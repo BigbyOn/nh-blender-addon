@@ -31,8 +31,8 @@ Panel location:
 
 ## Project Links
 
-- Repository: <https://github.com/Enisam/NH_Blender>
-- Issues: <https://github.com/Enisam/NH_Blender/issues>
+- Repository: <https://github.com/BigbyOn/nh-blender-addon>
+- Issues: <https://github.com/BigbyOn/nh-blender-addon/issues>
 
 ## Repository Structure
 

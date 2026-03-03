@@ -5,21 +5,22 @@ bl_info = {
     "blender": (4, 4, 0),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "Scatter Arma3 Proxy objects using DayZ clutter config + Texture Replace (.paa/.rvmat) + Replace from DB via A3OB",
-    "doc_url": "https://github.com/Enisam/NH_Blender",
-    "tracker_url": "https://github.com/Enisam/NH_Blender/issues",
-    "mclink": "https://github.com/Enisam/NH_Blender",
+    "doc_url": "https://github.com/BigbyOn/nh-blender-addon",
+    "tracker_url": "https://github.com/BigbyOn/nh-blender-addon/issues",
+    "mclink": "https://github.com/BigbyOn/nh-blender-addon",
     "category": "Object",
 }
 
 import bpy
 import bmesh
-from bpy.types import Operator, Panel, PropertyGroup, UIList
-from bpy.props import PointerProperty, StringProperty, FloatProperty, IntProperty, BoolProperty, EnumProperty
+from bpy.types import Operator, Panel, PropertyGroup, UIList, OperatorFileListElement
+from bpy.props import PointerProperty, StringProperty, FloatProperty, IntProperty, BoolProperty, EnumProperty, CollectionProperty
 from mathutils import Vector, Matrix
 import math
 import random
 import os
 import re
+import shutil
 
 # ------------------------------------------------------------------------
 #  Global config storage
@@ -313,6 +314,56 @@ class CRAY_PG_Settings(PropertyGroup):
     seed: IntProperty(name="Random Seed", default=0)
     only_hit_source: BoolProperty(name="Only Hit Source", default=True)
 
+class CRAY_PG_SnapSettings(PropertyGroup):
+    source_object: PointerProperty(name="Model Object", type=bpy.types.Object)
+    memory_object: PointerProperty(name="Memory LOD Object", type=bpy.types.Object)
+    snap_group: StringProperty(name="Snap Group", default="StenaKamennaya")
+    snap_side: EnumProperty(
+        name="Side",
+        items=(
+            ("a", "A", "Create A-side snap points"),
+            ("v", "V", "Create V-side snap points"),
+        ),
+        default="a",
+    )
+    edge_axis: EnumProperty(
+        name="Edge Axis",
+        items=(
+            ("X", "X", "Use X min/max edge"),
+            ("Y", "Y", "Use Y min/max edge"),
+            ("Z", "Z", "Use Z min/max edge"),
+        ),
+        default="X",
+    )
+    edge_side: EnumProperty(
+        name="Edge Side",
+        items=(
+            ("NEG", "Min", "Use minimum edge value"),
+            ("POS", "Max", "Use maximum edge value"),
+        ),
+        default="POS",
+    )
+    edge_span_axis: EnumProperty(
+        name="Span Axis",
+        items=(
+            ("AUTO", "Auto", "Auto-pick span axis from Edge Axis"),
+            ("X", "X", "Use X as span axis"),
+            ("Y", "Y", "Use Y as span axis"),
+            ("Z", "Z", "Use Z as span axis"),
+        ),
+        default="AUTO",
+    )
+    edge_tolerance: FloatProperty(
+        name="Edge Tolerance",
+        description="Band size near edge (fraction of model size along edge axis)",
+        default=0.03,
+        min=0.0,
+        max=0.5,
+    )
+    replace_existing: BoolProperty(name="Replace Existing Named Groups", default=True)
+    batch_cleanup_imported: BoolProperty(name="Cleanup Imported Objects", default=True)
+    batch_overwrite_bak: BoolProperty(name="Overwrite .bak", default=True)
+
 
 # ------------------------------------------------------------------------
 #  Operators (scatter)
@@ -512,6 +563,621 @@ class CRAY_OT_ScatterProxies(Operator):
                 f"{limit_suffix}"
             ),
         )
+        return {"FINISHED"}
+
+
+# ------------------------------------------------------------------------
+#  Snap points (.sp_*) for Memory LOD
+# ------------------------------------------------------------------------
+
+_SP_GROUP_RE = re.compile(r"^[A-Za-z0-9]+$")
+
+_A3OB_IMPORT_CANDIDATES = (
+    (
+        "a3ob.import_p3d",
+        (
+            "filepath",
+            "first_lod_only",
+            "absolute_paths",
+            "enclose",
+            "groupby",
+            "additional_data_allowed",
+            "additional_data",
+            "validate_meshes",
+            "proxy_action",
+            "translate_selections",
+            "cleanup_empty_selections",
+        ),
+    ),
+    ("import_scene.a3ob_p3d", ("filepath",)),
+    ("import_scene.a3ob_model", ("filepath",)),
+    ("a3ob.import_model", ("filepath",)),
+)
+
+_A3OB_EXPORT_CANDIDATES = (
+    (
+        "a3ob.export_p3d",
+        (
+            "filepath",
+            "use_selection",
+            "visible_only",
+            "relative_paths",
+            "preserve_normals",
+            "validate_meshes",
+            "apply_transforms",
+            "apply_modifiers",
+            "sort_sections",
+            "lod_collisions",
+            "validate_lods",
+            "generate_components",
+            "force_lowercase",
+        ),
+    ),
+    ("export_scene.a3ob_p3d", ("filepath", "use_selection")),
+    ("a3ob.export_model", ("filepath", "use_selection")),
+)
+
+def _op_handle(op_idname: str):
+    try:
+        mod, op = op_idname.split(".", 1)
+    except ValueError:
+        return None
+    mod_obj = getattr(bpy.ops, mod, None)
+    if mod_obj is None:
+        return None
+    return getattr(mod_obj, op, None)
+
+def _has_any_a3ob_io_ops():
+    has_import = any(_op_handle(op) is not None for op, _ in _A3OB_IMPORT_CANDIDATES)
+    has_export = any(_op_handle(op) is not None for op, _ in _A3OB_EXPORT_CANDIDATES)
+    return has_import and has_export
+
+def _call_first_available(op_candidates, **kwargs):
+    last_err = None
+    for op_idname, allowed_keys in op_candidates:
+        fn = _op_handle(op_idname)
+        if fn is None:
+            continue
+        payload = {k: v for k, v in kwargs.items() if k in allowed_keys}
+        try:
+            result = fn(**payload)
+            if isinstance(result, set) and "CANCELLED" in result:
+                last_err = RuntimeError(f"{op_idname} returned CANCELLED")
+                continue
+            return result, op_idname, None
+        except Exception as e:
+            last_err = e
+            continue
+    return None, None, last_err
+
+def _is_memory_lod_mesh_object(obj) -> bool:
+    if obj is None or obj.type != "MESH":
+        return False
+    if obj.name == "Memory":
+        return True
+    if not hasattr(obj, "a3ob_properties_object"):
+        return False
+    try:
+        props = obj.a3ob_properties_object
+        return str(getattr(props, "lod", "")) == "9"
+    except Exception:
+        return False
+
+def _pick_memory_lod_object(context, source_obj):
+    if source_obj is not None:
+        for col in source_obj.users_collection:
+            obj = col.objects.get("Memory")
+            if obj is not None and obj.type == "MESH":
+                return obj
+    obj = bpy.data.objects.get("Memory")
+    if obj is not None and obj.type == "MESH":
+        return obj
+    for obj in context.scene.objects:
+        if _is_memory_lod_mesh_object(obj):
+            return obj
+    return None
+
+def _set_memory_lod_a3ob_props(memory_obj):
+    if not hasattr(memory_obj, "a3ob_properties_object"):
+        return
+    try:
+        props = memory_obj.a3ob_properties_object
+        props.lod = "9"
+        props.is_a3_lod = True
+        autocenter = None
+        for p in props.properties:
+            if p.name.lower() == "autocenter":
+                autocenter = p
+                break
+        if autocenter is None:
+            autocenter = props.properties.add()
+            autocenter.name = "autocenter"
+        autocenter.value = "0"
+    except Exception:
+        pass
+
+def _ensure_memory_lod_object(context, source_obj, preferred_obj=None):
+    if preferred_obj is not None and preferred_obj.type == "MESH":
+        memory_obj = preferred_obj
+    else:
+        memory_obj = _pick_memory_lod_object(context, source_obj)
+
+    if memory_obj is None:
+        memory_mesh = bpy.data.meshes.new("Memory")
+        memory_obj = bpy.data.objects.new("Memory", memory_mesh)
+        if source_obj is not None and source_obj.users_collection:
+            source_obj.users_collection[0].objects.link(memory_obj)
+        else:
+            context.scene.collection.objects.link(memory_obj)
+        if source_obj is not None:
+            memory_obj.matrix_world = source_obj.matrix_world.copy()
+
+    _set_memory_lod_a3ob_props(memory_obj)
+    return memory_obj
+
+def _get_two_selected_vertex_world_positions(context):
+    active = context.view_layer.objects.active
+    if active is None or active.type != "MESH" or active.mode != "EDIT":
+        raise RuntimeError("Active object must be a mesh in Edit Mode")
+
+    bm = bmesh.from_edit_mesh(active.data)
+    selected = [active.matrix_world @ v.co for v in bm.verts if v.select]
+    if len(selected) != 2:
+        raise RuntimeError(f"Select exactly 2 vertices in Edit Mode (selected: {len(selected)})")
+    return active, selected
+
+def _create_snap_pair_in_memory(memory_obj, world_points, snap_group: str, snap_side: str, replace_existing: bool):
+    mesh = memory_obj.data
+    to_local = memory_obj.matrix_world.inverted()
+    local_points = [to_local @ p for p in world_points]
+
+    base_idx = len(mesh.vertices)
+    mesh.vertices.add(2)
+    mesh.vertices[base_idx + 0].co = local_points[0]
+    mesh.vertices[base_idx + 1].co = local_points[1]
+    mesh.update()
+
+    created_names = []
+    for i in range(2):
+        vg_name = f".sp_{snap_group}_{snap_side}_{i}"
+        if replace_existing:
+            old = memory_obj.vertex_groups.get(vg_name)
+            if old is not None:
+                memory_obj.vertex_groups.remove(old)
+        vg = memory_obj.vertex_groups.get(vg_name)
+        if vg is None:
+            vg = memory_obj.vertex_groups.new(name=vg_name)
+        vg.add([base_idx + i], 1.0, "REPLACE")
+        created_names.append(vg_name)
+    return created_names
+
+def _axis_index_from_token(token: str) -> int:
+    t = (token or "").upper()
+    if t == "X":
+        return 0
+    if t == "Y":
+        return 1
+    return 2
+
+def _pick_span_axis_index(edge_axis_idx: int, span_token: str) -> int:
+    t = (span_token or "AUTO").upper()
+    if t == "AUTO":
+        # For walls/segments AUTO uses horizontal perpendicular axis.
+        return 1 if edge_axis_idx == 0 else 0
+    idx = _axis_index_from_token(t)
+    if idx == edge_axis_idx:
+        return 2 if edge_axis_idx != 2 else 0
+    return idx
+
+def _auto_snap_points_from_model_edge(model_obj, edge_axis_token: str, edge_side_token: str,
+                                      span_axis_token: str, edge_tolerance: float):
+    if model_obj is None or model_obj.type != "MESH" or model_obj.data is None:
+        raise RuntimeError("Model Object must be a mesh")
+    if len(model_obj.data.vertices) < 2:
+        raise RuntimeError("Model object must have at least 2 vertices")
+
+    edge_axis = _axis_index_from_token(edge_axis_token)
+    span_axis = _pick_span_axis_index(edge_axis, span_axis_token)
+    verts_local = [v.co.copy() for v in model_obj.data.vertices]
+
+    edge_values = [v[edge_axis] for v in verts_local]
+    edge_min = min(edge_values)
+    edge_max = max(edge_values)
+    edge_range = edge_max - edge_min
+    target_edge = edge_min if (edge_side_token or "POS").upper() == "NEG" else edge_max
+
+    tol_abs = max(1e-6, edge_range * max(0.0, edge_tolerance))
+    candidates = [v for v in verts_local if abs(v[edge_axis] - target_edge) <= tol_abs]
+    if len(candidates) < 2:
+        sorted_by_edge = sorted(verts_local, key=lambda v: abs(v[edge_axis] - target_edge))
+        candidates = sorted_by_edge[:max(2, len(sorted_by_edge))]
+
+    if len(candidates) < 2:
+        raise RuntimeError("Could not detect enough vertices on selected edge")
+
+    v0 = min(candidates, key=lambda v: v[span_axis])
+    v1 = max(candidates, key=lambda v: v[span_axis])
+    if (v0 - v1).length_squared < 1e-12:
+        farthest = None
+        best_d2 = -1.0
+        for i in range(len(candidates)):
+            for j in range(i + 1, len(candidates)):
+                d2 = (candidates[i] - candidates[j]).length_squared
+                if d2 > best_d2:
+                    best_d2 = d2
+                    farthest = (candidates[i], candidates[j])
+        if farthest is None:
+            raise RuntimeError("Failed to determine distinct edge points")
+        v0, v1 = farthest
+
+    return [model_obj.matrix_world @ v0, model_obj.matrix_world @ v1]
+
+def _pick_model_mesh_from_objects(objs):
+    meshes = [o for o in objs if o is not None and o.type == "MESH" and o.data is not None]
+    if not meshes:
+        return None
+
+    for o in meshes:
+        if (o.name or "").strip().lower() == "resolution 0":
+            return o
+
+    non_memory = [o for o in meshes if not _is_memory_lod_mesh_object(o)]
+    if non_memory:
+        return max(non_memory, key=lambda o: len(o.data.polygons) if o.data else 0)
+
+    return max(meshes, key=lambda o: len(o.data.polygons) if o.data else 0)
+
+def _pick_memory_mesh_from_objects(objs):
+    for o in objs:
+        if _is_memory_lod_mesh_object(o):
+            return o
+    return None
+
+def _deselect_all_in_view_layer(context):
+    for o in context.view_layer.objects:
+        if o.select_get():
+            o.select_set(False)
+
+def _cleanup_imported_objects(imported_obj_names, pre_collection_ptrs):
+    live = [bpy.data.objects.get(n) for n in imported_obj_names]
+    live = [o for o in live if o is not None]
+    live.sort(key=_obj_depth, reverse=True)
+    for obj in live:
+        if bpy.data.objects.get(obj.name) is not None:
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+    for col in list(bpy.data.collections):
+        if col.as_pointer() in pre_collection_ptrs:
+            continue
+        if len(col.objects) != 0 or len(col.children) != 0:
+            continue
+        try:
+            bpy.data.collections.remove(col)
+        except Exception:
+            pass
+
+class CRAY_OT_EnsureMemoryLOD(Operator):
+    bl_idname = "cray.ensure_memory_lod"
+    bl_label = "Create/Find Memory LOD"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        ss = context.scene.cray_snap_settings
+        source_obj = ss.source_object
+        if source_obj is None:
+            active = context.view_layer.objects.active
+            if active is not None and active.type == "MESH":
+                source_obj = active
+
+        if ss.memory_object is not None and ss.memory_object.type != "MESH":
+            self.report({"ERROR"}, "Memory LOD Object must be a mesh")
+            return {"CANCELLED"}
+
+        memory_obj = _ensure_memory_lod_object(context, source_obj, preferred_obj=ss.memory_object)
+        ss.memory_object = memory_obj
+        self.report({"INFO"}, f"Memory LOD ready: {memory_obj.name}")
+        return {"FINISHED"}
+
+class CRAY_OT_CreateSnapPair(Operator):
+    bl_idname = "cray.create_snap_pair"
+    bl_label = "Create .sp Pair From Selected Vertices"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        ss = context.scene.cray_snap_settings
+
+        snap_group = (ss.snap_group or "").strip()
+        if not snap_group:
+            self.report({"ERROR"}, "Snap Group is empty")
+            return {"CANCELLED"}
+        if not _SP_GROUP_RE.fullmatch(snap_group):
+            self.report({"ERROR"}, "Snap Group must contain only letters and digits")
+            return {"CANCELLED"}
+
+        try:
+            active_obj, world_points = _get_two_selected_vertex_world_positions(context)
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        if context.mode != "OBJECT":
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception as e:
+                self.report({"ERROR"}, f"Failed to switch to Object Mode: {_fmt_exc(e)}")
+                return {"CANCELLED"}
+
+        source_obj = ss.source_object if ss.source_object is not None else active_obj
+        if ss.memory_object is not None and ss.memory_object.type != "MESH":
+            self.report({"ERROR"}, "Memory LOD Object must be a mesh")
+            return {"CANCELLED"}
+
+        memory_obj = _ensure_memory_lod_object(context, source_obj, preferred_obj=ss.memory_object)
+        ss.memory_object = memory_obj
+
+        created_names = _create_snap_pair_in_memory(
+            memory_obj=memory_obj,
+            world_points=world_points,
+            snap_group=snap_group,
+            snap_side=ss.snap_side,
+            replace_existing=ss.replace_existing,
+        )
+
+        self.report({"INFO"}, f"Created {len(created_names)} points in {memory_obj.name}: {', '.join(created_names)}")
+        return {"FINISHED"}
+
+class CRAY_OT_CreateSnapPairFromModelEdge(Operator):
+    bl_idname = "cray.create_snap_pair_from_model_edge"
+    bl_label = "Create .sp Pair From Model Edge"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        ss = context.scene.cray_snap_settings
+
+        snap_group = (ss.snap_group or "").strip()
+        if not snap_group:
+            self.report({"ERROR"}, "Snap Group is empty")
+            return {"CANCELLED"}
+        if not _SP_GROUP_RE.fullmatch(snap_group):
+            self.report({"ERROR"}, "Snap Group must contain only letters and digits")
+            return {"CANCELLED"}
+
+        model_obj = ss.source_object
+        if model_obj is None:
+            active = context.view_layer.objects.active
+            if active is not None and active.type == "MESH":
+                model_obj = active
+        if model_obj is None or model_obj.type != "MESH":
+            self.report({"ERROR"}, "Model Object must be a mesh")
+            return {"CANCELLED"}
+
+        try:
+            world_points = _auto_snap_points_from_model_edge(
+                model_obj=model_obj,
+                edge_axis_token=ss.edge_axis,
+                edge_side_token=ss.edge_side,
+                span_axis_token=ss.edge_span_axis,
+                edge_tolerance=ss.edge_tolerance,
+            )
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        if context.mode != "OBJECT":
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception as e:
+                self.report({"ERROR"}, f"Failed to switch to Object Mode: {_fmt_exc(e)}")
+                return {"CANCELLED"}
+
+        if ss.memory_object is not None and ss.memory_object.type != "MESH":
+            self.report({"ERROR"}, "Memory LOD Object must be a mesh")
+            return {"CANCELLED"}
+
+        memory_obj = _ensure_memory_lod_object(context, model_obj, preferred_obj=ss.memory_object)
+        ss.memory_object = memory_obj
+
+        created_names = _create_snap_pair_in_memory(
+            memory_obj=memory_obj,
+            world_points=world_points,
+            snap_group=snap_group,
+            snap_side=ss.snap_side,
+            replace_existing=ss.replace_existing,
+        )
+        self.report(
+            {"INFO"},
+            (
+                f"Created {len(created_names)} edge points in {memory_obj.name}: "
+                f"{', '.join(created_names)}"
+            ),
+        )
+        return {"FINISHED"}
+
+class CRAY_OT_SnapBatchProcess(Operator):
+    bl_idname = "cray.snap_batch_process"
+    bl_label = "Batch Process P3D (Backup + Snap)"
+    bl_options = {"REGISTER"}
+
+    filter_glob: StringProperty(default="*.p3d", options={"HIDDEN"})
+    directory: StringProperty(subtype="DIR_PATH")
+    files: CollectionProperty(type=OperatorFileListElement)
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        ss = context.scene.cray_snap_settings
+
+        if not _has_any_a3ob_io_ops():
+            self.report({"ERROR"}, "A3OB import/export operators not found")
+            return {"CANCELLED"}
+
+        snap_group = (ss.snap_group or "").strip()
+        if not snap_group:
+            self.report({"ERROR"}, "Snap Group is empty")
+            return {"CANCELLED"}
+        if not _SP_GROUP_RE.fullmatch(snap_group):
+            self.report({"ERROR"}, "Snap Group must contain only letters and digits")
+            return {"CANCELLED"}
+
+        paths = []
+        for item in self.files:
+            p = os.path.join(self.directory, item.name)
+            paths.append(bpy.path.abspath(p))
+        if not paths:
+            self.report({"ERROR"}, "No files selected")
+            return {"CANCELLED"}
+
+        prev_selected_names = [o.name for o in context.selected_objects]
+        prev_active_name = context.view_layer.objects.active.name if context.view_layer.objects.active else None
+
+        ok_count = 0
+        fail_count = 0
+        backup_count = 0
+        exported_count = 0
+        failures = []
+
+        for filepath in paths:
+            if not os.path.isfile(filepath):
+                fail_count += 1
+                failures.append((filepath, "file-not-found"))
+                continue
+
+            bak_path = filepath + ".bak"
+            try:
+                if os.path.exists(bak_path) and not ss.batch_overwrite_bak:
+                    bak_path = filepath + ".bak.prev"
+                shutil.copy2(filepath, bak_path)
+                backup_count += 1
+            except Exception as e:
+                fail_count += 1
+                failures.append((filepath, f"backup-failed: {_fmt_exc(e)}"))
+                continue
+
+            pre_obj_ptrs = {o.as_pointer() for o in bpy.data.objects}
+            pre_col_ptrs = {c.as_pointer() for c in bpy.data.collections}
+
+            _, used_import, import_err = _call_first_available(
+                _A3OB_IMPORT_CANDIDATES,
+                filepath=filepath,
+                first_lod_only=False,
+                absolute_paths=True,
+                enclose=True,
+                groupby="TYPE",
+                additional_data_allowed=True,
+                additional_data={"PROPS", "SELECTIONS"},
+                validate_meshes=False,
+                proxy_action="SEPARATE",
+                translate_selections=False,
+                cleanup_empty_selections=False,
+            )
+            if used_import is None:
+                fail_count += 1
+                failures.append((filepath, f"import-failed: {_fmt_exc(import_err) if import_err else 'no operator'}"))
+                continue
+
+            imported_objs = [o for o in bpy.data.objects if o.as_pointer() not in pre_obj_ptrs]
+            imported_names = [o.name for o in imported_objs]
+            if not imported_objs:
+                fail_count += 1
+                failures.append((filepath, "import-produced-no-objects"))
+                continue
+
+            model_obj = _pick_model_mesh_from_objects(imported_objs)
+            if model_obj is None:
+                fail_count += 1
+                failures.append((filepath, "no-mesh-model-found"))
+                if ss.batch_cleanup_imported:
+                    _cleanup_imported_objects(imported_names, pre_col_ptrs)
+                continue
+
+            memory_obj = _pick_memory_mesh_from_objects(imported_objs)
+            memory_obj = _ensure_memory_lod_object(context, model_obj, preferred_obj=memory_obj)
+
+            try:
+                world_points = _auto_snap_points_from_model_edge(
+                    model_obj=model_obj,
+                    edge_axis_token=ss.edge_axis,
+                    edge_side_token=ss.edge_side,
+                    span_axis_token=ss.edge_span_axis,
+                    edge_tolerance=ss.edge_tolerance,
+                )
+                _create_snap_pair_in_memory(
+                    memory_obj=memory_obj,
+                    world_points=world_points,
+                    snap_group=snap_group,
+                    snap_side=ss.snap_side,
+                    replace_existing=ss.replace_existing,
+                )
+            except Exception as e:
+                fail_count += 1
+                failures.append((filepath, f"snap-failed: {_fmt_exc(e)}"))
+                if ss.batch_cleanup_imported:
+                    _cleanup_imported_objects(imported_names, pre_col_ptrs)
+                continue
+
+            _deselect_all_in_view_layer(context)
+            for name in imported_names:
+                live = bpy.data.objects.get(name)
+                if live is None:
+                    continue
+                try:
+                    live.hide_set(False)
+                except Exception:
+                    pass
+                try:
+                    live.hide_viewport = False
+                except Exception:
+                    pass
+                live.select_set(True)
+            if bpy.data.objects.get(model_obj.name) is not None:
+                context.view_layer.objects.active = bpy.data.objects.get(model_obj.name)
+
+            _, used_export, export_err = _call_first_available(
+                _A3OB_EXPORT_CANDIDATES,
+                filepath=filepath,
+                use_selection=True,
+                visible_only=True,
+                relative_paths=True,
+                preserve_normals=True,
+                validate_meshes=False,
+                apply_transforms=True,
+                apply_modifiers=True,
+                sort_sections=True,
+                lod_collisions="SKIP",
+                validate_lods=False,
+                generate_components=True,
+                force_lowercase=True,
+            )
+            if used_export is None:
+                fail_count += 1
+                failures.append((filepath, f"export-failed: {_fmt_exc(export_err) if export_err else 'no operator'}"))
+            else:
+                ok_count += 1
+                exported_count += 1
+
+            if ss.batch_cleanup_imported:
+                _cleanup_imported_objects(imported_names, pre_col_ptrs)
+
+        _deselect_all_in_view_layer(context)
+        for name in prev_selected_names:
+            o = bpy.data.objects.get(name)
+            if o is not None:
+                o.select_set(True)
+        if prev_active_name and bpy.data.objects.get(prev_active_name) is not None:
+            context.view_layer.objects.active = bpy.data.objects.get(prev_active_name)
+
+        if failures:
+            print("=== Batch Snap Process Failures ===")
+            for path, reason in failures:
+                print(f"{path} :: {reason}")
+
+        msg = f"Batch done: ok {ok_count}/{len(paths)}, exported {exported_count}, backups {backup_count}, failed {fail_count}"
+        if fail_count > 0:
+            self.report({"WARNING"}, msg + " (see System Console)")
+        else:
+            self.report({"INFO"}, msg)
         return {"FINISHED"}
 
 
@@ -890,16 +1556,64 @@ def _resolve_tex_target_object(context, picked_obj):
     return best, "scene-largest"
 
 def _ensure_visual_hierarchy(context, mesh_obj):
+    visuals_name = "Visuals"
     mesh_name = "Resolution 0"
     target_collection = _ensure_target_collection(context, mesh_obj)
 
-    _move_object_to_collection(mesh_obj, target_collection)
     mesh_world = mesh_obj.matrix_world.copy()
-    mesh_obj.parent = None
-    mesh_obj.matrix_parent_inverse.identity()
+    root_obj = None
+    p = mesh_obj
+    while p is not None:
+        if p.type == "EMPTY" and p.name.lower().endswith("_a.p3d"):
+            root_obj = p
+            break
+        p = p.parent
+
+    if root_obj is None:
+        base = _basename_no_ext(mesh_obj.name) or "object_placeholder"
+        if base.lower() == mesh_name.lower() and mesh_obj.parent is not None:
+            parent_base = _basename_no_ext(mesh_obj.parent.name)
+            if parent_base and parent_base.lower() != visuals_name.lower():
+                base = parent_base
+        root_name = f"{base}_A.p3d"
+        root_obj = bpy.data.objects.new(root_name, None)
+        root_obj.empty_display_type = "PLAIN_AXES"
+        root_obj.empty_display_size = 0.25
+        _link_object_to_collection(root_obj, target_collection)
+        root_obj.matrix_world = mesh_world
+    else:
+        _move_object_to_collection(root_obj, target_collection)
+
+    visuals_obj = None
+    for ch in root_obj.children:
+        if ch.type == "EMPTY" and ch.name.lower() == visuals_name.lower():
+            visuals_obj = ch
+            break
+
+    if visuals_obj is None:
+        visuals_obj = bpy.data.objects.new(visuals_name, None)
+        visuals_obj.empty_display_type = "PLAIN_AXES"
+        visuals_obj.empty_display_size = 0.2
+        _link_object_to_collection(visuals_obj, target_collection)
+        visuals_obj.parent = root_obj
+        visuals_obj.matrix_parent_inverse.identity()
+        visuals_obj.location = (0.0, 0.0, 0.0)
+        visuals_obj.rotation_euler = (0.0, 0.0, 0.0)
+        visuals_obj.scale = (1.0, 1.0, 1.0)
+    else:
+        _move_object_to_collection(visuals_obj, target_collection)
+        visuals_obj.parent = root_obj
+        visuals_obj.matrix_parent_inverse.identity()
+        visuals_obj.location = (0.0, 0.0, 0.0)
+        visuals_obj.rotation_euler = (0.0, 0.0, 0.0)
+        visuals_obj.scale = (1.0, 1.0, 1.0)
+
+    _move_object_to_collection(mesh_obj, target_collection)
+    mesh_obj.parent = visuals_obj
+    mesh_obj.matrix_parent_inverse = visuals_obj.matrix_world.inverted()
     mesh_obj.matrix_world = mesh_world
     mesh_obj.name = mesh_name
-    return target_collection, mesh_obj
+    return target_collection, root_obj, visuals_obj, mesh_obj
 
 # ---------- A3OB material setter (FIXED) ----------
 
@@ -1197,7 +1911,7 @@ class CRAY_OT_FixMeshHierarchy(Operator):
         after_v = len(mesh.vertices)
         after_e = len(mesh.edges)
         after_f = len(mesh.polygons)
-        target_collection, mesh_obj = _ensure_visual_hierarchy(context, obj)
+        target_collection, root_obj, visuals_obj, mesh_obj = _ensure_visual_hierarchy(context, obj)
         deleted_parents = 0
         for anc_name in old_parent_names:
             anc_live = bpy.data.objects.get(anc_name)
@@ -1235,7 +1949,7 @@ class CRAY_OT_FixMeshHierarchy(Operator):
             (
                 f"Fixed '{obj.name}': deleted children {deleted_total}, joined {joined_count}, "
                 f"verts {before_v}->{after_v}, edges {before_e}->{after_e}, faces {before_f}->{after_f}, "
-                f"hierarchy: {target_collection.name}/{mesh_obj.name}{suffix}"
+                f"hierarchy: {target_collection.name}/{root_obj.name}/{visuals_obj.name}/{mesh_obj.name}{suffix}"
             ),
         )
         return {"FINISHED"}
@@ -1390,6 +2104,54 @@ class CRAY_PT_ClutterProxiesPanel(Panel):
         layout.separator()
         layout.operator("object.cray_scatter_proxies", icon="PARTICLES")
 
+class CRAY_PT_SnapPointsPanel(Panel):
+    bl_idname = "VIEW3D_PT_cray_snap_points"
+    bl_label = "Snap Points (Memory LOD)"
+    bl_category = "NH Plugin"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        ss = context.scene.cray_snap_settings
+
+        col = layout.column(align=True)
+        col.label(text="Target")
+        col.prop(ss, "source_object")
+        col.prop(ss, "memory_object")
+        col.operator("cray.ensure_memory_lod", icon="OUTLINER_OB_MESH")
+
+        layout.separator()
+
+        col = layout.column(align=True)
+        col.label(text="Name Pattern")
+        col.prop(ss, "snap_group")
+        col.prop(ss, "snap_side", expand=True)
+        col.prop(ss, "replace_existing")
+
+        layout.separator()
+        box = layout.box()
+        box.label(text="Manual: 2 selected vertices", icon="EDITMODE_HLT")
+        box.label(text="Select exactly 2 vertices in Edit Mode", icon="INFO")
+        box.operator("cray.create_snap_pair", icon="MESH_DATA")
+
+        layout.separator()
+        box = layout.box()
+        box.label(text="Auto: edge extremes from model", icon="SNAP_EDGE")
+        box.prop(ss, "edge_axis")
+        box.prop(ss, "edge_side", expand=True)
+        box.prop(ss, "edge_span_axis")
+        box.prop(ss, "edge_tolerance")
+        box.operator("cray.create_snap_pair_from_model_edge", icon="SNAP_EDGE")
+
+        layout.separator()
+        box = layout.box()
+        box.label(text="Batch P3D: import -> snap -> export", icon="FILE_FOLDER")
+        box.prop(ss, "batch_cleanup_imported")
+        box.prop(ss, "batch_overwrite_bak")
+        box.operator("cray.snap_batch_process", icon="FILE_REFRESH")
+
 class CRAY_PT_TextureReplacePanel(Panel):
     bl_idname = "VIEW3D_PT_cray_texreplace"
     bl_label = "Texture Replace"
@@ -1436,8 +2198,13 @@ class CRAY_PT_TextureReplacePanel(Panel):
 
 classes = (
     CRAY_PG_Settings,
+    CRAY_PG_SnapSettings,
     CRAY_OT_LoadConfig,
     CRAY_OT_ScatterProxies,
+    CRAY_OT_EnsureMemoryLOD,
+    CRAY_OT_CreateSnapPair,
+    CRAY_OT_CreateSnapPairFromModelEdge,
+    CRAY_OT_SnapBatchProcess,
 
     CRAY_PG_TexDBItem,
     CRAY_PG_ObjMatImagesItem,
@@ -1450,6 +2217,7 @@ classes = (
     CRAY_OT_ReplaceTexturesFromDB,
 
     CRAY_PT_ClutterProxiesPanel,
+    CRAY_PT_SnapPointsPanel,
     CRAY_PT_TextureReplacePanel,
 )
 
@@ -1457,12 +2225,14 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.cray_settings = PointerProperty(type=CRAY_PG_Settings)
+    bpy.types.Scene.cray_snap_settings = PointerProperty(type=CRAY_PG_SnapSettings)
     bpy.types.Scene.cray_texreplace_settings = PointerProperty(type=CRAY_PG_TexReplaceSettings)
 
 def unregister():
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
     del bpy.types.Scene.cray_settings
+    del bpy.types.Scene.cray_snap_settings
     del bpy.types.Scene.cray_texreplace_settings
 
 if __name__ == "__main__":
