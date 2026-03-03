@@ -27,3 +27,6 @@ Thumbs.db
 
 # Local release helper (kept only on workstation)
 release_local.bat
+
+# Build artifacts
+dist/
