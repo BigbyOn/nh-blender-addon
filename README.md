@@ -1,50 +1,58 @@
 # NH Blender Plugin
 
-Blender add-on for DayZ/Arma-style workflow:
-- scatter proxy objects by DayZ clutter config (`.cpp`)
-- build texture database from folder (`.paa`/`.rvmat`)
-- replace material paths through A3OB-compatible properties
-- create snap points in `Memory LOD` (`.sp_*`) manually, automatically, or in batch for many `.p3d`
+Blender add-on for DayZ/Arma-style workflows with A3OB integration.
 
-## Features
+## Core Features
 
-- Clutter scatter from `CfgWorlds -> CAWorld -> Clutter` and `CfgSurfaceCharacters`
-- Surface-based weighted spawn
-- Density controls (`grid size`, `density scale`, `spawn probability`, limits)
-- Texture DB build from folder and quick object preview
-- Material replace from DB by smart name matching
-- Mesh hierarchy fix helper for export preparation
-- Snap points panel for `Memory LOD`:
-  - manual pair from 2 selected vertices
-  - auto pair from model edge extremes (`X/Y/Z`, `Min/Max`, tolerance)
-  - batch process for multiple `.p3d`: backup to `.bak`, import, create/update snap points, export back
+- Scatter clutter proxies from DayZ config (`CfgWorlds -> CAWorld -> Clutter` + `CfgSurfaceCharacters`)
+- Build texture DB from folder (`.paa` / `.rvmat`)
+- Replace material paths from DB using A3OB-compatible properties
+- Batch import/export `.p3d` collections (with source-path tracking and optional `.bak`)
+- Build temporary P3D Asset Library and convert placed assets to A3OB proxies
+- Quick fixes panel:
+- `Fix Shading` (merge selected meshes, clear split normals, recalc normals, shade smooth)
+- `Fix Mesh/Hierarchy` duplicate shortcut button
 
-## Snap Points Naming
+## UI Panels
 
-Created names follow:
-- `.sp_<Group>_<a|v>_<index>`
+- `Clutter Proxies (DayZ)`
+- `P3D Asset Library`
+- `Fixes`
+- `Import/Export planner`
+- `Texture Replace`
 
-Example:
-- `.sp_StenaKamennaya_a_0`
-- `.sp_StenaKamennaya_v_0`
+## Export Notes
 
-Use matching `<Group>` and `<index>` on opposite sides (`a` <-> `v`) for intended snapping pairs.
+- `Force export all LODs (skip validation)` exists for problematic files.
+- Default is **OFF**.
+- Batch export performs post-check and writes missing LOD info to System Console when export is partial.
+
+## Snap Points Status
+
+- Snap Points tools are currently kept in code but panel visibility is disabled in UI.
+- This is temporary while pipeline/behavior is being reworked.
 
 ## Requirements
 
 - Blender `4.4+`
-- Add-on: **Arma 3 Object Builder (A3OB)** enabled (for proxy/material property integration)
-- For batch snap processing: A3OB import/export operators must be available
+- Add-on: **Arma 3 Object Builder (A3OB)** enabled
+- A3OB import/export operators are required for batch `.p3d` workflows
 
 ## Installation
 
 1. Download this repository.
-2. In Blender: `Edit -> Preferences -> Add-ons -> Install...`
+2. In Blender open `Edit -> Preferences -> Add-ons -> Install...`.
 3. Select `NH_Blender.py`.
 4. Enable the add-on.
 
 Panel location:
 - `3D Viewport -> N panel -> NH Plugin`
+
+## Recent Changes (0.1.2 -> 0.1.4)
+
+- `0.1.2`: P3D Asset Library tools and convert-selected-to-proxies workflow added.
+- `0.1.3`: New `Fixes` panel, `Fix Shading`, hidden Snap Points panel, LOD export diagnostics.
+- `0.1.4`: `Force export all LODs` default switched to OFF.
 
 ## Project Links
 
