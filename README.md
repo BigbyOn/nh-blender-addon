@@ -4,6 +4,7 @@ Blender add-on for DayZ/Arma-style workflow:
 - scatter proxy objects by DayZ clutter config (`.cpp`)
 - build texture database from folder (`.paa`/`.rvmat`)
 - replace material paths through A3OB-compatible properties
+- create snap points in `Memory LOD` (`.sp_*`) manually, automatically, or in batch for many `.p3d`
 
 ## Features
 
@@ -13,11 +14,27 @@ Blender add-on for DayZ/Arma-style workflow:
 - Texture DB build from folder and quick object preview
 - Material replace from DB by smart name matching
 - Mesh hierarchy fix helper for export preparation
+- Snap points panel for `Memory LOD`:
+  - manual pair from 2 selected vertices
+  - auto pair from model edge extremes (`X/Y/Z`, `Min/Max`, tolerance)
+  - batch process for multiple `.p3d`: backup to `.bak`, import, create/update snap points, export back
+
+## Snap Points Naming
+
+Created names follow:
+- `.sp_<Group>_<a|v>_<index>`
+
+Example:
+- `.sp_StenaKamennaya_a_0`
+- `.sp_StenaKamennaya_v_0`
+
+Use matching `<Group>` and `<index>` on opposite sides (`a` <-> `v`) for intended snapping pairs.
 
 ## Requirements
 
 - Blender `4.4+`
 - Add-on: **Arma 3 Object Builder (A3OB)** enabled (for proxy/material property integration)
+- For batch snap processing: A3OB import/export operators must be available
 
 ## Installation
 
