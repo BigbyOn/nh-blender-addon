@@ -1,19 +1,19 @@
 # NH Blender Plugin
 
-Blender add-on for DayZ/Arma-style workflows with A3OB integration.
+Аддон Blender для пайплайнов DayZ/Arma с интеграцией A3OB.
 
-## Core Features
+## Основные возможности
 
-- Scatter clutter proxies from DayZ config (`CfgWorlds -> CAWorld -> Clutter` + `CfgSurfaceCharacters`)
-- Build texture DB from folder (`.paa` / `.rvmat`)
-- Replace material paths from DB using A3OB-compatible properties
-- Batch import/export `.p3d` collections (with source-path tracking and optional `.bak`)
-- Build temporary P3D Asset Library and convert placed assets to A3OB proxies
-- Quick fixes panel:
-- `Fix Shading` (merge selected meshes, clear split normals, recalc normals, shade smooth)
-- `Fix Mesh/Hierarchy` duplicate shortcut button
+- Scatter clutter-прокси из DayZ-конфига (`CfgWorlds -> CAWorld -> Clutter` + `CfgSurfaceCharacters`)
+- Сборка базы текстур из папки (`.paa` / `.rvmat`)
+- Замена путей материалов из базы через A3OB-совместимые свойства
+- Пакетный импорт/экспорт `.p3d`-коллекций (с сохранением source-path и опциональным `.bak`)
+- Построение временной P3D Asset Library и конвертация расставленных ассетов в A3OB-прокси
+- Панель быстрых фиксов:
+- `Fix Shading` (merge выбранных mesh, clear split normals, recalc normals, shade smooth)
+- `Fix Mesh/Hierarchy` (дублирующая кнопка быстрого доступа)
 
-## UI Panels
+## Панели в UI
 
 - `Clutter Proxies (DayZ)`
 - `P3D Asset Library`
@@ -21,51 +21,51 @@ Blender add-on for DayZ/Arma-style workflows with A3OB integration.
 - `Import/Export planner`
 - `Texture Replace`
 
-## Export Notes
+## Примечания по экспорту
 
-- `Force export all LODs (skip validation)` exists for problematic files.
-- Default is **OFF**.
-- Batch export performs post-check and writes missing LOD info to System Console when export is partial.
+- `Force export all LODs (skip validation)` предусмотрен для проблемных файлов.
+- По умолчанию параметр **OFF**.
+- При частичном экспорте batch-экспорт делает post-check и пишет в System Console, какие LOD не попали в файл.
 
-## Snap Points Status
+## Статус Snap Points
 
-- Snap Points tools are currently kept in code but panel visibility is disabled in UI.
-- This is temporary while pipeline/behavior is being reworked.
+- Инструменты Snap Points пока оставлены в коде, но панель скрыта в UI.
+- Это временно, пока дорабатывается пайплайн и логика работы.
 
-## Requirements
+## Требования
 
 - Blender `4.4+`
-- Add-on: **Arma 3 Object Builder (A3OB)** enabled
-- A3OB import/export operators are required for batch `.p3d` workflows
+- Включенный аддон: **Arma 3 Object Builder (A3OB)**
+- Для пакетных `.p3d`-операций нужны доступные A3OB import/export операторы
 
-## Installation
+## Установка
 
-1. Download this repository.
-2. In Blender open `Edit -> Preferences -> Add-ons -> Install...`.
-3. Select `NH_Blender.py`.
-4. Enable the add-on.
+1. Скачайте репозиторий.
+2. В Blender откройте `Edit -> Preferences -> Add-ons -> Install...`.
+3. Выберите `NH_Blender.py`.
+4. Включите аддон.
 
-Panel location:
+Расположение панели:
 - `3D Viewport -> N panel -> NH Plugin`
 
-## Recent Changes (0.1.2 -> 0.1.4)
+## Последние изменения (0.1.2 -> 0.1.4)
 
-- `0.1.2`: P3D Asset Library tools and convert-selected-to-proxies workflow added.
-- `0.1.3`: New `Fixes` panel, `Fix Shading`, hidden Snap Points panel, LOD export diagnostics.
-- `0.1.4`: `Force export all LODs` default switched to OFF.
+- `0.1.2`: добавлены инструменты P3D Asset Library и workflow конвертации selected-объектов в proxy.
+- `0.1.3`: добавлена панель `Fixes`, кнопка `Fix Shading`, скрыта панель Snap Points, добавлена диагностика LOD при batch-экспорте.
+- `0.1.4`: `Force export all LODs` по умолчанию переключен в OFF.
 
-## Project Links
+## Ссылки проекта
 
-- Repository: <https://github.com/BigbyOn/nh-blender-addon>
+- Репозиторий: <https://github.com/BigbyOn/nh-blender-addon>
 - Issues: <https://github.com/BigbyOn/nh-blender-addon/issues>
 
-## Repository Structure
+## Структура репозитория
 
-- `NH_Blender.py` - main add-on file
-- `README.md` - project description and setup
-- `LICENSE` - license terms
-- `.gitignore` - ignored local/build files
+- `NH_Blender.py` - основной файл аддона
+- `README.md` - описание проекта и настройка
+- `LICENSE` - условия лицензии
+- `.gitignore` - игнорируемые локальные/сборочные файлы
 
-## License
+## Лицензия
 
-MIT License. See [LICENSE](LICENSE).
+MIT License. См. [LICENSE](LICENSE).
