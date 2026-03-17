@@ -1,7 +1,7 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Daryl and Enisam",
-    "version": (0, 1, 2),
+    "version": (0, 1, 3),
     "blender": (4, 4, 0),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "Scatter Arma3 Proxy objects using DayZ clutter config + Texture Replace (.paa/.rvmat) + Replace from DB via A3OB",
@@ -21,6 +21,8 @@ import random
 import os
 import re
 import shutil
+import importlib
+from contextlib import contextmanager
 import uuid
 
 # ------------------------------------------------------------------------
@@ -612,6 +614,7 @@ _A3OB_EXPORT_CANDIDATES = (
             "sort_sections",
             "lod_collisions",
             "validate_lods",
+            "validate_lods_warning_errors",
             "generate_components",
             "force_lowercase",
         ),
@@ -655,6 +658,174 @@ def _call_first_available(op_candidates, **kwargs):
             last_err = e
             continue
     return None, None, last_err
+
+
+def _import_first_available_module(module_names):
+    for module_name in module_names:
+        try:
+            return importlib.import_module(module_name)
+        except Exception:
+            continue
+    return None
+
+
+@contextmanager
+def _temporary_disable_a3ob_lod_validation(enabled: bool):
+    if not enabled:
+        yield False
+        return
+
+    export_mod = _import_first_available_module(
+        (
+            "bl_ext.user_default.Arma3ObjectBuilder.io.export_p3d",
+            "Arma3ObjectBuilder.io.export_p3d",
+        )
+    )
+    if export_mod is None:
+        yield False
+        return
+
+    validator_cls = getattr(export_mod, "Validator", None)
+    original_validate = getattr(validator_cls, "validate_lod", None) if validator_cls else None
+    if validator_cls is None or not callable(original_validate):
+        yield False
+        return
+
+    def _always_valid(self, obj, lod, lazy=False, warns_errs=True, relative_paths=False):
+        return True
+
+    validator_cls.validate_lod = _always_valid
+    try:
+        yield True
+    finally:
+        validator_cls.validate_lod = original_validate
+
+
+def _call_export_with_optional_relaxed_validation(force_all_lods: bool, **kwargs):
+    with _temporary_disable_a3ob_lod_validation(force_all_lods):
+        return _call_first_available(_A3OB_EXPORT_CANDIDATES, **kwargs)
+
+
+def _get_a3ob_data_p3d_module():
+    return _import_first_available_module(
+        (
+            "bl_ext.user_default.Arma3ObjectBuilder.io.data_p3d",
+            "Arma3ObjectBuilder.io.data_p3d",
+        )
+    )
+
+
+def _lod_signature_key(signature: float) -> str:
+    return f"{float(signature):.6e}"
+
+
+def _a3ob_lod_signature_from_props(props, p3d_mod):
+    lod_res_cls = getattr(p3d_mod, "P3D_LOD_Resolution", None)
+    if lod_res_cls is None:
+        return None
+
+    try:
+        lod_idx = int(getattr(props, "lod", 0))
+    except Exception:
+        return None
+
+    lod_unknown = int(getattr(lod_res_cls, "UNKNOWN", -1))
+    try:
+        if lod_idx == lod_unknown:
+            resolution = float(getattr(props, "resolution_float", 0.0) or 0.0)
+        else:
+            resolution = float(getattr(props, "resolution", 0.0) or 0.0)
+    except Exception:
+        resolution = 0.0
+
+    try:
+        signature = lod_res_cls.encode(lod_idx, resolution)
+    except Exception:
+        return None
+    if signature is None:
+        return None
+    return float(signature)
+
+
+def _collect_expected_lod_entries(export_objects):
+    p3d_mod = _get_a3ob_data_p3d_module()
+    if p3d_mod is None:
+        return {}
+
+    expected = {}
+    for obj in export_objects:
+        if obj is None or obj.type != "MESH" or obj.parent is not None:
+            continue
+        if not hasattr(obj, "a3ob_properties_object"):
+            continue
+
+        props = obj.a3ob_properties_object
+        if not bool(getattr(props, "is_a3_lod", False)):
+            continue
+
+        signature = _a3ob_lod_signature_from_props(props, p3d_mod)
+        if signature is None:
+            continue
+
+        try:
+            lod_name = str(props.get_name())
+        except Exception:
+            lod_name = obj.name
+
+        key = _lod_signature_key(signature)
+        rec = expected.get(key)
+        if rec is None:
+            expected[key] = {
+                "signature": signature,
+                "lod_name": lod_name,
+                "objects": [obj.name],
+            }
+        else:
+            if obj.name not in rec["objects"]:
+                rec["objects"].append(obj.name)
+
+    return expected
+
+
+def _read_exported_lod_entries(filepath: str):
+    p3d_mod = _get_a3ob_data_p3d_module()
+    if p3d_mod is None:
+        raise RuntimeError("A3OB data_p3d module is not available")
+
+    mlod = p3d_mod.P3D_MLOD.read_file(filepath, first_lod_only=False)
+    exported = {}
+    for lod in getattr(mlod, "lods", []):
+        try:
+            signature = float(lod.resolution)
+        except Exception:
+            continue
+        key = _lod_signature_key(signature)
+        exported[key] = {"signature": signature}
+    return exported
+
+
+def _report_missing_lods_in_console(collection_name: str, filepath: str, expected_entries, exported_entries):
+    expected_keys = set(expected_entries.keys())
+    exported_keys = set(exported_entries.keys())
+    missing_keys = sorted(
+        expected_keys - exported_keys,
+        key=lambda k: expected_entries[k]["signature"],
+    )
+    if not missing_keys:
+        return []
+
+    print("=== Batch Export Collections: Missing LODs ===")
+    print(f"Collection: {collection_name}")
+    print(f"File: {filepath}")
+    print(
+        "WARNING: Not all LODs were exported "
+        f"(expected unique: {len(expected_keys)}, exported unique: {len(exported_keys)})"
+    )
+    for key in missing_keys:
+        rec = expected_entries[key]
+        objs = ", ".join(rec["objects"])
+        print(f" - {rec['lod_name']} | signature: {rec['signature']:.6e} | object(s): {objs}")
+    return missing_keys
 
 def _is_memory_lod_mesh_object(obj) -> bool:
     if obj is None or obj.type != "MESH":
@@ -2397,6 +2568,14 @@ class CRAY_PG_IEPlannerSettings(PropertyGroup):
         default=True,
         description="Skip root collections that do not look like imported .p3d collections",
     )
+    export_force_all_lods: BoolProperty(
+        name="Force export all LODs (skip validation)",
+        default=False,
+        description=(
+            "Workaround for A3OB exporter: temporarily bypass LOD validation "
+            "during batch export to prevent Resolution LODs from being skipped"
+        ),
+    )
 
 class CRAY_UL_IEFiles(UIList):
     bl_idname = "CRAY_UL_ie_files"
@@ -2939,13 +3118,13 @@ def _switch_bottom_area_to_asset_browser(context):
             return 2
         return 3
 
-    # Берём самую нижнюю область. При равном y предпочитаем таймлайн/анимационные редакторы.
+    # Pick the lowest area. For equal y, prefer timeline/animation editors.
     area = sorted(areas, key=lambda a: (a.y, _priority(a), -a.width, -a.height))[0]
 
     try:
         area.type = "FILE_BROWSER"
     except Exception:
-        # Иногда переключение через прямую смену типа не срабатывает на первом проходе.
+        # Sometimes direct area-type switching does not work on the first try.
         try:
             override = context.copy()
             override["window"] = window
@@ -3159,6 +3338,86 @@ class CRAY_OT_ConvertSelectedToProxies(Operator):
             self.report({"INFO"}, msg)
         return {"FINISHED"}
 
+
+class CRAY_OT_FixShadingByPipeline(Operator):
+    bl_idname = "cray.fix_shading_by_pipeline"
+    bl_label = "Fix Shading (Merge + Smooth)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        active_before = context.view_layer.objects.active
+        selected_meshes = [obj for obj in context.selected_objects if obj and obj.type == "MESH"]
+        if active_before is not None and active_before.type == "MESH" and active_before not in selected_meshes:
+            selected_meshes.insert(0, active_before)
+
+        if not selected_meshes:
+            self.report({"ERROR"}, "Select at least one mesh object")
+            return {"CANCELLED"}
+
+        if context.mode != "OBJECT":
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception as e:
+                self.report({"ERROR"}, f"Failed to switch to Object Mode: {_fmt_exc(e)}")
+                return {"CANCELLED"}
+
+        active_mesh = active_before if active_before in selected_meshes else selected_meshes[0]
+        _deselect_all_in_view_layer(context)
+        for obj in selected_meshes:
+            try:
+                obj.hide_set(False)
+            except Exception:
+                pass
+            try:
+                obj.hide_viewport = False
+            except Exception:
+                pass
+            try:
+                obj.select_set(True)
+            except Exception:
+                pass
+        try:
+            context.view_layer.objects.active = active_mesh
+        except Exception:
+            pass
+
+        joined_count = len(selected_meshes)
+        if joined_count > 1:
+            try:
+                bpy.ops.object.join()
+            except Exception as e:
+                self.report({"ERROR"}, f"Failed to join selected meshes: {_fmt_exc(e)}")
+                return {"CANCELLED"}
+            active_mesh = context.view_layer.objects.active
+        else:
+            active_mesh = active_mesh or context.view_layer.objects.active
+
+        if active_mesh is None or active_mesh.type != "MESH":
+            self.report({"ERROR"}, "Active object must be a mesh after merge")
+            return {"CANCELLED"}
+
+        try:
+            bpy.ops.mesh.customdata_custom_splitnormals_clear()
+        except Exception:
+            pass
+
+        try:
+            bpy.ops.object.mode_set(mode="EDIT")
+            bpy.ops.mesh.select_mode(type="FACE")
+            bpy.ops.mesh.select_all(action="SELECT")
+            bpy.ops.mesh.normals_make_consistent(inside=False)
+            bpy.ops.mesh.faces_shade_smooth()
+        except Exception as e:
+            self.report({"ERROR"}, f"Failed to run base shading pipeline: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+
+        self.report(
+            {"INFO"},
+            f"Shading fix done on '{active_mesh.name}': joined {joined_count}, Shade Smooth applied",
+        )
+        return {"FINISHED"}
+
+
 class CRAY_OT_IE_ExportCollectionsBatch(Operator):
     bl_idname = "cray.ie_export_collections_batch"
     bl_label = "Batch Export Collections (A3OB)"
@@ -3211,6 +3470,7 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
         exported = 0
         backups = 0
         failed = []
+        partial_lod_exports = []
         used_op = None
         used_targets = set()
 
@@ -3293,8 +3553,10 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
             except Exception:
                 pass
 
-            _, op_id, err = _call_first_available(
-                _A3OB_EXPORT_CANDIDATES,
+            expected_lod_entries = _collect_expected_lod_entries(selectable)
+
+            _, op_id, err = _call_export_with_optional_relaxed_validation(
+                force_all_lods=bool(st.export_force_all_lods),
                 filepath=filepath,
                 use_selection=True,
                 visible_only=False,
@@ -3306,12 +3568,27 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
                 sort_sections=True,
                 lod_collisions="SKIP",
                 validate_lods=False,
+                validate_lods_warning_errors=False,
                 generate_components=True,
                 force_lowercase=True,
             )
             if op_id:
                 used_op = op_id
                 exported += 1
+                if expected_lod_entries:
+                    try:
+                        exported_lod_entries = _read_exported_lod_entries(filepath)
+                        missing_keys = _report_missing_lods_in_console(
+                            collection_name=col.name,
+                            filepath=filepath,
+                            expected_entries=expected_lod_entries,
+                            exported_entries=exported_lod_entries,
+                        )
+                        if missing_keys:
+                            partial_lod_exports.append((col.name, filepath, len(missing_keys), len(expected_lod_entries)))
+                    except Exception as e:
+                        print("=== Batch Export Collections: LOD post-check failed ===")
+                        print(f"{col.name} -> {_fmt_exc(e)}")
             else:
                 failed.append(f"{col.name} -> {_fmt_exc(err) if err else 'export failed'}")
 
@@ -3338,11 +3615,22 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
             for f in failed:
                 print(f)
 
+        if partial_lod_exports:
+            print("=== Batch Export Collections: Partial LOD exports ===")
+            for col_name, fp, miss_count, expected_count in partial_lod_exports:
+                print(
+                    f"{col_name} -> missing {miss_count}/{expected_count} expected unique LOD signatures "
+                    f"({fp})"
+                )
+
         msg = (
             f"Exported {exported}/{len(candidates)} collections, "
             f"backups {backups}, failed {len(failed)}"
         )
-        if failed:
+        if partial_lod_exports:
+            msg += f", partial LOD exports {len(partial_lod_exports)}"
+
+        if failed or partial_lod_exports:
             self.report({"WARNING"}, msg + " (see System Console)")
         else:
             suffix = f" via {used_op}" if used_op else ""
@@ -3484,6 +3772,26 @@ class CRAY_PT_AssetProxyPanel(Panel):
         box.prop(st, "delete_originals")
         box.operator("cray.convert_selected_to_proxies", icon="CONSTRAINT")
 
+
+class CRAY_PT_FixesPanel(Panel):
+    bl_idname = "VIEW3D_PT_cray_fixes"
+    bl_label = "Fixes"
+    bl_category = "NH Plugin"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        box = layout.box()
+        box.label(text="Shading/Geometry fixes", icon="MOD_SMOOTH")
+        box.label(text="Select mesh object(s)", icon="INFO")
+        box.label(text="If >1 selected: auto-join")
+        box.operator("cray.fix_shading_by_pipeline", text="Fix Shading", icon="SHADING_RENDERED")
+        box.separator()
+        box.label(text="Hierarchy fix", icon="MOD_REMESH")
+        box.operator("cray.fix_mesh_hierarchy", text="Fix Mesh/Hierarchy", icon="MOD_REMESH")
+
 class CRAY_PT_ImportExportPlannerPanel(Panel):
     bl_idname = "VIEW3D_PT_cray_ie_planner"
     bl_label = "Import/Export planner"
@@ -3519,6 +3827,7 @@ class CRAY_PT_ImportExportPlannerPanel(Panel):
         row3.prop(st, "export_directory")
         ebox.prop(st, "export_create_bak")
         ebox.prop(st, "export_only_p3d_named")
+        ebox.prop(st, "export_force_all_lods")
         ebox.operator("cray.ie_export_collections_batch", icon="FILE_TICK")
         ebox.label(text="Each root collection exports separately.", icon="INFO")
 
@@ -3599,11 +3908,13 @@ classes = (
     CRAY_OT_IE_ClearFiles,
     CRAY_OT_IE_ImportBatch,
     CRAY_OT_ConvertSelectedToProxies,
+    CRAY_OT_FixShadingByPipeline,
     CRAY_OT_IE_ExportCollectionsBatch,
 
     CRAY_PT_ClutterProxiesPanel,
     CRAY_PT_SnapPointsPanel,
     CRAY_PT_AssetProxyPanel,
+    CRAY_PT_FixesPanel,
     CRAY_PT_ImportExportPlannerPanel,
     CRAY_PT_TextureReplacePanel,
 )
