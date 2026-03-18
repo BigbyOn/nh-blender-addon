@@ -1,7 +1,7 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Daryl and Enisam",
-    "version": (0, 1, 4),
+    "version": (0, 1, 6),
     "blender": (4, 4, 0),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "Scatter Arma3 Proxy objects using DayZ clutter config + Texture Replace (.paa/.rvmat) + Replace from DB via A3OB",
@@ -1560,7 +1560,7 @@ _ROOT_COLLECTION_NAME = "Collection"
 
 def _is_helper_object_name(name: str) -> bool:
     n = (name or "").strip().lower()
-    return n.startswith(_HELPER_OBJ_PREFIXES)
+    return n.startswith(_HELPER_OBJ_PREFIXES) or n.startswith("hier")
 
 def _link_object_to_collection(obj, collection):
     if obj is None or collection is None:
@@ -1711,6 +1711,57 @@ def _resolve_fix_target_object(context, picked_obj):
 
     return _resolve_tex_target_object(context, picked_obj)
 
+def _collect_collection_objects_deep(collection):
+    if collection is None:
+        return []
+
+    out = []
+    seen_cols = set()
+    seen_objs = set()
+    stack = [collection]
+    while stack:
+        col = stack.pop()
+        if col is None:
+            continue
+        col_key = col.as_pointer()
+        if col_key in seen_cols:
+            continue
+        seen_cols.add(col_key)
+
+        for obj in col.objects:
+            obj_key = obj.as_pointer()
+            if obj_key in seen_objs:
+                continue
+            seen_objs.add(obj_key)
+            out.append(obj)
+        stack.extend(col.children)
+    return out
+
+def _pick_random_scene_fix_mesh(context):
+    root_col = context.scene.collection.children.get(_ROOT_COLLECTION_NAME)
+    if root_col is not None:
+        root_col_meshes = [
+            o for o in _collect_collection_objects_deep(root_col)
+            if o.type == "MESH" and o.data is not None and len(o.data.polygons) > 0
+        ]
+        if root_col_meshes:
+            non_helper = [o for o in root_col_meshes if not _is_helper_object_name(o.name)]
+            if non_helper:
+                return random.choice(non_helper), "collection-random-non-helper"
+            return random.choice(root_col_meshes), "collection-random"
+
+    scene_meshes = [
+        o for o in context.scene.objects
+        if o.type == "MESH" and o.data is not None and len(o.data.polygons) > 0
+    ]
+    if not scene_meshes:
+        return None, "none"
+
+    non_helper = [o for o in scene_meshes if not _is_helper_object_name(o.name)]
+    if non_helper:
+        return random.choice(non_helper), "scene-random-non-helper"
+    return random.choice(scene_meshes), "scene-random"
+
 def _resolve_tex_target_object(context, picked_obj):
     if picked_obj is not None and picked_obj.type == "MESH":
         return picked_obj, "picked"
@@ -1732,65 +1783,189 @@ def _resolve_tex_target_object(context, picked_obj):
     best = max(scene_meshes, key=lambda o: len(o.data.polygons) if o.data else 0)
     return best, "scene-largest"
 
-def _ensure_visual_hierarchy(context, mesh_obj):
-    visuals_name = "Visuals"
-    mesh_name = "Resolution 0"
+def _ensure_flat_collection_mesh(context, mesh_obj):
     target_collection = _ensure_target_collection(context, mesh_obj)
-
     mesh_world = mesh_obj.matrix_world.copy()
-    root_obj = None
-    p = mesh_obj
-    while p is not None:
-        if p.type == "EMPTY" and p.name.lower().endswith("_a.p3d"):
-            root_obj = p
-            break
-        p = p.parent
-
-    if root_obj is None:
-        base = _basename_no_ext(mesh_obj.name) or "object_placeholder"
-        if base.lower() == mesh_name.lower() and mesh_obj.parent is not None:
-            parent_base = _basename_no_ext(mesh_obj.parent.name)
-            if parent_base and parent_base.lower() != visuals_name.lower():
-                base = parent_base
-        root_name = f"{base}_A.p3d"
-        root_obj = bpy.data.objects.new(root_name, None)
-        root_obj.empty_display_type = "PLAIN_AXES"
-        root_obj.empty_display_size = 0.25
-        _link_object_to_collection(root_obj, target_collection)
-        root_obj.matrix_world = mesh_world
-    else:
-        _move_object_to_collection(root_obj, target_collection)
-
-    visuals_obj = None
-    for ch in root_obj.children:
-        if ch.type == "EMPTY" and ch.name.lower() == visuals_name.lower():
-            visuals_obj = ch
-            break
-
-    if visuals_obj is None:
-        visuals_obj = bpy.data.objects.new(visuals_name, None)
-        visuals_obj.empty_display_type = "PLAIN_AXES"
-        visuals_obj.empty_display_size = 0.2
-        _link_object_to_collection(visuals_obj, target_collection)
-        visuals_obj.parent = root_obj
-        visuals_obj.matrix_parent_inverse.identity()
-        visuals_obj.location = (0.0, 0.0, 0.0)
-        visuals_obj.rotation_euler = (0.0, 0.0, 0.0)
-        visuals_obj.scale = (1.0, 1.0, 1.0)
-    else:
-        _move_object_to_collection(visuals_obj, target_collection)
-        visuals_obj.parent = root_obj
-        visuals_obj.matrix_parent_inverse.identity()
-        visuals_obj.location = (0.0, 0.0, 0.0)
-        visuals_obj.rotation_euler = (0.0, 0.0, 0.0)
-        visuals_obj.scale = (1.0, 1.0, 1.0)
 
     _move_object_to_collection(mesh_obj, target_collection)
-    mesh_obj.parent = visuals_obj
-    mesh_obj.matrix_parent_inverse = visuals_obj.matrix_world.inverted()
+    mesh_obj.parent = None
     mesh_obj.matrix_world = mesh_world
-    mesh_obj.name = mesh_name
-    return target_collection, root_obj, visuals_obj, mesh_obj
+    return target_collection, mesh_obj
+
+def _purge_collection_tree(collection):
+    deleted_objects = 0
+    deleted_collections = 0
+
+    for ch in list(collection.children):
+        child_deleted_objects, child_deleted_collections = _purge_collection_tree(ch)
+        deleted_objects += child_deleted_objects
+        deleted_collections += child_deleted_collections
+
+        try:
+            collection.children.unlink(ch)
+        except Exception:
+            pass
+        else:
+            if len(ch.users) == 0:
+                try:
+                    bpy.data.collections.remove(ch)
+                except Exception:
+                    pass
+            deleted_collections += 1
+
+    for obj in list(collection.objects):
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        except Exception:
+            continue
+        deleted_objects += 1
+
+    return deleted_objects, deleted_collections
+
+def _cleanup_target_collection_keep_mesh(target_collection, keep_obj):
+    deleted_objects = 0
+    deleted_collections = 0
+
+    for obj in list(target_collection.objects):
+        if obj == keep_obj:
+            continue
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        except Exception:
+            continue
+        deleted_objects += 1
+
+    for ch in list(target_collection.children):
+        child_deleted_objects, child_deleted_collections = _purge_collection_tree(ch)
+        deleted_objects += child_deleted_objects
+        deleted_collections += child_deleted_collections
+
+        try:
+            target_collection.children.unlink(ch)
+        except Exception:
+            continue
+
+        if len(ch.users) == 0:
+            try:
+                bpy.data.collections.remove(ch)
+            except Exception:
+                pass
+        deleted_collections += 1
+
+    return deleted_objects, deleted_collections
+
+def _unlink_collection_from_all_parents(col):
+    if col is None:
+        return
+    for scene in list(bpy.data.scenes):
+        try:
+            if scene.collection.children.get(col.name) is not None:
+                scene.collection.children.unlink(col)
+        except Exception:
+            pass
+    for parent in list(bpy.data.collections):
+        if parent == col:
+            continue
+        try:
+            if parent.children.get(col.name) is not None:
+                parent.children.unlink(col)
+        except Exception:
+            pass
+
+def _force_remove_object(obj, keep_obj=None):
+    if obj is None or obj == keep_obj:
+        return False
+
+    try:
+        if keep_obj is not None and keep_obj.parent == obj:
+            keep_obj.parent = None
+        for ch in list(obj.children):
+            if ch == keep_obj:
+                ch.parent = None
+        obj.parent = None
+    except Exception:
+        pass
+
+    for col in list(getattr(obj, "users_collection", [])):
+        try:
+            col.objects.unlink(obj)
+        except Exception:
+            pass
+
+    try:
+        bpy.data.objects.remove(obj, do_unlink=True)
+        return True
+    except Exception:
+        return False
+
+def _remove_helper_named_objects(keep_obj=None, max_passes=8):
+    deleted_objects = 0
+    deleted_collections = 0
+
+    for _ in range(max_passes):
+        deleted_pass = 0
+
+        helpers = [
+            o for o in bpy.data.objects
+            if o is not None and o != keep_obj and _is_helper_object_name(o.name)
+        ]
+        helpers.sort(key=_obj_depth, reverse=True)
+        for helper in helpers:
+            live = bpy.data.objects.get(helper.name)
+            if live is None or live == keep_obj:
+                continue
+            if not _is_helper_object_name(live.name):
+                continue
+            if _force_remove_object(live, keep_obj=keep_obj):
+                deleted_objects += 1
+                deleted_pass += 1
+
+        helper_cols = [
+            c for c in bpy.data.collections
+            if c is not None and _is_helper_object_name(c.name)
+        ]
+        # Remove deeper sub-collections first.
+        helper_cols.sort(key=lambda c: len(getattr(c, "children_recursive", [])), reverse=True)
+        for col in helper_cols:
+            live_col = bpy.data.collections.get(col.name)
+            if live_col is None:
+                continue
+            if not _is_helper_object_name(live_col.name):
+                continue
+
+            for obj in list(live_col.objects):
+                if _force_remove_object(obj, keep_obj=keep_obj):
+                    deleted_objects += 1
+                    deleted_pass += 1
+
+            for ch in list(live_col.children):
+                try:
+                    live_col.children.unlink(ch)
+                except Exception:
+                    pass
+                if len(ch.users) == 0:
+                    try:
+                        bpy.data.collections.remove(ch)
+                    except Exception:
+                        pass
+
+            _unlink_collection_from_all_parents(live_col)
+            if len(live_col.users) == 0:
+                try:
+                    bpy.data.collections.remove(live_col)
+                    deleted_collections += 1
+                    deleted_pass += 1
+                except Exception:
+                    pass
+
+        if deleted_pass == 0:
+            break
+
+    remaining_helpers = [
+        o.name for o in bpy.data.objects
+        if o is not None and o != keep_obj and _is_helper_object_name(o.name)
+    ]
+    return deleted_objects, deleted_collections, remaining_helpers
 
 # ---------- A3OB material setter (FIXED) ----------
 
@@ -1992,10 +2167,11 @@ class CRAY_OT_FixMeshHierarchy(Operator):
 
     def execute(self, context):
         ts = context.scene.cray_texreplace_settings
-        target_obj, src = _resolve_fix_target_object(context, ts.picked_object)
+        target_obj, src = _pick_random_scene_fix_mesh(context)
         if target_obj is None:
-            self.report({"ERROR"}, "No mesh object found in picked/active/selected scope")
+            self.report({"ERROR"}, "No mesh object found in scene")
             return {"CANCELLED"}
+        ts.picked_object = target_obj
 
         if context.mode != "OBJECT":
             try:
@@ -2003,130 +2179,119 @@ class CRAY_OT_FixMeshHierarchy(Operator):
             except Exception:
                 pass
 
-        scope_objs, scope_src = _collect_fix_scope(context, target_obj)
-        obj, target_src = _pick_primary_mesh(scope_objs, target_obj)
-        if obj is None:
-            self.report({"ERROR"}, "No mesh object in selected/root scope")
+        scope_src = "root-branch"
+        scope_objs = []
+        target_collection = context.scene.collection.children.get(_ROOT_COLLECTION_NAME)
+        if target_collection is not None:
+            col_objs = _collect_collection_objects_deep(target_collection)
+            if any(o == target_obj for o in col_objs):
+                scope_objs = col_objs
+                scope_src = "target-collection"
+
+        if not scope_objs:
+            root_obj = target_obj
+            while root_obj.parent is not None:
+                root_obj = root_obj.parent
+            scope_objs = [root_obj]
+            scope_objs.extend(_iter_descendants(root_obj))
+
+        scope_names = []
+        for o in scope_objs:
+            try:
+                name = o.name
+            except ReferenceError:
+                continue
+            if not name:
+                continue
+            if name not in scope_names:
+                scope_names.append(name)
+
+        mesh_candidates = [
+            o for o in (bpy.data.objects.get(name) for name in scope_names)
+            if o is not None and o.type == "MESH" and o.data is not None and len(o.data.polygons) > 0
+        ]
+        if not mesh_candidates:
+            self.report({"ERROR"}, "No mesh object in root branch")
             return {"CANCELLED"}
-        ts.picked_object = obj
-        old_parent_names = []
-        p = obj.parent
-        while p is not None:
-            old_parent_names.append(p.name)
-            p = p.parent
+        active_mesh = random.choice(mesh_candidates)
+        active_mesh_name = active_mesh.name
+        ts.picked_object = active_mesh
 
-        descendant_names = {o.name for o in _iter_descendants(obj)}
-        delete_objs = []
-        join_objs = []
-        for ch in scope_objs:
-            if ch == obj:
+        # Emulate "A then Ctrl+J": pick one active mesh, select full branch, then join meshes.
+        bpy.ops.object.select_all(action="DESELECT")
+        for name in scope_names:
+            ch_live = bpy.data.objects.get(name)
+            if ch_live is None:
                 continue
-            if bpy.data.objects.get(ch.name) is None:
-                continue
+            try:
+                ch_live.hide_set(False)
+            except Exception:
+                pass
+            try:
+                ch_live.hide_viewport = False
+            except Exception:
+                pass
+            ch_live.select_set(True)
+        context.view_layer.objects.active = active_mesh
 
-            if _is_helper_object_name(ch.name):
-                delete_objs.append(ch)
-                continue
-
-            if ch.type == "MESH":
-                poly_count = len(ch.data.polygons) if ch.data else 0
-                if poly_count > 0:
-                    join_objs.append(ch)
-                else:
-                    delete_objs.append(ch)
-            else:
-                if ch.name in descendant_names:
-                    delete_objs.append(ch)
-
-        deleted_count = 0
-        for ch in sorted(delete_objs, key=_obj_depth, reverse=True):
-            if bpy.data.objects.get(ch.name) is not None:
-                bpy.data.objects.remove(ch, do_unlink=True)
-                deleted_count += 1
-
+        selected_meshes = [
+            o for o in context.selected_objects
+            if o.type == "MESH" and o.data is not None and len(o.data.polygons) > 0
+        ]
         joined_count = 0
-        if join_objs:
-            bpy.ops.object.select_all(action="DESELECT")
-            obj.select_set(True)
-            for ch in join_objs:
-                if bpy.data.objects.get(ch.name) is not None:
-                    try:
-                        ch.hide_set(False)
-                    except Exception:
-                        pass
-                    try:
-                        ch.hide_viewport = False
-                    except Exception:
-                        pass
-                    ch.select_set(True)
-            context.view_layer.objects.active = obj
-            selected_meshes = [o for o in context.selected_objects if o.type == "MESH"]
-            if len(selected_meshes) > 1:
-                bpy.ops.object.join()
-                joined_count = len(selected_meshes) - 1
+        if len(selected_meshes) > 1:
+            bpy.ops.object.join()
+            joined_count = len(selected_meshes) - 1
 
-        mesh = obj.data
-        before_v = len(mesh.vertices)
-        before_e = len(mesh.edges)
-        before_f = len(mesh.polygons)
+        merged_obj = context.view_layer.objects.active
+        if merged_obj is None or merged_obj.type != "MESH":
+            merged_obj = bpy.data.objects.get(active_mesh_name)
+        if merged_obj is None or merged_obj.type != "MESH":
+            self.report({"ERROR"}, "Join failed: no active mesh after Ctrl+J")
+            return {"CANCELLED"}
 
-        bm = bmesh.new()
-        bm.from_mesh(mesh)
-        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
-        bmesh.ops.dissolve_degenerate(bm, edges=bm.edges, dist=0.000001)
-        loose_edges = [e for e in bm.edges if not e.link_faces]
-        if loose_edges:
-            bmesh.ops.delete(bm, geom=loose_edges, context="EDGES")
-        loose_verts = [v for v in bm.verts if not v.link_edges]
-        if loose_verts:
-            bmesh.ops.delete(bm, geom=loose_verts, context="VERTS")
-        bm.normal_update()
-        bm.to_mesh(mesh)
-        bm.free()
-        mesh.update()
+        live_scope_names = []
+        for name in scope_names:
+            ch_live = bpy.data.objects.get(name)
+            if ch_live is None or ch_live == merged_obj:
+                continue
+            live_scope_names.append(( _obj_depth(ch_live), name ))
+        live_scope_names.sort(key=lambda it: it[0], reverse=True)
 
-        after_v = len(mesh.vertices)
-        after_e = len(mesh.edges)
-        after_f = len(mesh.polygons)
-        target_collection, root_obj, visuals_obj, mesh_obj = _ensure_visual_hierarchy(context, obj)
-        deleted_parents = 0
-        for anc_name in old_parent_names:
-            anc_live = bpy.data.objects.get(anc_name)
-            if anc_live is None:
+        deleted_scope = 0
+        for _, name in live_scope_names:
+            ch_live = bpy.data.objects.get(name)
+            if ch_live is None:
                 continue
-            if anc_live == mesh_obj:
+            try:
+                bpy.data.objects.remove(ch_live, do_unlink=True)
+            except Exception:
                 continue
-            if anc_live.type != "EMPTY":
-                continue
-            if len(anc_live.children) != 0:
-                continue
-            bpy.data.objects.remove(anc_live, do_unlink=True)
-            deleted_parents += 1
+            deleted_scope += 1
 
-        deleted_helpers = 0
-        for helper in list(bpy.data.objects):
-            if helper.type != "EMPTY":
-                continue
-            if not _is_export_helper_empty_name(helper.name):
-                continue
-            if len(helper.children) != 0:
-                continue
-            bpy.data.objects.remove(helper, do_unlink=True)
-            deleted_helpers += 1
+        target_collection, mesh_obj = _ensure_flat_collection_mesh(context, merged_obj)
+        deleted_target_objs, deleted_target_cols = _cleanup_target_collection_keep_mesh(target_collection, mesh_obj)
 
-        deleted_total = deleted_count + deleted_parents + deleted_helpers
-        extras = [f"src: {src}", f"scope_objs: {len(scope_objs)}"]
-        if scope_src != "target-descendants":
-            extras.append(f"scope: {scope_src}")
-        if target_src != "preferred":
-            extras.append(f"target: {target_src}")
+        deleted_helpers, deleted_helper_cols, remaining_helpers = _remove_helper_named_objects(keep_obj=mesh_obj)
+
+        deleted_total = deleted_scope + deleted_target_objs + deleted_helpers
+        extras = [
+            f"src: {src}",
+            f"scope: {scope_src}",
+            f"scope_objs: {len(scope_names)}",
+            f"anchor: {active_mesh_name}",
+        ]
+        if deleted_helper_cols:
+            extras.append(f"helper_cols: {deleted_helper_cols}")
+        if remaining_helpers:
+            extras.append(f"remaining_helpers: {len(remaining_helpers)}")
         suffix = "" if not extras else f", {', '.join(extras)}"
         self.report(
             {"INFO"},
             (
-                f"Fixed '{obj.name}': deleted children {deleted_total}, joined {joined_count}, "
-                f"verts {before_v}->{after_v}, edges {before_e}->{after_e}, faces {before_f}->{after_f}, "
-                f"hierarchy: {target_collection.name}/{root_obj.name}/{visuals_obj.name}/{mesh_obj.name}{suffix}"
+                f"Fixed '{mesh_obj.name}': joined {joined_count}, removed objects {deleted_total}, "
+                f"removed subcollections {deleted_target_cols}, "
+                f"hierarchy: {context.scene.collection.name}/{target_collection.name}/{mesh_obj.name}{suffix}"
             ),
         )
         return {"FINISHED"}
