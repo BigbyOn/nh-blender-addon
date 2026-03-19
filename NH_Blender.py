@@ -2,7 +2,7 @@ bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Daryl and Enisam",
     "version": (0, 1, 6),
-    "blender": (4, 4, 0),
+    "blender": (4, 4, 3),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "Scatter Arma3 Proxy objects using DayZ clutter config + Texture Replace (.paa/.rvmat) + Replace from DB via A3OB",
     "doc_url": "https://github.com/BigbyOn/nh-blender-addon",
@@ -1557,6 +1557,7 @@ _HELPER_OBJ_PREFIXES = (
 )
 
 _ROOT_COLLECTION_NAME = "Collection"
+_FIX_TARGET_COLLECTION_BASENAME = "NH_Fix_Result"
 
 def _is_helper_object_name(name: str) -> bool:
     n = (name or "").strip().lower()
@@ -1584,20 +1585,21 @@ def _is_export_helper_empty_name(name: str) -> bool:
     n = (name or "").strip().lower()
     return n == "visuals" or n.endswith("_a.p3d")
 
+def _scene_fix_collection_name(scene):
+    scene_name = (getattr(scene, "name", "") or "").strip()
+    if not scene_name:
+        return _FIX_TARGET_COLLECTION_BASENAME
+    safe = re.sub(r"[\\/:*?\"<>|]+", "_", scene_name)
+    return f"{_FIX_TARGET_COLLECTION_BASENAME}_{safe}"
+
 def _ensure_target_collection(context, mesh_obj):
     scene_root = context.scene.collection
+    target_name = _scene_fix_collection_name(context.scene)
 
-    target = scene_root.children.get(_ROOT_COLLECTION_NAME)
-    if target is not None:
-        return target
-
-    target = bpy.data.collections.get(_ROOT_COLLECTION_NAME)
+    target = scene_root.children.get(target_name)
     if target is None:
-        target = bpy.data.collections.new(_ROOT_COLLECTION_NAME)
-
-    if scene_root.children.get(target.name) is None:
+        target = bpy.data.collections.new(target_name)
         scene_root.children.link(target)
-
     return target
 
 def _collect_fix_scope(context, target_obj):
@@ -1737,6 +1739,25 @@ def _collect_collection_objects_deep(collection):
         stack.extend(col.children)
     return out
 
+def _collect_collections_deep(collection):
+    if collection is None:
+        return []
+
+    out = []
+    seen = set()
+    stack = [collection]
+    while stack:
+        col = stack.pop()
+        if col is None:
+            continue
+        key = col.as_pointer()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(col)
+        stack.extend(col.children)
+    return out
+
 def _pick_random_scene_fix_mesh(context):
     root_col = context.scene.collection.children.get(_ROOT_COLLECTION_NAME)
     if root_col is not None:
@@ -1796,7 +1817,7 @@ def _purge_collection_tree(collection):
     deleted_objects = 0
     deleted_collections = 0
 
-    for ch in list(collection.children):
+    for ch_idx, ch in enumerate(list(collection.children), start=1):
         child_deleted_objects, child_deleted_collections = _purge_collection_tree(ch)
         deleted_objects += child_deleted_objects
         deleted_collections += child_deleted_collections
@@ -1812,13 +1833,17 @@ def _purge_collection_tree(collection):
                 except Exception:
                     pass
             deleted_collections += 1
+        if ch_idx % 25 == 0:
+            _ui_yield()
 
-    for obj in list(collection.objects):
+    for obj_idx, obj in enumerate(list(collection.objects), start=1):
         try:
             bpy.data.objects.remove(obj, do_unlink=True)
         except Exception:
             continue
         deleted_objects += 1
+        if obj_idx % 50 == 0:
+            _ui_yield()
 
     return deleted_objects, deleted_collections
 
@@ -1826,7 +1851,7 @@ def _cleanup_target_collection_keep_mesh(target_collection, keep_obj):
     deleted_objects = 0
     deleted_collections = 0
 
-    for obj in list(target_collection.objects):
+    for obj_idx, obj in enumerate(list(target_collection.objects), start=1):
         if obj == keep_obj:
             continue
         try:
@@ -1834,8 +1859,10 @@ def _cleanup_target_collection_keep_mesh(target_collection, keep_obj):
         except Exception:
             continue
         deleted_objects += 1
+        if obj_idx % 50 == 0:
+            _ui_yield()
 
-    for ch in list(target_collection.children):
+    for ch_idx, ch in enumerate(list(target_collection.children), start=1):
         child_deleted_objects, child_deleted_collections = _purge_collection_tree(ch)
         deleted_objects += child_deleted_objects
         deleted_collections += child_deleted_collections
@@ -1851,6 +1878,8 @@ def _cleanup_target_collection_keep_mesh(target_collection, keep_obj):
             except Exception:
                 pass
         deleted_collections += 1
+        if ch_idx % 25 == 0:
+            _ui_yield()
 
     return deleted_objects, deleted_collections
 
@@ -1872,9 +1901,29 @@ def _unlink_collection_from_all_parents(col):
         except Exception:
             pass
 
-def _force_remove_object(obj, keep_obj=None):
+def _unlink_collection_from_scene_parents(scene, col):
+    if scene is None or col is None:
+        return
+    scene_cols = _collect_collections_deep(scene.collection)
+    for parent in scene_cols:
+        if parent == col:
+            continue
+        try:
+            if any(ch == col for ch in parent.children):
+                parent.children.unlink(col)
+        except Exception:
+            pass
+
+def _force_remove_object(obj, keep_obj=None, allowed_col_ptrs=None):
     if obj is None or obj == keep_obj:
         return False
+
+    cols = list(getattr(obj, "users_collection", []))
+    if allowed_col_ptrs is not None:
+        for col in cols:
+            if col.as_pointer() not in allowed_col_ptrs:
+                # Object is shared with another scene/collection tree. Keep it safe.
+                return False
 
     try:
         if keep_obj is not None and keep_obj.parent == obj:
@@ -1886,7 +1935,9 @@ def _force_remove_object(obj, keep_obj=None):
     except Exception:
         pass
 
-    for col in list(getattr(obj, "users_collection", [])):
+    for col in cols:
+        if allowed_col_ptrs is not None and col.as_pointer() not in allowed_col_ptrs:
+            continue
         try:
             col.objects.unlink(obj)
         except Exception:
@@ -1898,43 +1949,61 @@ def _force_remove_object(obj, keep_obj=None):
     except Exception:
         return False
 
-def _remove_helper_named_objects(keep_obj=None, max_passes=8):
+def _remove_helper_named_objects(scene=None, keep_obj=None, max_passes=8):
+    if scene is None:
+        scene = bpy.context.scene if bpy.context is not None else None
+    if scene is None:
+        return 0, 0, []
+
+    scene_cols = _collect_collections_deep(scene.collection)
+    scene_col_ptrs = {c.as_pointer() for c in scene_cols if c is not None}
+
     deleted_objects = 0
     deleted_collections = 0
 
-    for _ in range(max_passes):
+    for pass_idx in range(max_passes):
         deleted_pass = 0
 
         helpers = [
-            o for o in bpy.data.objects
+            o for o in scene.objects
             if o is not None and o != keep_obj and _is_helper_object_name(o.name)
         ]
         helpers.sort(key=_obj_depth, reverse=True)
-        for helper in helpers:
-            live = bpy.data.objects.get(helper.name)
+        for obj_idx, helper in enumerate(helpers, start=1):
+            live = helper
             if live is None or live == keep_obj:
                 continue
-            if not _is_helper_object_name(live.name):
+            try:
+                live_name = live.name
+            except ReferenceError:
                 continue
-            if _force_remove_object(live, keep_obj=keep_obj):
+            if not _is_helper_object_name(live_name):
+                continue
+            if _force_remove_object(live, keep_obj=keep_obj, allowed_col_ptrs=scene_col_ptrs):
                 deleted_objects += 1
                 deleted_pass += 1
+            if obj_idx % 50 == 0:
+                _ui_yield()
 
         helper_cols = [
-            c for c in bpy.data.collections
-            if c is not None and _is_helper_object_name(c.name)
+            c for c in scene_cols
+            if c is not None and c != scene.collection and _is_helper_object_name(c.name)
         ]
         # Remove deeper sub-collections first.
         helper_cols.sort(key=lambda c: len(getattr(c, "children_recursive", [])), reverse=True)
-        for col in helper_cols:
-            live_col = bpy.data.collections.get(col.name)
+        for col_idx, col in enumerate(helper_cols, start=1):
+            live_col = col
             if live_col is None:
                 continue
-            if not _is_helper_object_name(live_col.name):
+            try:
+                live_col_name = live_col.name
+            except ReferenceError:
+                continue
+            if not _is_helper_object_name(live_col_name):
                 continue
 
             for obj in list(live_col.objects):
-                if _force_remove_object(obj, keep_obj=keep_obj):
+                if _force_remove_object(obj, keep_obj=keep_obj, allowed_col_ptrs=scene_col_ptrs):
                     deleted_objects += 1
                     deleted_pass += 1
 
@@ -1949,7 +2018,7 @@ def _remove_helper_named_objects(keep_obj=None, max_passes=8):
                     except Exception:
                         pass
 
-            _unlink_collection_from_all_parents(live_col)
+            _unlink_collection_from_scene_parents(scene, live_col)
             if len(live_col.users) == 0:
                 try:
                     bpy.data.collections.remove(live_col)
@@ -1957,15 +2026,129 @@ def _remove_helper_named_objects(keep_obj=None, max_passes=8):
                     deleted_pass += 1
                 except Exception:
                     pass
+            if col_idx % 25 == 0:
+                _ui_yield()
 
         if deleted_pass == 0:
             break
+        if pass_idx % 2 == 1:
+            _ui_yield()
 
     remaining_helpers = [
-        o.name for o in bpy.data.objects
+        o.name for o in scene.objects
         if o is not None and o != keep_obj and _is_helper_object_name(o.name)
     ]
     return deleted_objects, deleted_collections, remaining_helpers
+
+def _ui_yield():
+    try:
+        bpy.ops.wm.redraw_timer(type="DRAW_WIN_SWAP", iterations=1)
+    except Exception:
+        pass
+
+def _ensure_object_visible_for_ops(obj):
+    if obj is None:
+        return
+    try:
+        obj.hide_set(False)
+    except Exception:
+        pass
+    try:
+        obj.hide_viewport = False
+    except Exception:
+        pass
+
+def _join_meshes_in_batches(context, anchor_obj, mesh_names, batch_size=24):
+    if anchor_obj is None or anchor_obj.type != "MESH" or anchor_obj.data is None:
+        raise RuntimeError("Join anchor must be a mesh object")
+
+    batch_size = int(batch_size)
+    batch_limit = None if batch_size <= 1 else max(2, batch_size)
+    anchor_name = anchor_obj.name
+    pending = [n for n in mesh_names if n and n != anchor_name]
+    joined_count = 0
+    join_passes = 0
+
+    while pending:
+        anchor = bpy.data.objects.get(anchor_name)
+        if anchor is None or anchor.type != "MESH" or anchor.data is None:
+            raise RuntimeError("Join failed: anchor mesh became unavailable")
+
+        batch_names = []
+        next_pending = []
+        for nm in pending:
+            live = bpy.data.objects.get(nm)
+            if live is None or live == anchor:
+                continue
+            if live.type != "MESH" or live.data is None or len(live.data.polygons) == 0:
+                continue
+            if batch_limit is None or len(batch_names) < batch_limit:
+                batch_names.append(nm)
+            else:
+                next_pending.append(nm)
+        pending = next_pending
+
+        if not batch_names:
+            break
+
+        bpy.ops.object.select_all(action="DESELECT")
+        _ensure_object_visible_for_ops(anchor)
+        anchor.select_set(True)
+        selected_for_join = [anchor]
+
+        for nm in batch_names:
+            live = bpy.data.objects.get(nm)
+            if live is None or live == anchor:
+                continue
+            _ensure_object_visible_for_ops(live)
+            live.select_set(True)
+            selected_for_join.append(live)
+
+        if len(selected_for_join) <= 1:
+            continue
+
+        context.view_layer.objects.active = anchor
+        bpy.ops.object.join()
+        joined_count += len(selected_for_join) - 1
+        join_passes += 1
+
+        active_after = context.view_layer.objects.active
+        if active_after is not None and active_after.type == "MESH":
+            anchor_name = active_after.name
+
+        _ui_yield()
+
+    merged_obj = bpy.data.objects.get(anchor_name)
+    if merged_obj is None or merged_obj.type != "MESH":
+        raise RuntimeError("Join failed: no merged mesh after staged join")
+    return merged_obj, joined_count, join_passes
+
+def _center_object_bbox_to_world_origin(obj):
+    if obj is None:
+        return False, Vector((0.0, 0.0, 0.0))
+
+    bbox_world = []
+    try:
+        for corner in obj.bound_box:
+            bbox_world.append(obj.matrix_world @ Vector(corner))
+    except Exception:
+        bbox_world = []
+
+    if bbox_world:
+        center = Vector((0.0, 0.0, 0.0))
+        for p in bbox_world:
+            center += p
+        center /= len(bbox_world)
+    else:
+        center = obj.matrix_world.translation.copy()
+
+    if center.length <= 1e-7:
+        return False, center
+
+    mw = obj.matrix_world.copy()
+    mw.translation = mw.translation - center
+    obj.matrix_world = mw
+    return True, center
 
 # ---------- A3OB material setter (FIXED) ----------
 
@@ -2075,6 +2258,22 @@ class CRAY_PG_ObjMatImagesItem(PropertyGroup):
 class CRAY_PG_TexReplaceSettings(PropertyGroup):
     folder: StringProperty(name="Folder", default="P:\\NH_ObjectTextures", subtype="DIR_PATH")
     picked_object: PointerProperty(name="Select Object", type=bpy.types.Object)
+    fix_mesh_join_batch: IntProperty(
+        name="Fix Mesh Join Batch",
+        description=(
+            "How many meshes to join in one pass. "
+            "1 = try to join all at once (legacy behavior), "
+            "higher values split work into stages"
+        ),
+        default=1,
+        min=1,
+        max=500,
+    )
+    fix_mesh_center_to_origin: BoolProperty(
+        name="Center Fixed Mesh To (0,0,0)",
+        description="After Fix Mesh, move merged object's bounds center to world origin",
+        default=True,
+    )
     obj_preview_items: bpy.props.CollectionProperty(type=CRAY_PG_ObjMatImagesItem)
     obj_preview_active_index: IntProperty(default=0)
     db_items: bpy.props.CollectionProperty(type=CRAY_PG_TexDBItem)
@@ -2167,9 +2366,9 @@ class CRAY_OT_FixMeshHierarchy(Operator):
 
     def execute(self, context):
         ts = context.scene.cray_texreplace_settings
-        target_obj, src = _pick_random_scene_fix_mesh(context)
+        target_obj, src = _resolve_fix_target_object(context, ts.picked_object)
         if target_obj is None:
-            self.report({"ERROR"}, "No mesh object found in scene")
+            self.report({"ERROR"}, "No mesh object found (pick/select one)")
             return {"CANCELLED"}
         ts.picked_object = target_obj
 
@@ -2179,21 +2378,7 @@ class CRAY_OT_FixMeshHierarchy(Operator):
             except Exception:
                 pass
 
-        scope_src = "root-branch"
-        scope_objs = []
-        target_collection = context.scene.collection.children.get(_ROOT_COLLECTION_NAME)
-        if target_collection is not None:
-            col_objs = _collect_collection_objects_deep(target_collection)
-            if any(o == target_obj for o in col_objs):
-                scope_objs = col_objs
-                scope_src = "target-collection"
-
-        if not scope_objs:
-            root_obj = target_obj
-            while root_obj.parent is not None:
-                root_obj = root_obj.parent
-            scope_objs = [root_obj]
-            scope_objs.extend(_iter_descendants(root_obj))
+        scope_objs, scope_src = _collect_fix_scope(context, target_obj)
 
         scope_names = []
         for o in scope_objs:
@@ -2211,43 +2396,36 @@ class CRAY_OT_FixMeshHierarchy(Operator):
             if o is not None and o.type == "MESH" and o.data is not None and len(o.data.polygons) > 0
         ]
         if not mesh_candidates:
-            self.report({"ERROR"}, "No mesh object in root branch")
+            self.report({"ERROR"}, "No mesh object in selected scope")
             return {"CANCELLED"}
-        active_mesh = random.choice(mesh_candidates)
-        active_mesh_name = active_mesh.name
-        ts.picked_object = active_mesh
 
-        # Emulate "A then Ctrl+J": pick one active mesh, select full branch, then join meshes.
-        bpy.ops.object.select_all(action="DESELECT")
-        for name in scope_names:
-            ch_live = bpy.data.objects.get(name)
-            if ch_live is None:
-                continue
-            try:
-                ch_live.hide_set(False)
-            except Exception:
-                pass
-            try:
-                ch_live.hide_viewport = False
-            except Exception:
-                pass
-            ch_live.select_set(True)
-        context.view_layer.objects.active = active_mesh
+        anchor_mesh = None
+        anchor_src = "largest-non-helper"
+        if target_obj in mesh_candidates and not _is_helper_object_name(target_obj.name):
+            anchor_mesh = target_obj
+            anchor_src = "target"
+        else:
+            non_helper = [o for o in mesh_candidates if not _is_helper_object_name(o.name)]
+            if non_helper:
+                anchor_mesh = max(non_helper, key=lambda o: len(o.data.polygons) if o.data else 0)
+            else:
+                anchor_mesh = max(mesh_candidates, key=lambda o: len(o.data.polygons) if o.data else 0)
+                anchor_src = "largest-mesh"
+        if anchor_mesh is None:
+            self.report({"ERROR"}, "No valid mesh anchor in selected scope")
+            return {"CANCELLED"}
+        active_mesh_name = anchor_mesh.name
+        ts.picked_object = anchor_mesh
 
-        selected_meshes = [
-            o for o in context.selected_objects
-            if o.type == "MESH" and o.data is not None and len(o.data.polygons) > 0
-        ]
-        joined_count = 0
-        if len(selected_meshes) > 1:
-            bpy.ops.object.join()
-            joined_count = len(selected_meshes) - 1
-
-        merged_obj = context.view_layer.objects.active
-        if merged_obj is None or merged_obj.type != "MESH":
-            merged_obj = bpy.data.objects.get(active_mesh_name)
-        if merged_obj is None or merged_obj.type != "MESH":
-            self.report({"ERROR"}, "Join failed: no active mesh after Ctrl+J")
+        try:
+            merged_obj, joined_count, join_passes = _join_meshes_in_batches(
+                context=context,
+                anchor_obj=anchor_mesh,
+                mesh_names=[o.name for o in mesh_candidates],
+                batch_size=ts.fix_mesh_join_batch,
+            )
+        except Exception as e:
+            self.report({"ERROR"}, f"Join failed: {_fmt_exc(e)}")
             return {"CANCELLED"}
 
         live_scope_names = []
@@ -2259,7 +2437,7 @@ class CRAY_OT_FixMeshHierarchy(Operator):
         live_scope_names.sort(key=lambda it: it[0], reverse=True)
 
         deleted_scope = 0
-        for _, name in live_scope_names:
+        for idx, (_, name) in enumerate(live_scope_names, start=1):
             ch_live = bpy.data.objects.get(name)
             if ch_live is None:
                 continue
@@ -2268,23 +2446,46 @@ class CRAY_OT_FixMeshHierarchy(Operator):
             except Exception:
                 continue
             deleted_scope += 1
+            if idx % 50 == 0:
+                _ui_yield()
 
         target_collection, mesh_obj = _ensure_flat_collection_mesh(context, merged_obj)
         deleted_target_objs, deleted_target_cols = _cleanup_target_collection_keep_mesh(target_collection, mesh_obj)
 
-        deleted_helpers, deleted_helper_cols, remaining_helpers = _remove_helper_named_objects(keep_obj=mesh_obj)
+        deleted_helpers, deleted_helper_cols, remaining_helpers = _remove_helper_named_objects(
+            scene=context.scene,
+            keep_obj=mesh_obj,
+        )
+
+        centered = False
+        center_vec = Vector((0.0, 0.0, 0.0))
+        if ts.fix_mesh_center_to_origin:
+            centered, center_vec = _center_object_bbox_to_world_origin(mesh_obj)
 
         deleted_total = deleted_scope + deleted_target_objs + deleted_helpers
         extras = [
             f"src: {src}",
             f"scope: {scope_src}",
+            f"scene: {context.scene.name}",
             f"scope_objs: {len(scope_names)}",
             f"anchor: {active_mesh_name}",
+            f"anchor_src: {anchor_src}",
+            f"join_passes: {join_passes}",
+            f"join_batch: {int(ts.fix_mesh_join_batch)}",
         ]
         if deleted_helper_cols:
             extras.append(f"helper_cols: {deleted_helper_cols}")
         if remaining_helpers:
             extras.append(f"remaining_helpers: {len(remaining_helpers)}")
+        if ts.fix_mesh_center_to_origin:
+            if centered:
+                extras.append(
+                    f"centered_to_origin: yes ({center_vec.x:.3f}, {center_vec.y:.3f}, {center_vec.z:.3f})"
+                )
+            else:
+                extras.append("centered_to_origin: already")
+        else:
+            extras.append("centered_to_origin: off")
         suffix = "" if not extras else f", {', '.join(extras)}"
         self.report(
             {"INFO"},
@@ -3948,6 +4149,7 @@ class CRAY_PT_FixesPanel(Panel):
 
     def draw(self, context):
         layout = self.layout
+        ts = context.scene.cray_texreplace_settings
         box = layout.box()
         box.label(text="Shading/Geometry fixes", icon="MOD_SMOOTH")
         box.label(text="Select mesh object(s)", icon="INFO")
@@ -3955,6 +4157,9 @@ class CRAY_PT_FixesPanel(Panel):
         box.operator("cray.fix_shading_by_pipeline", text="Fix Shading", icon="SHADING_RENDERED")
         box.separator()
         box.label(text="Hierarchy fix", icon="MOD_REMESH")
+        box.prop(ts, "fix_mesh_join_batch")
+        box.prop(ts, "fix_mesh_center_to_origin")
+        box.label(text="Fix Mesh uses selected/active object first", icon="INFO")
         box.operator("cray.fix_mesh_hierarchy", text="Fix Mesh/Hierarchy", icon="MOD_REMESH")
 
 class CRAY_PT_ImportExportPlannerPanel(Panel):

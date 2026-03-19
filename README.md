@@ -1,19 +1,17 @@
 # NH Blender Plugin
 
-Аддон Blender для пайплайнов DayZ/Arma с интеграцией A3OB.
+Аддон Blender для пайплайна DayZ/Arma с интеграцией Arma 3 Object Builder (A3OB).
 
-## Основные возможности
+## Возможности
 
 - Scatter clutter-прокси из DayZ-конфига (`CfgWorlds -> CAWorld -> Clutter` + `CfgSurfaceCharacters`)
 - Сборка базы текстур из папки (`.paa` / `.rvmat`)
 - Замена путей материалов из базы через A3OB-совместимые свойства
-- Пакетный импорт/экспорт `.p3d`-коллекций (с сохранением source-path и опциональным `.bak`)
-- Построение временной P3D Asset Library и конвертация расставленных ассетов в A3OB-прокси
-- Панель быстрых фиксов:
-- `Fix Shading` (merge выбранных mesh, clear split normals, recalc normals, shade smooth)
-- `Fix Mesh/Hierarchy` (дублирующая кнопка быстрого доступа)
+- Пакетный import/export `.p3d` коллекций
+- Временная P3D Asset Library и конвертация расставленных ассетов в A3OB proxy
+- Панель быстрых фиксов геометрии/иерархии
 
-## Панели в UI
+## Панели UI
 
 - `Clutter Proxies (DayZ)`
 - `P3D Asset Library`
@@ -21,22 +19,12 @@
 - `Import/Export planner`
 - `Texture Replace`
 
-## Примечания по экспорту
-
-- `Force export all LODs (skip validation)` предусмотрен для проблемных файлов.
-- По умолчанию параметр **OFF**.
-- При частичном экспорте batch-экспорт делает post-check и пишет в System Console, какие LOD не попали в файл.
-
-## Статус Snap Points
-
-- Инструменты Snap Points пока оставлены в коде, но панель скрыта в UI.
-- Это временно, пока дорабатывается пайплайн и логика работы.
+Расположение: `3D Viewport -> N Panel -> NH Plugin`
 
 ## Требования
 
 - Blender `4.4+`
 - Включенный аддон: **Arma 3 Object Builder (A3OB)**
-- Для пакетных `.p3d`-операций нужны доступные A3OB import/export операторы
 
 ## Установка
 
@@ -45,26 +33,27 @@
 3. Выберите `NH_Blender.py`.
 4. Включите аддон.
 
-Расположение панели:
-- `3D Viewport -> N panel -> NH Plugin`
+## Последний релиз: 0.1.7
 
-## Последние изменения (0.1.2 -> 0.1.4)
+### Что изменилось в 0.1.7
 
-- `0.1.2`: добавлены инструменты P3D Asset Library и workflow конвертации selected-объектов в proxy.
-- `0.1.3`: добавлена панель `Fixes`, кнопка `Fix Shading`, скрыта панель Snap Points, добавлена диагностика LOD при batch-экспорте.
-- `0.1.4`: `Force export all LODs` по умолчанию переключен в OFF.
+- `Fix Mesh/Hierarchy` стал безопаснее для больших сцен:
+- Поиск цели идет от selected/active объекта, а не случайно.
+- Join может выполняться поэтапно батчами.
+- Добавлены уступки UI (`redraw/yield`) в тяжелых местах.
+- Добавлено центрирование результата в `(0,0,0)` по bbox.
+- `Fix Mesh Join Batch`:
+- `1` = попытка объединить все за один проход (legacy-поведение).
+- `>=2` = объединение поэтапно батчами.
+- Очистка helper-объектов и фиксовая коллекция ограничены активной сценой.
+- Результат fix складывается в коллекцию вида `NH_Fix_Result_<SceneName>`.
 
-## Ссылки проекта
+Полная история изменений: [CHANGELOG.md](CHANGELOG.md)
+
+## Ссылки
 
 - Репозиторий: <https://github.com/BigbyOn/nh-blender-addon>
 - Issues: <https://github.com/BigbyOn/nh-blender-addon/issues>
-
-## Структура репозитория
-
-- `NH_Blender.py` - основной файл аддона
-- `README.md` - описание проекта и настройка
-- `LICENSE` - условия лицензии
-- `.gitignore` - игнорируемые локальные/сборочные файлы
 
 ## Лицензия
 
