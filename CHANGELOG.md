@@ -2,6 +2,13 @@
 
 Все заметные изменения проекта фиксируются в этом файле.
 
+## [0.1.7] - 2026-03-21
+
+### Изменено
+- Панель `Snap Points (Memory LOD)` снова отображается в UI (`N-panel -> NH Plugin`).
+- В панели `Snap Points` оставлен только manual workflow: `Manual: 2 selected vertices`.
+- Блоки `Auto: edge extremes from model` и `Batch P3D: import -> snap -> export` убраны из UI.
+
 ## [0.1.6] - 2026-03-19
 
 ### Добавлено

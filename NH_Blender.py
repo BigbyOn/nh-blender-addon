@@ -1,7 +1,7 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Daryl and Enisam",
-    "version": (0, 1, 6),
+    "version": (0, 1, 7),
     "blender": (4, 4, 3),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "Scatter Arma3 Proxy objects using DayZ clutter config + Texture Replace (.paa/.rvmat) + Replace from DB via A3OB",
@@ -4067,7 +4067,7 @@ class CRAY_PT_SnapPointsPanel(Panel):
 
     @classmethod
     def poll(cls, context):
-        return False
+        return True
 
     def draw(self, context):
         layout = self.layout
@@ -4092,22 +4092,6 @@ class CRAY_PT_SnapPointsPanel(Panel):
         box.label(text="Manual: 2 selected vertices", icon="EDITMODE_HLT")
         box.label(text="Select exactly 2 vertices in Edit Mode", icon="INFO")
         box.operator("cray.create_snap_pair", icon="MESH_DATA")
-
-        layout.separator()
-        box = layout.box()
-        box.label(text="Auto: edge extremes from model", icon="SNAP_EDGE")
-        box.prop(ss, "edge_axis")
-        box.prop(ss, "edge_side", expand=True)
-        box.prop(ss, "edge_span_axis")
-        box.prop(ss, "edge_tolerance")
-        box.operator("cray.create_snap_pair_from_model_edge", icon="SNAP_EDGE")
-
-        layout.separator()
-        box = layout.box()
-        box.label(text="Batch P3D: import -> snap -> export", icon="FILE_FOLDER")
-        box.prop(ss, "batch_cleanup_imported")
-        box.prop(ss, "batch_overwrite_bak")
-        box.operator("cray.snap_batch_process", icon="FILE_REFRESH")
 
 class CRAY_PT_AssetProxyPanel(Panel):
     bl_idname = "VIEW3D_PT_cray_asset_proxy"
