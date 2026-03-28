@@ -160,14 +160,6 @@ def _register_collider_keymaps():
     if keymap is None:
         keymap = addon_keyconfig.keymaps.new(name=_MESH_KEYMAP_NAME, space_type="EMPTY", region_type="WINDOW")
 
-    for existing in list(keymap.keymap_items):
-        if getattr(existing, "idname", "") != "cray.select_linked_pick_whole_object":
-            continue
-        try:
-            keymap.keymap_items.remove(existing)
-        except Exception:
-            pass
-
     _register_addon_keymap_item(
         keymap,
         "cray.copy_selected_verts_to_geometry",
@@ -187,12 +179,6 @@ def _register_collider_keymaps():
         )
     else:
         print("[NH Plugin] Ctrl+Shift+A is already in use, skipping Select Isolated Verts shortcut.")
-    _register_addon_keymap_item(
-        keymap,
-        "cray.hull_loose_geometry_verts",
-        event_type="BUTTON5MOUSE",
-        value="PRESS",
-    )
     if _mesh_shortcut_is_free(window_manager, event_type="BUTTON4MOUSE", value="PRESS"):
         _register_addon_keymap_item(
             keymap,
@@ -203,17 +189,6 @@ def _register_collider_keymaps():
         )
     else:
         print("[NH Plugin] Mouse4 is already in use, skipping Selection -> Hull shortcut.")
-
-    if _mesh_shortcut_is_free(window_manager, event_type="LEFTMOUSE", value="PRESS", alt=True):
-        _register_addon_keymap_item(
-            keymap,
-            "cray.select_linked_pick_whole_object",
-            event_type="LEFTMOUSE",
-            value="PRESS",
-            alt=True,
-        )
-    else:
-        print("[NH Plugin] Alt+Left Mouse is already in use, skipping collider linked-pick shortcut.")
 
 
 def _unregister_collider_keymaps():
@@ -553,13 +528,17 @@ class CRAY_PG_SnapSettings(PropertyGroup):
     batch_overwrite_bak: BoolProperty(name="Overwrite .bak", default=True)
 
 
-_COLLIDER_LOD_ITEMS = (
+_COLLIDER_TARGET_LOD_ITEMS = (
     ("6", "Geometry", "Object collision geometry and occluders"),
-    ("8", "Geometry PhysX", "PhysX object collision geometry"),
     ("14", "View Geometry", "View occlusion for AI"),
     ("15", "Fire Geometry", "Hitbox geometry"),
 )
-_COLLIDER_LOD_NAMES = {item[0]: item[1] for item in _COLLIDER_LOD_ITEMS}
+_COLLIDER_LOD_NAMES = {
+    "6": "Geometry",
+    "8": "Geometry PhysX",
+    "14": "View Geometry",
+    "15": "Fire Geometry",
+}
 _COLLIDER_KNOWN_LOD_NAMES = {
     **_COLLIDER_LOD_NAMES,
     "0": "Resolution",
@@ -573,6 +552,77 @@ _MISC_COLLECTION_NAME = "Misc"
 _MISC_COLLECTION_COLOR = "COLOR_04"
 _ROADWAY_LOD_TOKEN = "11"
 _ROADWAY_OBJECT_COLOR = (0.72, 0.88, 1.0, 1.0)
+_ROADWAY_SURFACES_FOLDER = r"P:\DZ\surfaces\data\roadway"
+_ROADWAY_MATERIAL_NONE = "__NONE__"
+_ROADWAY_MATERIAL_ENUM_CACHE = [
+    (_ROADWAY_MATERIAL_NONE, "<no materials>", "Roadway object has no assigned materials")
+]
+
+
+def get_roadway_material_enum_items(self, context):
+    del self
+
+    items = []
+    cs = getattr(getattr(context, "scene", None), "cray_collider_settings", None)
+    obj = getattr(cs, "roadway_object", None) if cs else None
+
+    if obj is None or obj.type != "MESH":
+        items = [(_ROADWAY_MATERIAL_NONE, "<no roadway object>", "Assign a Roadway Object to list its materials")]
+    else:
+        seen = set()
+        for slot_idx, slot in enumerate(obj.material_slots, start=1):
+            mat = slot.material
+            if mat is None:
+                continue
+
+            key = mat.name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+
+            image_names = []
+            if mat.use_nodes and mat.node_tree:
+                for node in mat.node_tree.nodes:
+                    if node.type == "TEX_IMAGE" and getattr(node, "image", None):
+                        image_names.append(node.image.name)
+
+            desc = f"Roadway material from slot {slot_idx}"
+            if image_names:
+                uniq_images = sorted(set(image_names), key=lambda x: x.lower())
+                desc = f"{desc} | Images: {', '.join(uniq_images[:3])}"
+                if len(uniq_images) > 3:
+                    desc += f" (+{len(uniq_images) - 3} more)"
+
+            items.append((mat.name, mat.name, desc))
+
+        if not items:
+            items = [(_ROADWAY_MATERIAL_NONE, "<no materials>", "Selected Roadway Object has no assigned materials")]
+
+    global _ROADWAY_MATERIAL_ENUM_CACHE
+    _ROADWAY_MATERIAL_ENUM_CACHE = items
+    return _ROADWAY_MATERIAL_ENUM_CACHE
+
+
+def _on_collider_target_lod_changed(self, context):
+    cs = self
+    if context is None:
+        return
+
+    target_obj = getattr(cs, "geometry_object", None)
+    if target_obj is None or target_obj.type != "MESH":
+        return
+
+    lod_token = str(getattr(cs, "target_lod", "") or "").strip()
+    if lod_token not in _COLLIDER_LOD_NAMES:
+        return
+
+    try:
+        _set_collider_lod_a3ob_props(target_obj, lod_token)
+        _apply_collider_visual_style(target_obj)
+        _enable_collider_object_color_preview(context)
+        _set_collider_settings_object(context, "geometry_object", target_obj)
+    except Exception:
+        pass
 
 
 class CRAY_PG_ColliderSettings(PropertyGroup):
@@ -589,8 +639,9 @@ class CRAY_PG_ColliderSettings(PropertyGroup):
     target_lod: EnumProperty(
         name="Target LOD",
         description="A3OB LOD type for the generated collider object",
-        items=_COLLIDER_LOD_ITEMS,
+        items=_COLLIDER_TARGET_LOD_ITEMS,
         default="6",
+        update=_on_collider_target_lod_changed,
     )
     box_thickness: FloatProperty(
         name="Thickness",
@@ -635,6 +686,11 @@ class CRAY_PG_ColliderSettings(PropertyGroup):
         name="Roadway Object",
         description="Roadway LOD mesh stored in Misc collection",
         type=bpy.types.Object,
+    )
+    roadway_material: EnumProperty(
+        name="Roadway Material",
+        description="Current material on the Roadway object",
+        items=get_roadway_material_enum_items,
     )
     roadway_weld_distance: FloatProperty(
         name="Roadway Weld Distance",
@@ -899,6 +955,9 @@ _A3OB_EXPORT_CANDIDATES = (
     ("a3ob.export_model", ("filepath", "use_selection")),
 )
 
+_A3OB_IMPORT_READ_FILE_PATCHES = []
+_A3OB_IMPORT_TRACKING_SUPPRESS_DEPTH = 0
+
 def _op_handle(op_idname: str):
     try:
         mod, op = op_idname.split(".", 1)
@@ -934,6 +993,16 @@ def _call_first_available(op_candidates, **kwargs):
             last_err = e
             continue
     return None, None, last_err
+
+
+@contextmanager
+def _suppress_a3ob_import_tracking():
+    global _A3OB_IMPORT_TRACKING_SUPPRESS_DEPTH
+    _A3OB_IMPORT_TRACKING_SUPPRESS_DEPTH += 1
+    try:
+        yield
+    finally:
+        _A3OB_IMPORT_TRACKING_SUPPRESS_DEPTH = max(0, _A3OB_IMPORT_TRACKING_SUPPRESS_DEPTH - 1)
 
 
 def _import_first_available_module(module_names):
@@ -1137,15 +1206,7 @@ def _set_memory_lod_a3ob_props(memory_obj):
         props = memory_obj.a3ob_properties_object
         props.lod = "9"
         props.is_a3_lod = True
-        autocenter = None
-        for p in props.properties:
-            if p.name.lower() == "autocenter":
-                autocenter = p
-                break
-        if autocenter is None:
-            autocenter = props.properties.add()
-            autocenter.name = "autocenter"
-        autocenter.value = "0"
+        _remove_a3ob_named_property(props, "autocenter")
     except Exception:
         pass
 
@@ -1511,20 +1572,21 @@ class CRAY_OT_SnapBatchProcess(Operator):
             pre_obj_ptrs = {o.as_pointer() for o in bpy.data.objects}
             pre_col_ptrs = {c.as_pointer() for c in bpy.data.collections}
 
-            _, used_import, import_err = _call_first_available(
-                _A3OB_IMPORT_CANDIDATES,
-                filepath=filepath,
-                first_lod_only=False,
-                absolute_paths=True,
-                enclose=True,
-                groupby="TYPE",
-                additional_data_allowed=True,
-                additional_data={"PROPS", "SELECTIONS"},
-                validate_meshes=False,
-                proxy_action="SEPARATE",
-                translate_selections=False,
-                cleanup_empty_selections=False,
-            )
+            with _suppress_a3ob_import_tracking():
+                _, used_import, import_err = _call_first_available(
+                    _A3OB_IMPORT_CANDIDATES,
+                    filepath=filepath,
+                    first_lod_only=False,
+                    absolute_paths=True,
+                    enclose=True,
+                    groupby="TYPE",
+                    additional_data_allowed=True,
+                    additional_data={"PROPS", "SELECTIONS"},
+                    validate_meshes=False,
+                    proxy_action="SEPARATE",
+                    translate_selections=False,
+                    cleanup_empty_selections=False,
+                )
             if used_import is None:
                 fail_count += 1
                 failures.append((filepath, f"import-failed: {_fmt_exc(import_err) if import_err else 'no operator'}"))
@@ -1665,17 +1727,38 @@ def _is_collider_lod_mesh_object(obj, lod_token=None) -> bool:
     return value == expected
 
 
+def _object_in_logical_collection(obj, collection_name: str) -> bool:
+    if obj is None:
+        return False
+
+    wanted_name = _logical_collection_name(collection_name)
+    for col in getattr(obj, "users_collection", []):
+        if _logical_collection_name(getattr(col, "name", "")) == wanted_name:
+            return True
+    return False
+
+
+def _is_auto_reusable_collider_target(obj, lod_token=None) -> bool:
+    if obj is None or obj.type != "MESH":
+        return False
+
+    if _is_collider_lod_mesh_object(obj, lod_token=lod_token):
+        return True
+
+    return _object_in_logical_collection(obj, _COLLIDER_COLLECTION_NAME)
+
+
 def _pick_collider_lod_object(context, source_obj, lod_token):
     expected_name = _collider_lod_name(lod_token)
 
     if source_obj is not None:
         for col in source_obj.users_collection:
             obj = col.objects.get(expected_name)
-            if obj is not None and obj.type == "MESH":
+            if _is_auto_reusable_collider_target(obj, lod_token=lod_token):
                 return obj
 
     obj = bpy.data.objects.get(expected_name)
-    if obj is not None and obj.type == "MESH":
+    if _is_auto_reusable_collider_target(obj, lod_token=lod_token):
         return obj
 
     for obj in context.scene.objects:
@@ -1698,6 +1781,10 @@ def _find_parent_collection(root_collection, target_collection):
     return None
 
 
+def _logical_collection_name(name: str) -> str:
+    return re.sub(r"\.\d{3}$", "", (name or "").strip().lower())
+
+
 def _preferred_collider_parent_collection(context, source_obj):
     source_col = None
     if source_obj is not None and source_obj.users_collection:
@@ -1717,7 +1804,7 @@ def _preferred_collider_parent_collection(context, source_obj):
         "point clouds",
         "misc",
     }
-    if (source_col.name or "").strip().lower() in logical_group_names:
+    if _logical_collection_name(source_col.name) in logical_group_names:
         return parent
     return source_col
 
@@ -1735,6 +1822,12 @@ def _ensure_named_child_collection(parent_collection, collection_name, color_tag
         return None
 
     target = parent_collection.children.get(collection_name)
+    if target is None:
+        wanted_name = _logical_collection_name(collection_name)
+        for child in parent_collection.children:
+            if _logical_collection_name(child.name) == wanted_name:
+                target = child
+                break
     if target is None:
         target = bpy.data.collections.new(collection_name)
         parent_collection.children.link(target)
@@ -1773,16 +1866,21 @@ def _pick_named_lod_object(context, source_obj, lod_token, object_name):
     return None
 
 
-def _ensure_a3ob_named_property(props, name: str, value: str):
-    match = None
-    for item in getattr(props, "properties", []):
-        if (item.name or "").strip().lower() == name.lower():
-            match = item
-            break
-    if match is None:
-        match = props.properties.add()
-        match.name = name
-    match.value = value
+def _remove_a3ob_named_property(props, name: str):
+    items = getattr(props, "properties", None)
+    if items is None:
+        return
+
+    remove_indices = []
+    for idx, item in enumerate(items):
+        if (getattr(item, "name", "") or "").strip().lower() == name.lower():
+            remove_indices.append(idx)
+
+    for idx in reversed(remove_indices):
+        try:
+            items.remove(idx)
+        except Exception:
+            pass
 
 
 def _set_collider_lod_a3ob_props(target_obj, lod_token):
@@ -1795,7 +1893,7 @@ def _set_collider_lod_a3ob_props(target_obj, lod_token):
         props.resolution = 1
         props.resolution_float = 1.0
         props.is_a3_lod = True
-        _ensure_a3ob_named_property(props, "autocenter", "0")
+        _remove_a3ob_named_property(props, "autocenter")
         lod_name = props.get_name() if hasattr(props, "get_name") else _collider_lod_name(lod_token)
         target_obj.name = lod_name
         if target_obj.data is not None:
@@ -1804,13 +1902,14 @@ def _set_collider_lod_a3ob_props(target_obj, lod_token):
         pass
 
 
-def _collider_target_validation_error(target_obj, lod_token, source_obj=None):
+def _collider_target_validation_error(target_obj, lod_token, source_obj=None, allow_same_source=False):
     if target_obj is None:
         return None
     if target_obj.type != "MESH":
         return "Target LOD Object must be a mesh"
-    if source_obj is not None and target_obj == source_obj:
-        return "Target LOD Object must be separate from the Source Object"
+    if source_obj is not None and target_obj == source_obj and not allow_same_source:
+        if not _is_collider_lod_mesh_object(target_obj, lod_token=lod_token):
+            return "Target LOD Object must be separate from the Source Object"
     if not hasattr(target_obj, "a3ob_properties_object"):
         return None
 
@@ -1828,6 +1927,94 @@ def _collider_target_validation_error(target_obj, lod_token, source_obj=None):
             f"A3OB LOD '{_collider_lod_name(current_lod)}'"
         )
     return None
+
+
+def _tag_redraw_all_areas(context):
+    screen = getattr(getattr(context, "window", None), "screen", None) or getattr(context, "screen", None)
+    if screen is None:
+        return
+
+    for area in getattr(screen, "areas", []):
+        try:
+            for region in area.regions:
+                region.tag_redraw()
+        except Exception:
+            pass
+        try:
+            area.tag_redraw()
+        except Exception:
+            pass
+
+
+def _set_collider_settings_object(context, attr_name, obj):
+    cs = getattr(getattr(context, "scene", None), "cray_collider_settings", None)
+    if cs is None or not hasattr(cs, attr_name):
+        return
+
+    current = getattr(cs, attr_name, None)
+    try:
+        if current == obj:
+            setattr(cs, attr_name, None)
+        setattr(cs, attr_name, obj)
+    except Exception:
+        pass
+
+    try:
+        context.view_layer.update()
+    except Exception:
+        pass
+    _tag_redraw_all_areas(context)
+
+
+def _sync_roadway_material_selection(context, preferred_name=""):
+    cs = getattr(getattr(context, "scene", None), "cray_collider_settings", None)
+    if cs is None:
+        return
+
+    items = get_roadway_material_enum_items(None, context)
+    valid_values = [item[0] for item in items if item and item[0] != _ROADWAY_MATERIAL_NONE]
+    current = (getattr(cs, "roadway_material", "") or "").strip()
+    preferred_name = (preferred_name or "").strip()
+
+    if preferred_name and preferred_name in valid_values:
+        chosen = preferred_name
+    elif current and current in valid_values:
+        chosen = current
+    elif valid_values:
+        chosen = valid_values[0]
+    else:
+        chosen = _ROADWAY_MATERIAL_NONE
+
+    try:
+        cs.roadway_material = chosen
+    except Exception:
+        pass
+
+    _tag_redraw_all_areas(context)
+
+
+def _get_selected_roadway_material(context):
+    cs = getattr(getattr(context, "scene", None), "cray_collider_settings", None)
+    if cs is None:
+        return None
+
+    roadway_obj = getattr(cs, "roadway_object", None)
+    if roadway_obj is None or roadway_obj.type != "MESH":
+        return None
+
+    selected_name = (getattr(cs, "roadway_material", "") or "").strip()
+    fallback_mat = None
+
+    for slot in roadway_obj.material_slots:
+        mat = slot.material
+        if mat is None:
+            continue
+        if fallback_mat is None:
+            fallback_mat = mat
+        if selected_name and mat.name == selected_name:
+            return mat
+
+    return fallback_mat
 
 
 def _apply_collider_visual_style(target_obj):
@@ -1904,6 +2091,10 @@ def _enable_collider_object_color_preview(context):
 def _ensure_collider_lod_object(context, source_obj, lod_token, preferred_obj=None):
     if preferred_obj is not None and preferred_obj.type == "MESH":
         target_obj = preferred_obj
+        _set_collider_lod_a3ob_props(target_obj, lod_token)
+        _apply_collider_visual_style(target_obj)
+        _enable_collider_object_color_preview(context)
+        return target_obj
     else:
         target_obj = _pick_collider_lod_object(context, source_obj, lod_token)
 
@@ -1927,11 +2118,20 @@ def _ensure_collider_lod_object(context, source_obj, lod_token, preferred_obj=No
 
 def _resolve_collider_source_object(context, preferred_obj=None):
     active = context.view_layer.objects.active
-    if preferred_obj is not None and preferred_obj.type == "MESH":
-        return preferred_obj
     if active is not None and active.type == "MESH":
         return active
+    if preferred_obj is not None and preferred_obj.type == "MESH":
+        return preferred_obj
     return None
+
+
+def _resolve_collider_selection_source_object(context, preferred_obj=None):
+    active = context.view_layer.objects.active
+    if active is not None and active.type == "MESH" and active.mode == "EDIT":
+        return active
+    if preferred_obj is not None and preferred_obj.type == "MESH" and preferred_obj.mode == "EDIT":
+        return preferred_obj
+    return _resolve_collider_source_object(context, preferred_obj)
 
 
 def _collect_selected_vertex_world_points(source_obj):
@@ -2015,6 +2215,16 @@ def _dedupe_world_points(points, tolerance=1e-6):
         seen.add(key)
         unique.append(point.copy())
     return unique
+
+
+def _vector_quantized_key(vec, tolerance=1e-6):
+    tol = max(float(tolerance), 1e-12)
+    scale = 1.0 / tol
+    return (
+        round(vec.x * scale),
+        round(vec.y * scale),
+        round(vec.z * scale),
+    )
 
 
 def _collect_selected_collider_input(source_obj, loose_only=False):
@@ -2143,6 +2353,77 @@ def _delete_bmesh_geom(bm, geom_items):
         bmesh.ops.delete(bm, geom=verts, context="VERTS")
 
 
+def _finalize_convex_hull_geometry(bm, hull_result, seed_verts, recalc_normals=True):
+    created_faces = [
+        item for item in hull_result.get("geom", [])
+        if isinstance(item, bmesh.types.BMFace) and item.is_valid
+    ]
+
+    cleanup = []
+    cleanup.extend(hull_result.get("geom_unused", []))
+    cleanup.extend(hull_result.get("geom_interior", []))
+    if cleanup:
+        _delete_bmesh_geom(bm, cleanup)
+
+    affected_verts = {vert for vert in seed_verts if vert.is_valid}
+    for face in created_faces:
+        if not face.is_valid:
+            continue
+        for vert in face.verts:
+            if vert.is_valid:
+                affected_verts.add(vert)
+
+    created_face_set = {face for face in created_faces if face.is_valid}
+    affected_edges = {
+        edge
+        for face in created_face_set
+        for edge in face.edges
+        if edge.is_valid
+        and all(link_face in created_face_set for link_face in edge.link_faces if link_face.is_valid)
+    }
+
+    if affected_edges:
+        bmesh.ops.dissolve_limit(
+            bm,
+            angle_limit=1e-5,
+            use_dissolve_boundaries=True,
+            verts=[vert for vert in affected_verts if vert.is_valid],
+            edges=[edge for edge in affected_edges if edge.is_valid],
+            delimit=set(),
+        )
+
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+
+    loose_edges = [edge for edge in affected_edges if edge.is_valid and len(edge.link_faces) == 0]
+    if loose_edges:
+        bmesh.ops.delete(bm, geom=loose_edges, context="EDGES")
+
+    loose_verts = [
+        vert for vert in affected_verts
+        if vert.is_valid and len(vert.link_edges) == 0 and len(vert.link_faces) == 0
+    ]
+    if loose_verts:
+        bmesh.ops.delete(bm, geom=loose_verts, context="VERTS")
+
+    final_faces = {
+        face
+        for vert in affected_verts
+        if vert.is_valid
+        for face in vert.link_faces
+        if face.is_valid
+    }
+    if not final_faces:
+        raise RuntimeError("Convex hull did not create faces (selection may be too flat or degenerate)")
+
+    final_faces = list(final_faces)
+    if recalc_normals:
+        bmesh.ops.recalc_face_normals(bm, faces=final_faces)
+
+    return final_faces
+
+
 def _append_collider_hull_to_object(target_obj, world_points, merge_distance=0.0, recalc_normals=True):
     if target_obj is None or target_obj.type != "MESH":
         raise RuntimeError("Target Geometry LOD object must be a mesh")
@@ -2180,22 +2461,7 @@ def _append_collider_hull_to_object(target_obj, world_points, merge_distance=0.0
             raise RuntimeError("New collider points collapsed below 4 unique vertices")
 
         hull = bmesh.ops.convex_hull(bm, input=new_verts, use_existing_faces=False)
-        created_faces = [
-            item for item in hull.get("geom", [])
-            if isinstance(item, bmesh.types.BMFace) and item.is_valid
-        ]
-
-        cleanup = []
-        cleanup.extend(hull.get("geom_unused", []))
-        cleanup.extend(hull.get("geom_interior", []))
-        if cleanup:
-            _delete_bmesh_geom(bm, cleanup)
-
-        if not created_faces:
-            raise RuntimeError("Convex hull did not create faces (selection may be too flat or degenerate)")
-
-        if recalc_normals:
-            bmesh.ops.recalc_face_normals(bm, faces=created_faces)
+        _finalize_convex_hull_geometry(bm, hull, new_verts, recalc_normals=recalc_normals)
 
         bm.normal_update()
         bm.to_mesh(mesh)
@@ -2245,6 +2511,42 @@ def _append_world_vertices_to_object(target_obj, world_points):
         bm.free()
 
 
+def _duplicate_selected_verts_as_loose_points_in_edit_object(target_obj):
+    if target_obj is None or target_obj.type != "MESH":
+        raise RuntimeError("Target Geometry LOD object must be a mesh")
+    if target_obj.mode != "EDIT":
+        raise RuntimeError("Target Geometry LOD must be active in Edit Mode")
+
+    mesh = target_obj.data
+    bm = bmesh.from_edit_mesh(mesh)
+    bm.verts.ensure_lookup_table()
+
+    selected_verts = [vert for vert in bm.verts if vert.is_valid and vert.select]
+    if not selected_verts:
+        raise RuntimeError("Select at least one vertex on the source mesh")
+
+    dup = bmesh.ops.duplicate(bm, geom=selected_verts)
+    new_verts = [
+        item for item in dup.get("geom", [])
+        if isinstance(item, bmesh.types.BMVert) and item.is_valid
+    ]
+    if not new_verts:
+        raise RuntimeError("Could not duplicate selected vertices")
+
+    for vert in bm.verts:
+        vert.select = False
+    for edge in bm.edges:
+        edge.select = False
+    for face in bm.faces:
+        face.select = False
+    for vert in new_verts:
+        vert.select = True
+
+    bm.select_flush_mode()
+    bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=True)
+    return [vert.index for vert in new_verts if vert.is_valid]
+
+
 def _append_selected_faces_to_object(target_obj, source_obj, recalc_normals=True, weld_distance=0.0):
     if source_obj is None or source_obj.type != "MESH" or source_obj.mode != "EDIT":
         raise RuntimeError("Source object must be the active mesh in Edit Mode")
@@ -2259,6 +2561,35 @@ def _append_selected_faces_to_object(target_obj, source_obj, recalc_normals=True
     selected_faces = [face for face in bm_src.faces if face.select]
     if not selected_faces:
         raise RuntimeError("Select at least one polygon on the source mesh")
+
+    material_slot_map = {}
+    preferred_material_name = ""
+    source_slots = list(getattr(source_obj, "material_slots", []))
+    target_materials = target_obj.data.materials
+
+    for src_material_index in sorted({face.material_index for face in selected_faces}):
+        src_mat = source_slots[src_material_index].material if src_material_index < len(source_slots) else None
+
+        target_material_index = None
+        for slot_idx, existing_mat in enumerate(target_materials):
+            if existing_mat == src_mat:
+                target_material_index = slot_idx
+                break
+
+        if target_material_index is None:
+            if src_mat is not None:
+                target_materials.append(src_mat)
+                target_material_index = len(target_materials) - 1
+                if not preferred_material_name:
+                    preferred_material_name = src_mat.name
+            elif len(target_materials) > 0:
+                target_material_index = 0
+            else:
+                target_material_index = 0
+        elif src_mat is not None and not preferred_material_name:
+            preferred_material_name = src_mat.name
+
+        material_slot_map[src_material_index] = target_material_index
 
     mesh = target_obj.data
     bm = bmesh.new()
@@ -2289,6 +2620,7 @@ def _append_selected_faces_to_object(target_obj, source_obj, recalc_normals=True
                 new_face = bm.faces.new(face_verts)
             except ValueError:
                 continue
+            new_face.material_index = material_slot_map.get(src_face.material_index, 0)
             created_faces.append(new_face)
 
         if not created_faces:
@@ -2319,6 +2651,7 @@ def _append_selected_faces_to_object(target_obj, source_obj, recalc_normals=True
         return {
             "verts_added": len(mesh.vertices) - before_vert_count,
             "faces_added": len(mesh.polygons) - before_face_count,
+            "preferred_material_name": preferred_material_name,
         }
     finally:
         bm.free()
@@ -2329,25 +2662,57 @@ def _weld_mesh_vertices(target_obj, merge_distance):
         raise RuntimeError("Roadway Object must be a mesh")
     if merge_distance <= 0.0:
         return {"removed_verts": 0}
+    if target_obj.mode != "EDIT":
+        raise RuntimeError("Roadway Object must be active in Edit Mode")
 
     mesh = target_obj.data
-    bm = bmesh.new()
-    try:
-        bm.from_mesh(mesh)
-        before_vert_count = len(bm.verts)
-        if before_vert_count == 0:
-            return {"removed_verts": 0}
+    bm = bmesh.from_edit_mesh(mesh)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
 
-        bmesh.ops.remove_doubles(bm, verts=list(bm.verts), dist=merge_distance)
-        bm.verts.ensure_lookup_table()
-        bm.normal_update()
-        bm.to_mesh(mesh)
-        mesh.update(calc_edges=True)
-        return {
-            "removed_verts": max(0, before_vert_count - len(mesh.vertices)),
-        }
-    finally:
-        bm.free()
+    before_vert_count = len(bm.verts)
+    if before_vert_count == 0:
+        return {"removed_verts": 0, "selected_verts": 0}
+
+    selected_verts = []
+    seen_indices = set()
+
+    def _add_vert(vert):
+        if vert is None or not vert.is_valid:
+            return
+        key = vert.index
+        if key in seen_indices:
+            return
+        seen_indices.add(key)
+        selected_verts.append(vert)
+
+    for vert in bm.verts:
+        if vert.select:
+            _add_vert(vert)
+    for edge in bm.edges:
+        if edge.select:
+            for vert in edge.verts:
+                _add_vert(vert)
+    for face in bm.faces:
+        if face.select:
+            for vert in face.verts:
+                _add_vert(vert)
+
+    if not selected_verts:
+        raise RuntimeError("Select Roadway vertices, edges, or faces to weld")
+
+    bmesh.ops.remove_doubles(bm, verts=selected_verts, dist=merge_distance)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    bm.normal_update()
+    bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=True)
+
+    return {
+        "removed_verts": max(0, before_vert_count - len(bm.verts)),
+        "selected_verts": len(selected_verts),
+    }
 
 
 def _activate_object_vertex_edit(context, obj, selected_indices=None):
@@ -2404,71 +2769,115 @@ def _activate_object_edit_mode(context, obj, select_mode="VERT"):
     bpy.ops.mesh.select_mode(type=select_mode)
 
 
-def _build_convex_hull_from_loose_geometry_verts(target_obj, merge_distance=0.0, recalc_normals=True):
-    if target_obj is None or target_obj.type != "MESH":
-        raise RuntimeError("Target Geometry LOD object must be a mesh")
-    if target_obj.mode == "EDIT":
-        raise RuntimeError("Geometry object must be in Object Mode while building hull")
+def _delete_loose_vertices_by_local_keys(target_obj, local_keys, tolerance=1e-6):
+    if target_obj is None or target_obj.type != "MESH" or not local_keys:
+        return 0
 
     mesh = target_obj.data
     bm = bmesh.new()
     try:
         bm.from_mesh(mesh)
-        bm.verts.ensure_lookup_table()
-        loose_verts = [
+        remove_verts = [
             vert for vert in bm.verts
-            if vert.is_valid and len(vert.link_edges) == 0 and len(vert.link_faces) == 0
+            if vert.is_valid
+            and len(vert.link_edges) == 0
+            and len(vert.link_faces) == 0
+            and _vector_quantized_key(vert.co, tolerance) in local_keys
         ]
+        if not remove_verts:
+            return 0
 
-        if merge_distance > 0.0 and loose_verts:
-            bmesh.ops.remove_doubles(bm, verts=loose_verts, dist=merge_distance)
-            bm.verts.ensure_lookup_table()
-            loose_verts = [
-                vert for vert in bm.verts
-                if vert.is_valid and len(vert.link_edges) == 0 and len(vert.link_faces) == 0
-            ]
-
-        if len(loose_verts) < 4:
-            raise RuntimeError("Need at least 4 loose vertices in Geometry to build a collider")
-
-        before_face_count = len(bm.faces)
-        hull = bmesh.ops.convex_hull(bm, input=loose_verts, use_existing_faces=False)
-        created_faces = [
-            item for item in hull.get("geom", [])
-            if isinstance(item, bmesh.types.BMFace) and item.is_valid
-        ]
-
-        cleanup = []
-        cleanup.extend(hull.get("geom_unused", []))
-        cleanup.extend(hull.get("geom_interior", []))
-        if cleanup:
-            _delete_bmesh_geom(bm, cleanup)
-
-        if not created_faces:
-            raise RuntimeError("Convex hull failed on loose Geometry vertices")
-
-        if recalc_normals:
-            bmesh.ops.recalc_face_normals(bm, faces=created_faces)
-
-        for vert in bm.verts:
-            vert.select = False
-        for edge in bm.edges:
-            edge.select = False
-        for face in bm.faces:
-            face.select = False
-        for face in created_faces:
-            if face.is_valid:
-                face.select = True
-
+        removed_count = len(remove_verts)
+        bmesh.ops.delete(bm, geom=remove_verts, context="VERTS")
         bm.normal_update()
         bm.to_mesh(mesh)
         mesh.update(calc_edges=True)
-        return {
-            "used_verts": len(loose_verts),
-            "faces_added": len(mesh.polygons) - before_face_count,
-        }
+        return removed_count
     finally:
         bm.free()
+
+
+def _build_convex_hull_from_loose_geometry_verts(context, target_obj, merge_distance=0.0, recalc_normals=True):
+    if target_obj is None or target_obj.type != "MESH":
+        raise RuntimeError("Target Geometry LOD object must be a mesh")
+    if target_obj.mode != "EDIT":
+        raise RuntimeError("Geometry object must be active in Edit Mode while building hull")
+
+    mesh = target_obj.data
+    bm = bmesh.from_edit_mesh(mesh)
+    bm.verts.ensure_lookup_table()
+
+    loose_verts = [
+        vert for vert in bm.verts
+        if vert.is_valid and vert.select and len(vert.link_edges) == 0 and len(vert.link_faces) == 0
+    ]
+
+    if len(loose_verts) < 4:
+        raise RuntimeError("Need at least 4 selected loose vertices in Geometry to build a collider")
+
+    world_points = _dedupe_world_points([target_obj.matrix_world @ vert.co for vert in loose_verts])
+    if len(world_points) < 4:
+        raise RuntimeError("Selected loose vertices collapse below 4 unique points")
+
+    local_keys = {_vector_quantized_key(vert.co) for vert in loose_verts}
+
+    if context.mode != "OBJECT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    stats = _append_collider_hull_to_object(
+        target_obj,
+        world_points,
+        merge_distance=merge_distance,
+        recalc_normals=recalc_normals,
+    )
+    removed_count = _delete_loose_vertices_by_local_keys(target_obj, local_keys)
+    stats["used_verts"] = len(world_points)
+    stats["removed_source_verts"] = removed_count
+    _activate_object_edit_mode(context, target_obj, select_mode="FACE")
+    return stats
+
+
+def _build_selection_hull_via_target(
+    context,
+    source_obj,
+    target_obj,
+    *,
+    merge_distance=0.0,
+    recalc_normals=True,
+    box_thickness=0.0,
+    loose_only=False,
+):
+    if source_obj is None or source_obj.type != "MESH" or source_obj.mode != "EDIT":
+        raise RuntimeError("Source object must be the active mesh in Edit Mode")
+    if target_obj is None or target_obj.type != "MESH":
+        raise RuntimeError("Target Geometry LOD object must be a mesh")
+
+    selection = _collect_selected_collider_input(source_obj, loose_only=loose_only)
+    world_points = selection["world_points"]
+    normal = selection["normal"]
+    auto_thickened = False
+
+    flat_eps = max(1e-5, merge_distance * 2.0)
+    if _points_are_flat(world_points, normal, epsilon=flat_eps):
+        if box_thickness <= 0.0:
+            raise RuntimeError("Flat selection detected. Increase Thickness or use a non-flat selection")
+        world_points = _extrude_points_along_normal(world_points, normal, box_thickness)
+        auto_thickened = True
+
+    if context.mode != "OBJECT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    added_indices = _append_world_vertices_to_object(target_obj, world_points)
+    _activate_object_vertex_edit(context, target_obj, added_indices)
+
+    stats = _build_convex_hull_from_loose_geometry_verts(
+        context,
+        target_obj,
+        merge_distance=merge_distance,
+        recalc_normals=recalc_normals,
+    )
+    stats["auto_thickened"] = auto_thickened
+    return stats
 
 
 def _collect_object_bounds_points(source_obj, padding=0.0, min_axis_size=0.0):
@@ -2496,7 +2905,7 @@ class CRAY_OT_CopySelectedVertsToGeometry(Operator):
 
     def execute(self, context):
         cs = context.scene.cray_collider_settings
-        source_obj = _resolve_collider_source_object(context, cs.source_object)
+        source_obj = _resolve_collider_selection_source_object(context, cs.source_object)
         if source_obj is None or source_obj.type != "MESH":
             self.report({"ERROR"}, "Source Object must be a mesh")
             return {"CANCELLED"}
@@ -2504,15 +2913,19 @@ class CRAY_OT_CopySelectedVertsToGeometry(Operator):
             self.report({"ERROR"}, "Copy requires the Source Object to be active in Edit Mode")
             return {"CANCELLED"}
 
-        err = _collider_target_validation_error(cs.geometry_object, cs.target_lod, source_obj=source_obj)
+        allow_same_source = (
+            cs.geometry_object is not None
+            and cs.geometry_object == source_obj
+            and _is_collider_lod_mesh_object(source_obj, lod_token=cs.target_lod)
+        )
+        err = _collider_target_validation_error(
+            cs.geometry_object,
+            cs.target_lod,
+            source_obj=source_obj,
+            allow_same_source=allow_same_source,
+        )
         if err:
             self.report({"ERROR"}, err)
-            return {"CANCELLED"}
-
-        try:
-            world_points = _collect_selected_vertex_world_points(source_obj)
-        except Exception as e:
-            self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
 
         target_obj = _ensure_collider_lod_object(
@@ -2521,13 +2934,18 @@ class CRAY_OT_CopySelectedVertsToGeometry(Operator):
             cs.target_lod,
             preferred_obj=cs.geometry_object,
         )
-        cs.geometry_object = target_obj
+        _set_collider_settings_object(context, "geometry_object", target_obj)
 
         try:
-            if context.mode != "OBJECT":
-                bpy.ops.object.mode_set(mode="OBJECT")
-            added_indices = _append_world_vertices_to_object(target_obj, world_points)
-            _activate_object_vertex_edit(context, target_obj, added_indices)
+            if target_obj == source_obj and source_obj.mode == "EDIT":
+                added_indices = _duplicate_selected_verts_as_loose_points_in_edit_object(target_obj)
+                bpy.ops.mesh.select_mode(type="VERT")
+            else:
+                world_points = _collect_selected_vertex_world_points(source_obj)
+                if context.mode != "OBJECT":
+                    bpy.ops.object.mode_set(mode="OBJECT")
+                added_indices = _append_world_vertices_to_object(target_obj, world_points)
+                _activate_object_vertex_edit(context, target_obj, added_indices)
         except Exception as e:
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
@@ -2540,10 +2958,10 @@ class CRAY_OT_CopySelectedVertsToGeometry(Operator):
 
 
 class CRAY_OT_HullLooseGeometryVerts(Operator):
-    """Build a convex hull from all loose vertices in the Geometry LOD"""
+    """Build a convex hull from selected loose vertices in the Geometry LOD"""
 
     bl_idname = "cray.hull_loose_geometry_verts"
-    bl_label = "Loose Geometry Verts -> Hull"
+    bl_label = "Selected Loose Geometry Verts -> Hull"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -2561,17 +2979,18 @@ class CRAY_OT_HullLooseGeometryVerts(Operator):
             cs.target_lod,
             preferred_obj=cs.geometry_object,
         )
-        cs.geometry_object = target_obj
+        _set_collider_settings_object(context, "geometry_object", target_obj)
 
         try:
-            if target_obj.mode == "EDIT":
-                bpy.ops.object.mode_set(mode="OBJECT")
+            if context.mode != "EDIT_MESH" or context.view_layer.objects.active != target_obj or target_obj.mode != "EDIT":
+                self.report({"ERROR"}, "Select loose vertices on the Geometry LOD in Edit Mode")
+                return {"CANCELLED"}
             stats = _build_convex_hull_from_loose_geometry_verts(
+                context,
                 target_obj,
                 merge_distance=cs.merge_distance,
                 recalc_normals=bool(cs.recalc_normals),
             )
-            _activate_object_edit_mode(context, target_obj, select_mode="FACE")
         except Exception as e:
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
@@ -2579,7 +2998,7 @@ class CRAY_OT_HullLooseGeometryVerts(Operator):
         self.report(
             {"INFO"},
             (
-                f"Built collider from {stats['used_verts']} loose Geometry verts in {target_obj.name}: "
+                f"Built collider from {stats['used_verts']} selected loose Geometry verts in {target_obj.name}: "
                 f"+{stats['faces_added']} faces"
             ),
         )
@@ -2599,9 +3018,7 @@ class CRAY_OT_ColliderHotkeysInfo(Operator):
         return (
             "Ctrl+Shift+C: Copy Selected Verts To Geometry\n"
             "Ctrl+Shift+A: Select Isolated Verts\n"
-            "Mouse4: Selection -> Hull\n"
-            "Mouse5: Loose Geometry Verts -> Hull\n"
-            "Alt+Left Mouse: Pick Whole Mesh Island"
+            "Mouse4: Selection -> Hull"
         )
 
     def execute(self, context):
@@ -2635,7 +3052,8 @@ class CRAY_OT_EnsureRoadwayLOD(Operator):
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
 
-        cs.roadway_object = roadway_obj
+        _set_collider_settings_object(context, "roadway_object", roadway_obj)
+        _sync_roadway_material_selection(context)
         self.report({"INFO"}, f"Roadway LOD ready: {roadway_obj.name}")
         return {"FINISHED"}
 
@@ -2649,7 +3067,7 @@ class CRAY_OT_CopySelectedFacesToRoadway(Operator):
 
     def execute(self, context):
         cs = context.scene.cray_collider_settings
-        source_obj = _resolve_collider_source_object(context, cs.source_object)
+        source_obj = _resolve_collider_selection_source_object(context, cs.source_object)
         if source_obj is None or source_obj.type != "MESH":
             self.report({"ERROR"}, "Source Object must be a mesh")
             return {"CANCELLED"}
@@ -2679,7 +3097,8 @@ class CRAY_OT_CopySelectedFacesToRoadway(Operator):
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
 
-        cs.roadway_object = roadway_obj
+        _set_collider_settings_object(context, "roadway_object", roadway_obj)
+        _sync_roadway_material_selection(context, stats.get("preferred_material_name", ""))
         self.report(
             {"INFO"},
             f"Copied source polygons to {roadway_obj.name}: +{stats['verts_added']} verts, +{stats['faces_added']} faces",
@@ -2688,7 +3107,7 @@ class CRAY_OT_CopySelectedFacesToRoadway(Operator):
 
 
 class CRAY_OT_WeldRoadwayVertices(Operator):
-    """Merge near-duplicate vertices in the Roadway mesh to keep navigation continuous"""
+    """Merge near-duplicate vertices only inside the current Roadway selection"""
 
     bl_idname = "cray.weld_roadway_vertices"
     bl_label = "Weld Roadway"
@@ -2700,33 +3119,98 @@ class CRAY_OT_WeldRoadwayVertices(Operator):
         if target_obj is None or target_obj.type != "MESH":
             self.report({"ERROR"}, "Roadway Object must be a mesh")
             return {"CANCELLED"}
+        if context.mode != "EDIT_MESH" or target_obj.mode != "EDIT":
+            self.report({"ERROR"}, "Weld Roadway works only on the current Roadway selection in Edit Mode")
+            return {"CANCELLED"}
 
         if cs.roadway_weld_distance <= 0.0:
             self.report({"ERROR"}, "Roadway Weld Distance must be greater than zero")
             return {"CANCELLED"}
 
-        was_edit = target_obj.mode == "EDIT"
-        select_mode = tuple(context.tool_settings.mesh_select_mode)
-
         try:
-            if was_edit:
-                bpy.ops.object.mode_set(mode="OBJECT")
             stats = _weld_mesh_vertices(target_obj, cs.roadway_weld_distance)
-            if was_edit:
-                mode_name = "FACE"
-                if select_mode[0]:
-                    mode_name = "VERT"
-                elif select_mode[1]:
-                    mode_name = "EDGE"
-                _activate_object_edit_mode(context, target_obj, select_mode=mode_name)
         except Exception as e:
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
 
         self.report(
             {"INFO"},
-            f"Welded Roadway '{target_obj.name}': removed {stats['removed_verts']} duplicate vert(s)",
+            (
+                f"Welded selected Roadway elements in '{target_obj.name}': "
+                f"removed {stats['removed_verts']} duplicate vert(s)"
+            ),
         )
+        return {"FINISHED"}
+
+
+class CRAY_OT_OpenRoadwayMaterialFolder(Operator):
+    """Pick a roadway material file inside Blender and assign it to the selected Roadway material"""
+
+    bl_idname = "cray.open_roadway_material_folder"
+    bl_label = "Choose Roadway Material Path"
+    bl_options = {"REGISTER", "UNDO"}
+
+    filepath: StringProperty(
+        name="Material File",
+        description="Choose an .rvmat or .paa file for the selected Roadway material",
+        subtype="FILE_PATH",
+    )
+    filter_glob: StringProperty(default="*.rvmat;*.paa", options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        del event
+
+        mat = _get_selected_roadway_material(context)
+        if mat is None:
+            self.report({"ERROR"}, "Select or create a Roadway material first")
+            return {"CANCELLED"}
+
+        default_dir = _ROADWAY_SURFACES_FOLDER if os.path.isdir(_ROADWAY_SURFACES_FOLDER) else ""
+        if not default_dir:
+            blend_dir = bpy.path.abspath("//")
+            if blend_dir and os.path.isdir(blend_dir):
+                default_dir = blend_dir
+            else:
+                default_dir = os.getcwd()
+
+        self.filepath = os.path.join(default_dir, "")
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        mat = _get_selected_roadway_material(context)
+        if mat is None:
+            self.report({"ERROR"}, "Roadway material not found on the selected Roadway object")
+            return {"CANCELLED"}
+
+        try:
+            filepath = os.path.abspath(bpy.path.abspath(self.filepath or ""))
+        except Exception as e:
+            self.report({"ERROR"}, f"Could not resolve material path: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+
+        if not filepath or not os.path.isfile(filepath):
+            self.report({"ERROR"}, "Choose an existing .rvmat or .paa file")
+            return {"CANCELLED"}
+
+        ext = os.path.splitext(filepath)[1].lower()
+        try:
+            if ext == ".rvmat":
+                _set_a3ob_material_paths(mat, None, _norm_path(filepath))
+            elif ext == ".paa":
+                _set_a3ob_material_paths(mat, _norm_path(filepath), None)
+            else:
+                self.report({"ERROR"}, "Unsupported file type. Choose .rvmat or .paa")
+                return {"CANCELLED"}
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        _sync_roadway_material_selection(context, mat.name)
+        if ext == ".rvmat":
+            self.report({"INFO"}, f"Assigned .rvmat to roadway material: {mat.name}")
+        else:
+            self.report({"INFO"}, f"Assigned .paa to roadway material: {mat.name}")
         return {"FINISHED"}
 
 
@@ -2776,39 +3260,6 @@ class CRAY_OT_SelectIsolatedVertices(Operator):
         return {"FINISHED"}
 
 
-class CRAY_OT_SelectLinkedPickWholeObject(Operator):
-    """Click a mesh element and select its whole connected mesh island"""
-
-    bl_idname = "cray.select_linked_pick_whole_object"
-    bl_label = "Pick Whole Mesh Island"
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return context.mode == "EDIT_MESH" and obj is not None and obj.type == "MESH"
-
-    def invoke(self, context, event):
-        del event
-        try:
-            return bpy.ops.mesh.select_linked_pick("INVOKE_DEFAULT", deselect=False, delimit=set())
-        except TypeError:
-            return bpy.ops.mesh.select_linked_pick("INVOKE_DEFAULT", deselect=False)
-        except Exception as e:
-            self.report({"ERROR"}, _fmt_exc(e))
-            return {"CANCELLED"}
-
-    def execute(self, context):
-        del context
-        try:
-            return bpy.ops.mesh.select_linked(delimit=set())
-        except TypeError:
-            return bpy.ops.mesh.select_linked()
-        except Exception as e:
-            self.report({"ERROR"}, _fmt_exc(e))
-            return {"CANCELLED"}
-
-
 class CRAY_OT_EnsureColliderLOD(Operator):
     """Create or find the Geometry LOD object and move it into the Geometry collection"""
 
@@ -2819,6 +3270,7 @@ class CRAY_OT_EnsureColliderLOD(Operator):
     def execute(self, context):
         cs = context.scene.cray_collider_settings
         source_obj = _resolve_collider_source_object(context, cs.source_object)
+        previous_active = context.view_layer.objects.active if context.view_layer is not None else None
 
         err = _collider_target_validation_error(cs.geometry_object, cs.target_lod, source_obj=source_obj)
         if err:
@@ -2831,15 +3283,20 @@ class CRAY_OT_EnsureColliderLOD(Operator):
             cs.target_lod,
             preferred_obj=cs.geometry_object,
         )
-        cs.geometry_object = target_obj
+        _set_collider_settings_object(context, "geometry_object", target_obj)
         try:
             context.view_layer.update()
         except Exception:
             pass
-        if context.mode == "OBJECT":
+        if context.mode == "OBJECT" and source_obj is None:
             _deselect_all_in_view_layer(context)
             target_obj.select_set(True)
             context.view_layer.objects.active = target_obj
+        elif context.mode == "OBJECT" and previous_active is not None:
+            try:
+                context.view_layer.objects.active = previous_active
+            except Exception:
+                pass
         self.report({"INFO"}, f"Collider LOD ready: {target_obj.name}")
         return {"FINISHED"}
 
@@ -2875,11 +3332,25 @@ class CRAY_OT_BuildCollider(Operator):
 
     def execute(self, context):
         cs = context.scene.cray_collider_settings
-        source_obj = _resolve_collider_source_object(context, cs.source_object)
+        if self.build_mode == "OBJECT_BOUNDS":
+            source_obj = _resolve_collider_source_object(context, cs.source_object)
+        else:
+            source_obj = _resolve_collider_selection_source_object(context, cs.source_object)
         if source_obj is None or source_obj.type != "MESH":
             self.report({"ERROR"}, "Source Object must be a mesh")
             return {"CANCELLED"}
-        err = _collider_target_validation_error(cs.geometry_object, cs.target_lod, source_obj=source_obj)
+        allow_same_source = (
+            self.build_mode == "SELECTION_HULL"
+            and cs.geometry_object is not None
+            and cs.geometry_object == source_obj
+            and _is_collider_lod_mesh_object(source_obj, lod_token=cs.target_lod)
+        )
+        err = _collider_target_validation_error(
+            cs.geometry_object,
+            cs.target_lod,
+            source_obj=source_obj,
+            allow_same_source=allow_same_source,
+        )
         if err:
             self.report({"ERROR"}, err)
             return {"CANCELLED"}
@@ -2896,10 +3367,38 @@ class CRAY_OT_BuildCollider(Operator):
             cs.target_lod,
             preferred_obj=cs.geometry_object,
         )
-        cs.geometry_object = target_obj
+        _set_collider_settings_object(context, "geometry_object", target_obj)
+
+        if self.build_mode == "SELECTION_HULL":
+            try:
+                stats = _build_selection_hull_via_target(
+                    context,
+                    source_obj,
+                    target_obj,
+                    merge_distance=cs.merge_distance,
+                    recalc_normals=bool(cs.recalc_normals),
+                    box_thickness=cs.box_thickness,
+                    loose_only=False,
+                )
+            except Exception as e:
+                self.report({"ERROR"}, _fmt_exc(e))
+                return {"CANCELLED"}
+
+            extras = []
+            if stats.get("auto_thickened"):
+                extras.append(f"auto-thickness {cs.box_thickness:g}")
+            extra_suffix = "" if not extras else f" ({', '.join(extras)})"
+            self.report(
+                {"INFO"},
+                (
+                    f"Built selection hull in {target_obj.name}: "
+                    f"+{stats['verts_added']} verts, +{stats['faces_added']} faces{extra_suffix}"
+                ),
+            )
+            return {"FINISHED"}
 
         if target_obj == source_obj and source_obj.mode == "EDIT":
-            self.report({"ERROR"}, "Target Geometry LOD must be a separate object from the edited source mesh")
+            self.report({"ERROR"}, "Target Geometry LOD must be separate from the edited source mesh")
             return {"CANCELLED"}
 
         auto_thickened = False
@@ -4328,6 +4827,26 @@ def _build_ie_import_basename_map(settings):
             mapping[base] = _norm_path(fp)
     return mapping
 
+
+def _planner_add_import_file(settings, filepath: str) -> bool:
+    if settings is None:
+        return False
+
+    fp = _norm_path(bpy.path.abspath(filepath)) if filepath else ""
+    if not fp:
+        return False
+
+    for idx, item in enumerate(settings.import_files):
+        existing = _norm_path(bpy.path.abspath(item.path)) if item.path else ""
+        if existing == fp:
+            settings.import_active_index = idx
+            return False
+
+    item = settings.import_files.add()
+    item.path = fp
+    settings.import_active_index = len(settings.import_files) - 1
+    return True
+
 def _resolve_collection_source_path(collection, import_basename_map=None):
     src = collection.get(_IE_SOURCE_PATH_KEY)
     if isinstance(src, str) and src.strip():
@@ -4496,6 +5015,83 @@ def _tag_import_source_on_imported_data(context, filepath, imported_objs, pre_co
             except Exception:
                 pass
 
+
+def _patch_a3ob_import_read_file():
+    if _A3OB_IMPORT_READ_FILE_PATCHES:
+        return
+
+    module_names = (
+        "bl_ext.user_default.Arma3ObjectBuilder.io.import_p3d",
+        "Arma3ObjectBuilder.io.import_p3d",
+    )
+
+    for module_name in module_names:
+        mod = _import_first_available_module((module_name,))
+        if mod is None:
+            continue
+
+        original_read_file = getattr(mod, "read_file", None)
+        if not callable(original_read_file):
+            continue
+        if any(patched_mod is mod for patched_mod, _ in _A3OB_IMPORT_READ_FILE_PATCHES):
+            continue
+
+        def _wrapped_read_file(operator, context, file, _original_read_file=original_read_file, _module_name=module_name):
+            filepath = _norm_path(bpy.path.abspath(getattr(operator, "filepath", "")))
+            pre_col_ptrs = {col.as_pointer() for col in bpy.data.collections}
+
+            lod_objects = _original_read_file(operator, context, file)
+
+            if _A3OB_IMPORT_TRACKING_SUPPRESS_DEPTH > 0:
+                return lod_objects
+
+            if not filepath or not os.path.isfile(filepath):
+                return lod_objects
+
+            try:
+                _tag_import_source_on_imported_data(
+                    context=context,
+                    filepath=filepath,
+                    imported_objs=lod_objects or [],
+                    pre_collection_ptrs=pre_col_ptrs,
+                )
+            except Exception as e:
+                print("=== Import/Export planner: failed to tag A3OB import ===")
+                print(f"{_module_name} -> {_fmt_exc(e)}")
+
+            try:
+                scene = getattr(context, "scene", None)
+                settings = getattr(scene, "cray_ie_settings", None) if scene is not None else None
+                _planner_add_import_file(settings, filepath)
+            except Exception as e:
+                print("=== Import/Export planner: failed to add A3OB import to planner ===")
+                print(f"{_module_name} -> {_fmt_exc(e)}")
+
+            return lod_objects
+
+        mod.read_file = _wrapped_read_file
+        _A3OB_IMPORT_READ_FILE_PATCHES.append((mod, original_read_file))
+
+
+def _unpatch_a3ob_import_read_file():
+    while _A3OB_IMPORT_READ_FILE_PATCHES:
+        mod, original_read_file = _A3OB_IMPORT_READ_FILE_PATCHES.pop()
+        try:
+            mod.read_file = original_read_file
+        except Exception:
+            pass
+
+
+def _ensure_a3ob_import_patch_timer():
+    if _A3OB_IMPORT_READ_FILE_PATCHES:
+        return None
+
+    _patch_a3ob_import_read_file()
+    if _A3OB_IMPORT_READ_FILE_PATCHES:
+        return None
+
+    return 2.0
+
 class CRAY_PG_IEFileItem(PropertyGroup):
     path: StringProperty(name="File", default="", subtype="FILE_PATH")
 
@@ -4570,6 +5166,7 @@ class CRAY_OT_IE_AddFiles(Operator):
     def execute(self, context):
         st = context.scene.cray_ie_settings
         added = 0
+        skipped = 0
         dir_abs = bpy.path.abspath(self.directory) if self.directory else ""
 
         for f in self.files:
@@ -4577,14 +5174,21 @@ class CRAY_OT_IE_AddFiles(Operator):
             fp = bpy.path.abspath(fp)
             if not fp:
                 continue
-            it = st.import_files.add()
-            it.path = _norm_path(fp)
-            added += 1
+            if _planner_add_import_file(st, fp):
+                added += 1
+            else:
+                skipped += 1
 
         if added == 0:
-            self.report({"WARNING"}, "No files added")
+            if skipped > 0:
+                self.report({"WARNING"}, "All selected files are already in the planner")
+            else:
+                self.report({"WARNING"}, "No files added")
         else:
-            self.report({"INFO"}, f"Added {added} file(s)")
+            msg = f"Added {added} file(s)"
+            if skipped > 0:
+                msg += f", skipped {skipped} duplicate(s)"
+            self.report({"INFO"}, msg)
         return {"FINISHED"}
 
 class CRAY_OT_IE_RemoveFile(Operator):
@@ -4641,7 +5245,8 @@ class CRAY_OT_IE_ImportBatch(Operator):
 
             pre_obj_ptrs = {o.as_pointer() for o in bpy.data.objects}
             pre_col_ptrs = {c.as_pointer() for c in bpy.data.collections}
-            res, op_id, err = _call_first_available(_A3OB_IMPORT_CANDIDATES, filepath=fp)
+            with _suppress_a3ob_import_tracking():
+                res, op_id, err = _call_first_available(_A3OB_IMPORT_CANDIDATES, filepath=fp)
             if op_id:
                 used_op = op_id
             if res is None:
@@ -5174,20 +5779,21 @@ def _build_temp_asset_library_from_paths(op, context, filepaths):
     for fp in filepaths:
         pre_obj_ptrs = {o.as_pointer() for o in bpy.data.objects}
         pre_col_ptrs = {c.as_pointer() for c in bpy.data.collections}
-        res, op_id, err = _call_first_available(
-            _A3OB_IMPORT_CANDIDATES,
-            filepath=fp,
-            first_lod_only=st.import_first_lod_only,
-            absolute_paths=True,
-            enclose=True,
-            groupby="TYPE",
-            additional_data_allowed=True,
-            additional_data={"PROPS", "SELECTIONS"},
-            validate_meshes=False,
-            proxy_action="SEPARATE",
-            translate_selections=False,
-            cleanup_empty_selections=False,
-        )
+        with _suppress_a3ob_import_tracking():
+            res, op_id, err = _call_first_available(
+                _A3OB_IMPORT_CANDIDATES,
+                filepath=fp,
+                first_lod_only=st.import_first_lod_only,
+                absolute_paths=True,
+                enclose=True,
+                groupby="TYPE",
+                additional_data_allowed=True,
+                additional_data={"PROPS", "SELECTIONS"},
+                validate_meshes=False,
+                proxy_action="SEPARATE",
+                translate_selections=False,
+                cleanup_empty_selections=False,
+            )
         if res is None:
             failed.append(f"{os.path.basename(fp)}: {_fmt_exc(err) if err else 'import failed'}")
             continue
@@ -5384,6 +5990,180 @@ class CRAY_OT_FixShadingByPipeline(Operator):
             {"INFO"},
             f"Shading fix done on '{active_mesh.name}': joined {joined_count}, Shade Smooth applied",
         )
+        return {"FINISHED"}
+
+
+def _repair_invalid_a3ob_selection_links(obj):
+    if obj is None or obj.type != "MESH" or obj.data is None:
+        raise RuntimeError("Target object must be a mesh")
+
+    group_specs = sorted(
+        [(int(vg.index), vg.name) for vg in obj.vertex_groups],
+        key=lambda item: item[0],
+    )
+    if not group_specs:
+        return {
+            "invalid_refs_removed": 0,
+            "zero_refs_removed": 0,
+            "verts_touched": 0,
+            "groups_rebuilt": 0,
+            "reindexed_groups": False,
+        }
+
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(obj.data)
+        bm.verts.ensure_lookup_table()
+        layer = bm.verts.layers.deform.verify()
+
+        old_to_new = {old_idx: new_idx for new_idx, (old_idx, _name) in enumerate(group_specs)}
+        valid_old_indices = set(old_to_new.keys())
+        reindexed_groups = any(old_idx != new_idx for old_idx, new_idx in old_to_new.items())
+
+        invalid_refs_removed = 0
+        zero_refs_removed = 0
+        verts_touched = 0
+        dense_weights_by_vert = {}
+
+        for vert in bm.verts:
+            deform = vert[layer]
+            items = list(deform.items())
+            if not items:
+                continue
+
+            filtered = {}
+            changed = False
+            for idx, weight in items:
+                idx = int(idx)
+                weight = float(weight)
+                if idx not in valid_old_indices:
+                    invalid_refs_removed += 1
+                    changed = True
+                    continue
+                if weight <= 0.0:
+                    zero_refs_removed += 1
+                    changed = True
+                    continue
+                new_idx = old_to_new[idx]
+                prev = filtered.get(new_idx)
+                if prev is None or weight > prev:
+                    filtered[new_idx] = weight
+                if new_idx != idx:
+                    changed = True
+
+            if filtered:
+                dense_weights_by_vert[vert.index] = sorted(filtered.items())
+
+            if not changed and not reindexed_groups:
+                continue
+
+            verts_touched += 1
+
+        if invalid_refs_removed == 0 and zero_refs_removed == 0 and not reindexed_groups:
+            return {
+                "invalid_refs_removed": 0,
+                "zero_refs_removed": 0,
+                "verts_touched": 0,
+                "groups_rebuilt": 0,
+                "reindexed_groups": False,
+            }
+
+        existing_groups = list(obj.vertex_groups)
+        for vg in existing_groups:
+            obj.vertex_groups.remove(vg)
+
+        rebuilt_groups = []
+        for _old_idx, group_name in group_specs:
+            rebuilt_groups.append(obj.vertex_groups.new(name=group_name))
+
+        for vert_idx, weights in dense_weights_by_vert.items():
+            for dense_idx, weight in weights:
+                rebuilt_groups[dense_idx].add([vert_idx], weight, "REPLACE")
+
+        return {
+            "invalid_refs_removed": invalid_refs_removed,
+            "zero_refs_removed": zero_refs_removed,
+            "verts_touched": verts_touched,
+            "groups_rebuilt": len(rebuilt_groups),
+            "reindexed_groups": reindexed_groups,
+        }
+    finally:
+        bm.free()
+
+
+class CRAY_OT_RepairA3OBSelections(Operator):
+    bl_idname = "cray.repair_a3ob_selections"
+    bl_label = "Repair Invalid A3OB Selections"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        active_before = context.view_layer.objects.active
+        selected_meshes = [
+            obj for obj in context.selected_objects
+            if obj is not None and obj.type == "MESH" and obj.data is not None
+        ]
+        if active_before is not None and active_before.type == "MESH" and active_before not in selected_meshes:
+            selected_meshes.insert(0, active_before)
+
+        if not selected_meshes:
+            self.report({"ERROR"}, "Select at least one mesh object")
+            return {"CANCELLED"}
+
+        if context.mode != "OBJECT":
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception as e:
+                self.report({"ERROR"}, f"Failed to switch to Object Mode: {_fmt_exc(e)}")
+                return {"CANCELLED"}
+
+        total_invalid = 0
+        total_zero = 0
+        total_verts = 0
+        touched_objects = 0
+        rebuilt_groups = 0
+        reindexed_objects = 0
+        failed = []
+
+        for obj in selected_meshes:
+            try:
+                stats = _repair_invalid_a3ob_selection_links(obj)
+            except Exception as e:
+                failed.append(f"{obj.name}: {_fmt_exc(e)}")
+                continue
+
+            total_invalid += stats["invalid_refs_removed"]
+            total_zero += stats["zero_refs_removed"]
+            total_verts += stats["verts_touched"]
+            rebuilt_groups += stats["groups_rebuilt"]
+            if stats["reindexed_groups"]:
+                reindexed_objects += 1
+            if stats["verts_touched"] > 0:
+                touched_objects += 1
+
+        if failed:
+            print("=== Repair Invalid A3OB Selections: Failed ===")
+            for item in failed:
+                print(item)
+
+        if total_invalid == 0 and total_zero == 0 and rebuilt_groups == 0:
+            msg = f"No invalid A3OB selection links found on {len(selected_meshes)} mesh object(s)"
+            if failed:
+                self.report({"WARNING"}, msg + f", failed: {len(failed)} (see System Console)")
+            else:
+                self.report({"INFO"}, msg)
+            return {"FINISHED"}
+
+        msg = (
+            f"Repaired A3OB selections on {touched_objects} object(s): "
+            f"removed {total_invalid} invalid refs and {total_zero} zero-weight refs "
+            f"across {total_verts} vertex/vertices, rebuilt {rebuilt_groups} groups"
+        )
+        if reindexed_objects > 0:
+            msg += f", reindexed groups on {reindexed_objects} object(s)"
+        if failed:
+            self.report({"WARNING"}, msg + f", failed: {len(failed)} (see System Console)")
+        else:
+            self.report({"INFO"}, msg)
         return {"FINISHED"}
 
 
@@ -5711,10 +6491,12 @@ class CRAY_PT_ColliderPanel(Panel):
     def draw(self, context):
         layout = self.layout
         cs = context.scene.cray_collider_settings
+        active_obj = context.view_layer.objects.active
+        active_source_name = active_obj.name if active_obj is not None and active_obj.type == "MESH" else "<active mesh>"
 
         col = layout.column(align=True)
         col.label(text="Target")
-        col.prop(cs, "source_object")
+        col.label(text=f"Source: {active_source_name}", icon="MESH_DATA")
         col.prop(cs, "target_lod")
         col.prop(cs, "geometry_object")
         col.operator("cray.ensure_collider_lod", icon="OUTLINER_OB_MESH")
@@ -5755,13 +6537,8 @@ class CRAY_PT_ColliderPanel(Panel):
             op.build_mode = "SELECTION_HULL"
             box.operator(
                 "cray.hull_loose_geometry_verts",
-                text="Loose Geometry Verts -> Hull  [Mouse5]",
+                text="Selected Loose Geometry Verts -> Hull",
                 icon="MESH_ICOSPHERE",
-            )
-            box.operator(
-                "cray.select_linked_pick_whole_object",
-                text="Select Whole Mesh Island  [Alt+LMB]",
-                icon="RESTRICT_SELECT_OFF",
             )
 
         layout.separator()
@@ -5795,6 +6572,9 @@ class CRAY_PT_ColliderPanel(Panel):
         row = roadway.row(align=True)
         row.operator("cray.ensure_roadway_lod", icon="OUTLINER_OB_MESH")
         row.operator("cray.copy_selected_faces_to_roadway", icon="FACESEL")
+        row = roadway.row(align=True)
+        row.prop(cs, "roadway_material", text="Material")
+        row.operator("cray.open_roadway_material_folder", text="", icon="FILE_FOLDER")
         roadway.prop(cs, "roadway_weld_distance")
         roadway.operator("cray.weld_roadway_vertices", icon="AUTOMERGE_ON")
 
@@ -5844,6 +6624,7 @@ class CRAY_PT_FixesPanel(Panel):
         box.label(text="Select mesh object(s)", icon="INFO")
         box.label(text="If >1 selected: auto-join")
         box.operator("cray.fix_shading_by_pipeline", text="Fix Shading", icon="SHADING_RENDERED")
+        box.operator("cray.repair_a3ob_selections", text="Repair Invalid A3OB Selections", icon="GROUP_VERTEX")
         box.separator()
         box.label(text="Hierarchy fix", icon="MOD_REMESH")
         box.prop(ts, "fix_mesh_join_batch")
@@ -5876,7 +6657,8 @@ class CRAY_PT_ImportExportPlannerPanel(Panel):
         row2 = ibox.row()
         row2.enabled = bool(st.disable_collections_after_import)
         row2.prop(st, "disable_mode", text="")
-        ibox.label(text="Import uses A3OB operators (fallback search).", icon="INFO")
+        ibox.label(text="File > Import > .p3d (A3OB) is auto-added here.", icon="INFO")
+        ibox.label(text="Batch import uses A3OB operators (fallback search).", icon="INFO")
 
         ebox = layout.box()
         ebox.label(text="Batch Export Collections (Arma 3 Object Builder)", icon="EXPORT")
@@ -5950,8 +6732,8 @@ classes = (
     CRAY_OT_EnsureRoadwayLOD,
     CRAY_OT_CopySelectedFacesToRoadway,
     CRAY_OT_WeldRoadwayVertices,
+    CRAY_OT_OpenRoadwayMaterialFolder,
     CRAY_OT_SelectIsolatedVertices,
-    CRAY_OT_SelectLinkedPickWholeObject,
     CRAY_OT_EnsureColliderLOD,
     CRAY_OT_BuildCollider,
 
@@ -5979,6 +6761,7 @@ classes = (
     CRAY_OT_IE_ImportBatch,
     CRAY_OT_ConvertSelectedToProxies,
     CRAY_OT_FixShadingByPipeline,
+    CRAY_OT_RepairA3OBSelections,
     CRAY_OT_IE_ExportCollectionsBatch,
 
     CRAY_PT_ColliderPanel,
@@ -6000,10 +6783,16 @@ def register():
     bpy.types.Scene.cray_ie_settings = PointerProperty(type=CRAY_PG_IEPlannerSettings)
     bpy.types.Scene.cray_asset_library_settings = PointerProperty(type=CRAY_PG_AssetLibrarySettings)
     bpy.types.Scene.cray_asset_proxy_settings = PointerProperty(type=CRAY_PG_AssetProxySettings)
+    _patch_a3ob_import_read_file()
+    if not bpy.app.timers.is_registered(_ensure_a3ob_import_patch_timer):
+        bpy.app.timers.register(_ensure_a3ob_import_patch_timer, first_interval=1.0, persistent=True)
     _register_collider_keymaps()
 
 def unregister():
     _unregister_collider_keymaps()
+    if bpy.app.timers.is_registered(_ensure_a3ob_import_patch_timer):
+        bpy.app.timers.unregister(_ensure_a3ob_import_patch_timer)
+    _unpatch_a3ob_import_read_file()
     del bpy.types.Scene.cray_asset_proxy_settings
     del bpy.types.Scene.cray_asset_library_settings
     del bpy.types.Scene.cray_ie_settings
