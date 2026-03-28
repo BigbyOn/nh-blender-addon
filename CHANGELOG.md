@@ -2,6 +2,25 @@
 
 Все заметные изменения проекта фиксируются в этом файле.
 
+## [0.1.9] - 2026-03-29
+
+### Добавлено
+- Переключатель `Target LOD` в панели `Geometry Collider` для `Geometry`, `View Geometry` и `Fire Geometry`.
+- Выбор активного `Roadway Material` на объекте `Roadway`.
+- Кнопка `Choose Roadway Material Path` для назначения `.rvmat` или `.paa` в A3OB material properties выбранного roadway-материала.
+
+### Изменено
+- `Selected Loose Geometry Verts -> Hull` теперь строит hull только по выделенным loose-вершинам в текущем target collider LOD и работает как отдельная UI-кнопка.
+- Набор collider-хоткеев упрощен: сохранены `Ctrl+Shift+C`, `Ctrl+Shift+A` и `Mouse4`; действия, убранные из хоткеев, доступны через `Hotkeys -> Buttons`.
+- `Weld Roadway` теперь работает только по текущему выделению в `Edit Mode`, а не по всему `Roadway`-мешу.
+- Панель `Geometry Collider` синхронизирует target-объект, A3OB LOD props и визуальный стиль при смене `Target LOD`.
+- `README.md` синхронизирован с версией `0.1.9` и актуальным workflow.
+
+### Исправлено
+- Повторное использование collider target-объектов стало надежнее для объектов из логической коллекции `Geometry`.
+- Валидация source/target для collider и roadway-операторов стала строже и дает более понятные ошибки.
+- Финализация convex hull и очистка временной геометрии стали безопаснее для edit-mode workflow.
+
 ## [0.1.8] - 2026-03-27
 
 ### Добавлено

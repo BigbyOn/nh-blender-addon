@@ -1,7 +1,7 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Daryl and Enisam",
-    "version": (0, 1, 8),
+    "version": (0, 1, 9),
     "blender": (4, 4, 3),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "Scatter Arma3 Proxy objects using DayZ clutter config + Texture Replace (.paa/.rvmat) + Replace from DB via A3OB",

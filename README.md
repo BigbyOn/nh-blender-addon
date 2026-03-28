@@ -4,13 +4,13 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 
 Расположение в Blender: `3D Viewport -> N Panel -> NH Plugin`
 
-Текущая версия: **0.1.8**
+Текущая версия: **0.1.9**
 
 ## Возможности
 
 - Scatter clutter-прокси из DayZ-конфига: `CfgWorlds -> CAWorld -> Clutter` + `CfgSurfaceCharacters`
 - Memory LOD / Snap Points workflow
-- Geometry Collider workflow для создания коллайдеров прямо в Blender
+- Collider LOD workflow для `Geometry` / `View Geometry` / `Fire Geometry`
 - Misc / Roadway workflow для подготовки плоских walkway-LOD мешей
 - Texture Replace через A3OB material properties (`.paa` / `.rvmat`)
 - Batch import/export `.p3d`
@@ -33,36 +33,42 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 
 Что умеет:
 
-- создавать или находить отдельный `Geometry` LOD
+- создавать или находить отдельный target LOD: `Geometry`, `View Geometry` или `Fire Geometry`
+- автоматически обновлять A3OB LOD props и имя target-объекта при смене `Target LOD`
 - складывать collider-меши в коллекцию `Geometry`
 - красить collider-объекты в светло-желтый цвет для быстрого визуального отличия от `Resolution`
 - поддерживать OB-style workflow через хоткеи
 - показывать fallback-кнопки через раскрывающийся блок `Hotkeys -> Buttons`
+- давать отдельную кнопку `Selected Loose Geometry Verts -> Hull` для работы по выделенным loose verts
 - показывать дополнительные редкие build-кнопки через `Extra Build`
 
 ### Collider workflow
 
 Базовый сценарий:
 
-1. На `Resolution` войдите в `Edit Mode`.
-2. Выделите вершины.
-3. Нажмите `Ctrl+Shift+C` для копирования вершин в `Geometry`.
-4. В `Geometry` при необходимости используйте `Shift+D` и перемещение вершин.
-5. Нажмите `Mouse5`, чтобы собрать convex hull из loose verts.
+1. На исходном визуальном меше войдите в `Edit Mode`.
+2. В блоке `Target` выберите нужный LOD: `Geometry`, `View Geometry` или `Fire Geometry`.
+3. Нажмите `Create/Find Collider LOD`.
+4. Выделите вершины и нажмите `Ctrl+Shift+C` для копирования в target LOD.
+5. В target LOD при необходимости используйте `Shift+D` и перемещение вершин.
+6. Выделите loose verts и нажмите `Selected Loose Geometry Verts -> Hull`.
 
 Дополнительно:
 
 - `Mouse4` делает `Selection -> Hull` по текущему выделению вершин / ребер / полигонов
-- `Alt+LMB` выбирает весь связанный mesh island под курсором
 - `Ctrl+Shift+A` выбирает только изолированные вершины без ребер и полигонов
+- `Selected Loose Geometry Verts -> Hull` работает по выделению внутри target LOD в `Edit Mode`
 
 ### Collider hotkeys
 
 - `Ctrl+Shift+C` — `Copy Selected Verts To Geometry`
 - `Ctrl+Shift+A` — `Select Isolated Verts`
 - `Mouse4` — `Selection -> Hull`
-- `Mouse5` — `Loose Geometry Verts -> Hull`
-- `Alt+LMB` — `Pick Whole Mesh Island`
+
+Примечание:
+
+- `Ctrl+Shift+A` регистрируется только если сочетание свободно в текущем keymap
+- `Selected Loose Geometry Verts -> Hull` доступен через блок `Hotkeys -> Buttons`
 
 ### Extra Build
 
@@ -87,19 +93,24 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 - создавать или находить коллекцию `Misc`
 - создавать или находить `Roadway` LOD внутри `Misc`
 - копировать выделенные полигоны из визуала в `Roadway`
-- сшивать почти совпадающие вершины в `Roadway` для более цельной nav/path геометрии
+- выбирать активный материал у `Roadway`-объекта
+- назначать `.rvmat` / `.paa` через файловый выбор прямо в выбранный `Roadway Material`
+- сшивать почти совпадающие вершины только в текущем выделении `Roadway` для более цельной nav/path геометрии
 
 ### Roadway workflow
 
 1. На визуальном меше выделите нужные полигоны в `Edit Mode`.
 2. Нажмите `Create/Find Misc Roadway`.
 3. Нажмите `Copy Selected Faces To Roadway`.
-4. При необходимости нажмите `Weld Roadway`.
+4. При необходимости выберите `Roadway Material` и назначьте `.rvmat` или `.paa` через кнопку с иконкой папки.
+5. Перейдите в `Roadway` и при необходимости нажмите `Weld Roadway` по текущему выделению.
 
 ### Roadway настройки
 
+- `Material` — выбор текущего материала на `Roadway`-объекте
+- Кнопка с иконкой папки — выбор `.rvmat` / `.paa` для выбранного `Roadway Material`
 - `Roadway Weld Distance` — дистанция сшивания близких вершин в `Roadway`
-- `Weld Roadway` — повторное merge-by-distance после ручных правок
+- `Weld Roadway` — merge-by-distance только по текущему выделению в `Edit Mode`
 
 Примечание:
 
@@ -162,6 +173,10 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 ## История изменений
 
 Полная история изменений: [CHANGELOG.md](CHANGELOG.md)
+
+Последнее обновление:
+
+- `0.1.9` (`2026-03-29`) — target LOD selector для collider workflow, `Roadway Material` picker и более точный selection-based `Weld Roadway`
 
 ## Ссылки
 
