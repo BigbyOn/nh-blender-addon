@@ -1,8 +1,8 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Daryl and Enisam",
-    "version": (0, 1, 9),
-    "blender": (4, 4, 3),
+    "version": (0, 2, 0),
+    "blender": (5, 1, 0),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "Scatter Arma3 Proxy objects using DayZ clutter config + Texture Replace (.paa/.rvmat) + Replace from DB via A3OB",
     "doc_url": "https://github.com/BigbyOn/nh-blender-addon",
@@ -168,17 +168,12 @@ def _register_collider_keymaps():
         ctrl=True,
         shift=True,
     )
-    if _mesh_shortcut_is_free(window_manager, event_type="A", value="PRESS", ctrl=True, shift=True):
-        _register_addon_keymap_item(
-            keymap,
-            "cray.select_isolated_vertices",
-            event_type="A",
-            value="PRESS",
-            ctrl=True,
-            shift=True,
-        )
-    else:
-        print("[NH Plugin] Ctrl+Shift+A is already in use, skipping Select Isolated Verts shortcut.")
+    _register_addon_keymap_item(
+        keymap,
+        "cray.select_isolated_vertices",
+        event_type="BUTTON5MOUSE",
+        value="PRESS",
+    )
     if _mesh_shortcut_is_free(window_manager, event_type="BUTTON4MOUSE", value="PRESS"):
         _register_addon_keymap_item(
             keymap,
@@ -2424,6 +2419,160 @@ def _finalize_convex_hull_geometry(bm, hull_result, seed_verts, recalc_normals=T
     return final_faces
 
 
+def _select_only_faces_in_bmesh(bm, faces):
+    face_set = {face for face in faces if face is not None and face.is_valid}
+    for face in bm.faces:
+        face.select = False
+    for edge in bm.edges:
+        edge.select = False
+    for vert in bm.verts:
+        vert.select = False
+    for face in face_set:
+        face.select = True
+    bm.select_flush_mode()
+
+
+def _build_clean_hull_data_from_local_points(local_points, merge_distance=0.0, recalc_normals=True):
+    unique_points = []
+    seen = set()
+    for point in local_points:
+        key = _vector_quantized_key(point)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_points.append(point.copy())
+
+    if len(unique_points) < 4:
+        raise RuntimeError("Selected vertices collapse below 4 unique points")
+
+    bm = bmesh.new()
+    try:
+        seed_verts = [bm.verts.new(point) for point in unique_points]
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+
+        if merge_distance > 0.0 and seed_verts:
+            bmesh.ops.remove_doubles(bm, verts=seed_verts, dist=merge_distance)
+            bm.verts.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
+            seed_verts = [vert for vert in seed_verts if vert.is_valid]
+
+        unique_point_keys = {_vector_quantized_key(vert.co) for vert in seed_verts if vert.is_valid}
+        if len(unique_point_keys) < 4:
+            raise RuntimeError("Selected vertices collapse below 4 unique points")
+
+        hull = bmesh.ops.convex_hull(bm, input=seed_verts, use_existing_faces=False)
+        final_faces = _finalize_convex_hull_geometry(
+            bm,
+            hull,
+            seed_verts,
+            recalc_normals=recalc_normals,
+        )
+
+        used_verts = []
+        used_vert_ids = set()
+        for face in final_faces:
+            if face is None or not face.is_valid:
+                continue
+            for vert in face.verts:
+                if vert is None or not vert.is_valid:
+                    continue
+                key = id(vert)
+                if key in used_vert_ids:
+                    continue
+                used_vert_ids.add(key)
+                used_verts.append(vert)
+
+        if len(used_verts) < 4:
+            raise RuntimeError("Convex hull did not keep enough vertices to build a clean result")
+
+        vert_index_by_id = {id(vert): idx for idx, vert in enumerate(used_verts)}
+        face_indices = []
+        for face in final_faces:
+            if face is None or not face.is_valid or len(face.verts) < 3:
+                continue
+            indices = [vert_index_by_id[id(vert)] for vert in face.verts if vert is not None and vert.is_valid]
+            if len(indices) >= 3:
+                face_indices.append(indices)
+
+        if not face_indices:
+            raise RuntimeError("Convex hull did not create faces (selection may be too flat or degenerate)")
+
+        return {
+            "verts": [vert.co.copy() for vert in used_verts],
+            "faces": face_indices,
+            "used_verts": len(unique_point_keys),
+        }
+    finally:
+        bm.free()
+
+
+def _replace_selection_with_clean_hull_in_edit_object(
+    context,
+    target_obj,
+    hull_data,
+    selected_geom,
+    recalc_normals=True,
+):
+    if target_obj is None or target_obj.type != "MESH":
+        raise RuntimeError("Target object must be a mesh")
+    if target_obj.mode != "EDIT":
+        raise RuntimeError("Target object must be in Edit Mode")
+
+    mesh = target_obj.data
+    bm = bmesh.from_edit_mesh(mesh)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+
+    geom_to_delete = []
+    geom_to_delete.extend(selected_geom.get("faces", []))
+    geom_to_delete.extend(selected_geom.get("edges", []))
+    geom_to_delete.extend(selected_geom.get("verts", []))
+    if geom_to_delete:
+        _delete_bmesh_geom(bm, geom_to_delete)
+
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+
+    new_verts = [bm.verts.new(point) for point in hull_data["verts"]]
+    bm.verts.ensure_lookup_table()
+
+    new_faces = []
+    for face_indices in hull_data["faces"]:
+        face_verts = [new_verts[idx] for idx in face_indices if 0 <= idx < len(new_verts)]
+        if len(face_verts) < 3 or len(set(face_verts)) < 3:
+            continue
+        try:
+            face = bm.faces.new(face_verts)
+        except ValueError:
+            continue
+        new_faces.append(face)
+
+    if not new_faces:
+        raise RuntimeError("Could not write clean convex hull back to the mesh")
+
+    if recalc_normals:
+        bmesh.ops.recalc_face_normals(bm, faces=new_faces)
+
+    _select_only_faces_in_bmesh(bm, new_faces)
+    bm.normal_update()
+    bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=True)
+    if context.mode == "EDIT_MESH":
+        try:
+            bpy.ops.mesh.select_mode(type="FACE")
+        except Exception:
+            pass
+
+    return {
+        "verts_added": len(new_verts),
+        "faces_added": len(new_faces),
+    }
+
+
 def _append_collider_hull_to_object(target_obj, world_points, merge_distance=0.0, recalc_normals=True):
     if target_obj is None or target_obj.type != "MESH":
         raise RuntimeError("Target Geometry LOD object must be a mesh")
@@ -2442,26 +2591,32 @@ def _append_collider_hull_to_object(target_obj, world_points, merge_distance=0.0
         before_face_count = len(bm.faces)
 
         to_local = target_obj.matrix_world.inverted_safe()
-        new_verts = []
-        for point in unique_points:
+        local_points = [to_local @ point for point in unique_points]
+        hull_data = _build_clean_hull_data_from_local_points(
+            local_points,
+            merge_distance=merge_distance,
+            recalc_normals=recalc_normals,
+        )
+
+        new_verts = [bm.verts.new(point) for point in hull_data["verts"]]
+        bm.verts.ensure_lookup_table()
+
+        new_faces = []
+        for face_indices in hull_data["faces"]:
+            face_verts = [new_verts[idx] for idx in face_indices if 0 <= idx < len(new_verts)]
+            if len(face_verts) < 3 or len(set(face_verts)) < 3:
+                continue
             try:
-                vert = bm.verts.new(to_local @ point)
-                new_verts.append(vert)
+                face = bm.faces.new(face_verts)
             except ValueError:
                 continue
+            new_faces.append(face)
 
-        bm.verts.ensure_lookup_table()
-        new_verts = [vert for vert in new_verts if vert.is_valid]
+        if not new_faces:
+            raise RuntimeError("Could not append clean convex hull to the target mesh")
 
-        if merge_distance > 0.0 and new_verts:
-            bmesh.ops.remove_doubles(bm, verts=new_verts, dist=merge_distance)
-            new_verts = [vert for vert in new_verts if vert.is_valid]
-
-        if len(new_verts) < 4:
-            raise RuntimeError("New collider points collapsed below 4 unique vertices")
-
-        hull = bmesh.ops.convex_hull(bm, input=new_verts, use_existing_faces=False)
-        _finalize_convex_hull_geometry(bm, hull, new_verts, recalc_normals=recalc_normals)
+        if recalc_normals:
+            bmesh.ops.recalc_face_normals(bm, faces=new_faces)
 
         bm.normal_update()
         bm.to_mesh(mesh)
@@ -2470,6 +2625,7 @@ def _append_collider_hull_to_object(target_obj, world_points, merge_distance=0.0
         return {
             "verts_added": len(mesh.vertices) - before_vert_count,
             "faces_added": len(mesh.polygons) - before_face_count,
+            "used_verts": hull_data["used_verts"],
         }
     finally:
         bm.free()
@@ -2570,24 +2726,16 @@ def _append_selected_faces_to_object(target_obj, source_obj, recalc_normals=True
     for src_material_index in sorted({face.material_index for face in selected_faces}):
         src_mat = source_slots[src_material_index].material if src_material_index < len(source_slots) else None
 
-        target_material_index = None
-        for slot_idx, existing_mat in enumerate(target_materials):
-            if existing_mat == src_mat:
-                target_material_index = slot_idx
-                break
-
-        if target_material_index is None:
-            if src_mat is not None:
-                target_materials.append(src_mat)
-                target_material_index = len(target_materials) - 1
-                if not preferred_material_name:
-                    preferred_material_name = src_mat.name
-            elif len(target_materials) > 0:
-                target_material_index = 0
-            else:
-                target_material_index = 0
-        elif src_mat is not None and not preferred_material_name:
-            preferred_material_name = src_mat.name
+        if src_mat is not None:
+            target_material_index, roadway_material_name = _ensure_roadway_material(target_materials, src_mat)
+            if not preferred_material_name:
+                preferred_material_name = roadway_material_name
+        elif len(target_materials) > 0:
+            target_material_index = 0
+        else:
+            target_material_index, roadway_material_name = _ensure_roadway_material(target_materials, None)
+            if not preferred_material_name:
+                preferred_material_name = roadway_material_name
 
         material_slot_map[src_material_index] = target_material_index
 
@@ -2806,6 +2954,11 @@ def _build_convex_hull_from_loose_geometry_verts(context, target_obj, merge_dist
     mesh = target_obj.data
     bm = bmesh.from_edit_mesh(mesh)
     bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+
+    before_vert_count = len(bm.verts)
+    before_face_count = len(bm.faces)
 
     loose_verts = [
         vert for vert in bm.verts
@@ -2815,25 +2968,142 @@ def _build_convex_hull_from_loose_geometry_verts(context, target_obj, merge_dist
     if len(loose_verts) < 4:
         raise RuntimeError("Need at least 4 selected loose vertices in Geometry to build a collider")
 
-    world_points = _dedupe_world_points([target_obj.matrix_world @ vert.co for vert in loose_verts])
-    if len(world_points) < 4:
+    if merge_distance > 0.0:
+        bmesh.ops.remove_doubles(bm, verts=loose_verts, dist=merge_distance)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        loose_verts = [
+            vert for vert in bm.verts
+            if vert.is_valid and vert.select and len(vert.link_edges) == 0 and len(vert.link_faces) == 0
+        ]
+
+    local_points = [vert.co.copy() for vert in loose_verts if vert is not None and vert.is_valid]
+    unique_point_keys = {_vector_quantized_key(point) for point in local_points}
+    if len(unique_point_keys) < 4:
         raise RuntimeError("Selected loose vertices collapse below 4 unique points")
 
-    local_keys = {_vector_quantized_key(vert.co) for vert in loose_verts}
+    hull = bmesh.ops.convex_hull(bm, input=loose_verts, use_existing_faces=False)
+    final_faces = _finalize_convex_hull_geometry(bm, hull, loose_verts, recalc_normals=recalc_normals)
+    _select_only_faces_in_bmesh(bm, final_faces)
+    bm.normal_update()
+    bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
+    try:
+        bpy.ops.mesh.select_mode(type="FACE")
+    except Exception:
+        pass
+
+    return {
+        "verts_added": len(bm.verts) - before_vert_count,
+        "faces_added": len(bm.faces) - before_face_count,
+        "used_verts": len(unique_point_keys),
+        "removed_source_verts": 0,
+    }
+
+
+def _build_convex_hull_from_current_selection_operator(context, target_obj, recalc_normals=True):
+    if target_obj is None or target_obj.type != "MESH":
+        raise RuntimeError("Target object must be a mesh")
+    if context.mode != "EDIT_MESH" or target_obj.mode != "EDIT":
+        raise RuntimeError("Convex hull requires the target object to be active in Edit Mode")
+
+    mesh = target_obj.data
+    bm = bmesh.from_edit_mesh(mesh)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+
+    selected_verts = {vert for vert in bm.verts if vert.select and vert.is_valid}
+    for edge in bm.edges:
+        if edge.select and edge.is_valid:
+            for vert in edge.verts:
+                if vert.is_valid:
+                    selected_verts.add(vert)
+    for face in bm.faces:
+        if face.select and face.is_valid:
+            for vert in face.verts:
+                if vert.is_valid:
+                    selected_verts.add(vert)
+
+    unique_point_keys = {_vector_quantized_key(vert.co) for vert in selected_verts}
+    if len(unique_point_keys) < 4:
+        raise RuntimeError("Need at least 4 unique selected vertices to build a collider")
+
+    before_vert_count = len(bm.verts)
+    before_face_count = len(bm.faces)
+
+    bpy.ops.mesh.select_mode(type="VERT")
+    bpy.ops.mesh.convex_hull(
+        delete_unused=True,
+        use_existing_faces=False,
+        make_holes=False,
+        join_triangles=True,
+        face_threshold=0.0001745329,
+        shape_threshold=0.0001745329,
+        uvs=False,
+        vcols=False,
+        seam=False,
+        sharp=False,
+        materials=False,
+    )
+    bpy.ops.mesh.select_mode(type="FACE")
+    bpy.ops.mesh.tris_convert_to_quads(
+        face_threshold=3.14159265,
+        shape_threshold=3.14159265,
+        uvs=False,
+        vcols=False,
+        seam=False,
+        sharp=False,
+        materials=False,
+    )
+
+    bm = bmesh.from_edit_mesh(mesh)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    if recalc_normals:
+        selected_faces = [face for face in bm.faces if face.select and face.is_valid]
+        if selected_faces:
+            bmesh.ops.recalc_face_normals(bm, faces=selected_faces)
+
+    bm.normal_update()
+    bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
+    try:
+        bpy.ops.mesh.select_mode(type="FACE")
+    except Exception:
+        pass
+
+    return {
+        "verts_added": len(bm.verts) - before_vert_count,
+        "faces_added": len(bm.faces) - before_face_count,
+        "used_verts": len(unique_point_keys),
+        "removed_source_verts": 0,
+    }
+
+
+def _build_collider_hull_from_world_points_via_edit_target(
+    context,
+    target_obj,
+    world_points,
+    merge_distance=0.0,
+    recalc_normals=True,
+):
+    before_vert_count = len(target_obj.data.vertices)
+    before_face_count = len(target_obj.data.polygons)
 
     if context.mode != "OBJECT":
         bpy.ops.object.mode_set(mode="OBJECT")
 
-    stats = _append_collider_hull_to_object(
+    added_indices = _append_world_vertices_to_object(target_obj, world_points)
+    _activate_object_vertex_edit(context, target_obj, added_indices)
+    stats = _build_convex_hull_from_loose_geometry_verts(
+        context,
         target_obj,
-        world_points,
         merge_distance=merge_distance,
         recalc_normals=recalc_normals,
     )
-    removed_count = _delete_loose_vertices_by_local_keys(target_obj, local_keys)
-    stats["used_verts"] = len(world_points)
-    stats["removed_source_verts"] = removed_count
-    _activate_object_edit_mode(context, target_obj, select_mode="FACE")
+    stats["verts_added"] = len(target_obj.data.vertices) - before_vert_count
+    stats["faces_added"] = len(target_obj.data.polygons) - before_face_count
     return stats
 
 
@@ -2852,6 +3122,25 @@ def _build_selection_hull_via_target(
     if target_obj is None or target_obj.type != "MESH":
         raise RuntimeError("Target Geometry LOD object must be a mesh")
 
+    bm = bmesh.from_edit_mesh(source_obj.data)
+    selected_faces = [face for face in bm.faces if face.select and face.is_valid]
+    selected_edges = [edge for edge in bm.edges if edge.select and edge.is_valid]
+    selected_verts = {vert for vert in bm.verts if vert.select and vert.is_valid}
+    for edge in selected_edges:
+        for vert in edge.verts:
+            if vert.is_valid:
+                selected_verts.add(vert)
+    for face in selected_faces:
+        for vert in face.verts:
+            if vert.is_valid:
+                selected_verts.add(vert)
+
+    selected_geom = {
+        "verts": list(selected_verts),
+        "edges": selected_edges,
+        "faces": selected_faces,
+    }
+
     selection = _collect_selected_collider_input(source_obj, loose_only=loose_only)
     world_points = selection["world_points"]
     normal = selection["normal"]
@@ -2864,18 +3153,21 @@ def _build_selection_hull_via_target(
         world_points = _extrude_points_along_normal(world_points, normal, box_thickness)
         auto_thickened = True
 
-    if context.mode != "OBJECT":
-        bpy.ops.object.mode_set(mode="OBJECT")
+    if target_obj == source_obj and target_obj.mode == "EDIT":
+        stats = _build_convex_hull_from_current_selection_operator(
+            context,
+            target_obj,
+            recalc_normals=recalc_normals,
+        )
+    else:
+        stats = _build_collider_hull_from_world_points_via_edit_target(
+            context,
+            target_obj,
+            world_points,
+            merge_distance=merge_distance,
+            recalc_normals=recalc_normals,
+        )
 
-    added_indices = _append_world_vertices_to_object(target_obj, world_points)
-    _activate_object_vertex_edit(context, target_obj, added_indices)
-
-    stats = _build_convex_hull_from_loose_geometry_verts(
-        context,
-        target_obj,
-        merge_distance=merge_distance,
-        recalc_normals=recalc_normals,
-    )
     stats["auto_thickened"] = auto_thickened
     return stats
 
@@ -3017,7 +3309,7 @@ class CRAY_OT_ColliderHotkeysInfo(Operator):
         del context, properties
         return (
             "Ctrl+Shift+C: Copy Selected Verts To Geometry\n"
-            "Ctrl+Shift+A: Select Isolated Verts\n"
+            "Mouse5: Select Isolated Verts\n"
             "Mouse4: Selection -> Hull"
         )
 
@@ -3205,6 +3497,13 @@ class CRAY_OT_OpenRoadwayMaterialFolder(Operator):
         except Exception as e:
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
+
+        new_name = _basename_no_ext(filepath)
+        if new_name:
+            try:
+                mat.name = new_name
+            except Exception:
+                pass
 
         _sync_roadway_material_selection(context, mat.name)
         if ext == ".rvmat":
@@ -4298,6 +4597,120 @@ def _pick_string_id(props, keywords):
         if all(k in ui_l for k in keywords):
             return pr["id"]
     return None
+
+def _get_a3ob_material_paths(mat: bpy.types.Material):
+    pg = _find_a3ob_material_pg(mat)
+    if pg is None:
+        return None, None
+
+    props = _a3ob_props(pg)
+    paa_id = (
+        _pick_string_id(props, ["paa"])
+        or _pick_string_id(props, ["texture", "paa"])
+        or _pick_string_id(props, ["texture"])
+        or _pick_string_id(props, ["file"])
+        or _pick_string_id(props, ["path"])
+    )
+    rvmat_id = (
+        _pick_string_id(props, ["rvmat"])
+        or _pick_string_id(props, ["rvm"])
+        or _pick_string_id(props, ["material", "path"])
+        or _pick_string_id(props, ["material"])
+    )
+
+    paa_path = ""
+    rvmat_path = ""
+    if paa_id and hasattr(pg, paa_id):
+        try:
+            paa_path = _norm_path(str(getattr(pg, paa_id, "") or "").strip())
+        except Exception:
+            paa_path = ""
+    if rvmat_id and hasattr(pg, rvmat_id):
+        try:
+            rvmat_path = _norm_path(str(getattr(pg, rvmat_id, "") or "").strip())
+        except Exception:
+            rvmat_path = ""
+
+    return paa_path or None, rvmat_path or None
+
+def _get_material_first_image_path(mat: bpy.types.Material):
+    if mat is None or not getattr(mat, "use_nodes", False) or not getattr(mat, "node_tree", None):
+        return None
+
+    for node in mat.node_tree.nodes:
+        if node.type != "TEX_IMAGE":
+            continue
+        image = getattr(node, "image", None)
+        if image is None:
+            continue
+
+        raw_path = getattr(image, "filepath_raw", "") or getattr(image, "filepath", "")
+        if raw_path:
+            try:
+                return _norm_path(bpy.path.abspath(raw_path))
+            except Exception:
+                return _norm_path(str(raw_path))
+
+        image_name = _basename_no_ext(getattr(image, "name", ""))
+        if image_name:
+            return image_name
+
+    return None
+
+def _derive_roadway_material_name(src_mat: bpy.types.Material):
+    if src_mat is None:
+        return "RoadwayMaterial"
+
+    paa_path, rvmat_path = _get_a3ob_material_paths(src_mat)
+    candidates = [
+        paa_path,
+        rvmat_path,
+        _get_material_first_image_path(src_mat),
+        getattr(src_mat, "name", ""),
+    ]
+
+    for candidate in candidates:
+        base = _basename_no_ext(candidate)
+        if base:
+            return base
+
+    return "RoadwayMaterial"
+
+def _find_material_slot_index_by_name_ci(materials, material_name):
+    target_name = (material_name or "").strip().lower()
+    if not target_name:
+        return None
+
+    for slot_idx, existing_mat in enumerate(materials):
+        if existing_mat is None:
+            continue
+        if existing_mat.name.strip().lower() == target_name:
+            return slot_idx
+    return None
+
+def _ensure_roadway_material(target_materials, src_mat: bpy.types.Material):
+    material_name = _derive_roadway_material_name(src_mat)
+    existing_index = _find_material_slot_index_by_name_ci(target_materials, material_name)
+    if existing_index is not None:
+        existing_mat = target_materials[existing_index]
+        return existing_index, existing_mat.name
+
+    if src_mat is not None:
+        roadway_mat = src_mat.copy()
+    else:
+        roadway_mat = bpy.data.materials.new(name=material_name)
+
+    roadway_mat.name = material_name
+
+    paa_path, rvmat_path = _get_a3ob_material_paths(src_mat)
+    try:
+        if paa_path or rvmat_path:
+            _set_a3ob_material_paths(roadway_mat, paa_path, rvmat_path)
+    except Exception:
+        pass
+
+    target_materials.append(roadway_mat)
+    return len(target_materials) - 1, roadway_mat.name
 
 def _set_a3ob_material_paths(mat: bpy.types.Material, paa_abs: str | None, rvmat_abs: str | None):
     pg = _find_a3ob_material_pg(mat)
@@ -6526,7 +6939,7 @@ class CRAY_PT_ColliderPanel(Panel):
             )
             box.operator(
                 "cray.select_isolated_vertices",
-                text="Select Isolated Verts  [Ctrl+Shift+A]",
+                text="Select Isolated Verts  [Mouse5]",
                 icon="VERTEXSEL",
             )
             op = box.operator(

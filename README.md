@@ -4,7 +4,7 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 
 Расположение в Blender: `3D Viewport -> N Panel -> NH Plugin`
 
-Текущая версия: **0.1.9**
+Текущая версия: **0.2.0**
 
 ## Возможности
 
@@ -56,18 +56,18 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 Дополнительно:
 
 - `Mouse4` делает `Selection -> Hull` по текущему выделению вершин / ребер / полигонов
-- `Ctrl+Shift+A` выбирает только изолированные вершины без ребер и полигонов
+- `Mouse5` выбирает только изолированные вершины без ребер и полигонов
 - `Selected Loose Geometry Verts -> Hull` работает по выделению внутри target LOD в `Edit Mode`
 
 ### Collider hotkeys
 
 - `Ctrl+Shift+C` — `Copy Selected Verts To Geometry`
-- `Ctrl+Shift+A` — `Select Isolated Verts`
+- `Mouse5` — `Select Isolated Verts`
 - `Mouse4` — `Selection -> Hull`
 
 Примечание:
 
-- `Ctrl+Shift+A` регистрируется только если сочетание свободно в текущем keymap
+- `Mouse5` назначен на `Select Isolated Verts`
 - `Selected Loose Geometry Verts -> Hull` доступен через блок `Hotkeys -> Buttons`
 
 ### Extra Build
@@ -176,6 +176,7 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 
 Последнее обновление:
 
+- `0.2.0` (`2026-03-30`) — целевая версия Blender обновлена до `5.1`, релизная версия аддона поднята до `0.2.0`
 - `0.1.9` (`2026-03-29`) — target LOD selector для collider workflow, `Roadway Material` picker и более точный selection-based `Weld Roadway`
 
 ## Ссылки
