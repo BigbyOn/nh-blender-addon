@@ -4,7 +4,7 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 
 Расположение в Blender: `3D Viewport -> N Panel -> NH Plugin`
 
-Текущая версия: **0.2.0**
+Текущая версия: **0.2.1**
 
 ## Возможности
 
@@ -35,7 +35,7 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 
 - создавать или находить отдельный target LOD: `Geometry`, `View Geometry` или `Fire Geometry`
 - автоматически обновлять A3OB LOD props и имя target-объекта при смене `Target LOD`
-- складывать collider-меши в коллекцию `Geometry`
+- складывать collider-меши в коллекцию `Geometries`
 - красить collider-объекты в светло-желтый цвет для быстрого визуального отличия от `Resolution`
 - поддерживать OB-style workflow через хоткеи
 - показывать fallback-кнопки через раскрывающийся блок `Hotkeys -> Buttons`
@@ -176,6 +176,7 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 
 Последнее обновление:
 
+- `0.2.1` (`2026-04-03`) — исправлено создание `Memory`/collider collection, `Geometry` collection переименована в `Geometries`, а `span point` 0/1 теперь сортируются по текущему вьюпорту
 - `0.2.0` (`2026-03-30`) — целевая версия Blender обновлена до `5.1`, релизная версия аддона поднята до `0.2.0`
 - `0.1.9` (`2026-03-29`) — target LOD selector для collider workflow, `Roadway Material` picker и более точный selection-based `Weld Roadway`
 

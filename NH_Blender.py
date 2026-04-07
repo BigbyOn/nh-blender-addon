@@ -1,7 +1,7 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Daryl and Enisam",
-    "version": (0, 2, 0),
+    "version": (0, 3, 1),
     "blender": (5, 1, 0),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "Scatter Arma3 Proxy objects using DayZ clutter config + Texture Replace (.paa/.rvmat) + Replace from DB via A3OB",
@@ -13,6 +13,7 @@ bl_info = {
 
 import bpy
 import bmesh
+from bpy.app.handlers import persistent
 from bpy.types import Operator, Panel, PropertyGroup, UIList, OperatorFileListElement
 from bpy.props import PointerProperty, StringProperty, FloatProperty, IntProperty, BoolProperty, EnumProperty, CollectionProperty
 from mathutils import Vector, Matrix
@@ -22,6 +23,7 @@ import os
 import re
 import shutil
 import importlib
+import json
 from contextlib import contextmanager
 import uuid
 
@@ -42,6 +44,245 @@ _LINKED_PICK_CONFLICT_KEYMAPS = {
     "3D View",
     "3D View Generic",
 }
+_PERSISTED_UI_STATE_FILENAME = "nh_blender_ui_state.json"
+_PERSISTED_UI_STATE_TIMER_INTERVAL = 1.0
+_PERSISTED_UI_STATE_CACHE = None
+_PERSISTED_UI_SETTINGS = {
+    "cray_settings": (
+        "vertex_group",
+        "config_path",
+        "selected_surface",
+        "grid_size",
+        "density_scale",
+        "max_height_offset",
+        "max_distance",
+        "random_jitter",
+        "spawn_probability",
+        "max_proxies",
+        "seed",
+        "only_hit_source",
+    ),
+    "cray_snap_settings": (
+        "snap_group",
+        "snap_side",
+        "edge_axis",
+        "edge_side",
+        "edge_span_axis",
+        "edge_tolerance",
+        "replace_existing",
+        "batch_cleanup_imported",
+        "batch_overwrite_bak",
+    ),
+    "cray_model_split_settings": (
+        "part_number",
+    ),
+    "cray_collider_settings": (
+        "target_lod",
+        "box_thickness",
+        "bounds_padding",
+        "merge_distance",
+        "recalc_normals",
+        "show_hotkey_button_fallbacks",
+        "show_advanced_build_buttons",
+        "roadway_weld_distance",
+    ),
+    "cray_texreplace_settings": (
+        "folder",
+        "fix_mesh_join_batch",
+        "fix_mesh_center_to_origin",
+    ),
+    "cray_ie_settings": (
+        "import_show_materials",
+        "import_keep_converted_textures",
+        "disable_collections_after_import",
+        "disable_mode",
+        "export_mode",
+        "export_directory",
+        "export_create_bak",
+        "export_only_p3d_named",
+        "export_only_split_parts",
+        "export_force_all_lods",
+    ),
+    "cray_asset_proxy_settings": (
+        "delete_originals",
+    ),
+    "cray_asset_library_settings": (
+        "folder",
+        "import_first_lod_only",
+        "clear_previous_temp_library",
+    ),
+}
+
+
+def _persisted_ui_state_path() -> str:
+    base_dir = ""
+    try:
+        base_dir = bpy.utils.user_resource("CONFIG") or ""
+    except Exception:
+        base_dir = ""
+    if not base_dir:
+        base_dir = bpy.app.tempdir or os.path.expanduser("~")
+    return os.path.join(base_dir, _PERSISTED_UI_STATE_FILENAME)
+
+
+def _read_persisted_ui_state():
+    path = _persisted_ui_state_path()
+    if not path or not os.path.isfile(path):
+        return {}
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print("=== NH Plugin: failed to read persisted UI state ===")
+        print(f"{path} -> {_fmt_exc(e)}")
+        return {}
+
+    return data if isinstance(data, dict) else {}
+
+
+def _write_persisted_ui_state(data):
+    global _PERSISTED_UI_STATE_CACHE
+
+    path = _persisted_ui_state_path()
+    folder = os.path.dirname(path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+
+    _PERSISTED_UI_STATE_CACHE = data
+
+
+def _collect_persisted_ui_state(scene):
+    state = {}
+    if scene is None:
+        return state
+
+    for settings_name, prop_names in _PERSISTED_UI_SETTINGS.items():
+        settings = getattr(scene, settings_name, None)
+        if settings is None:
+            continue
+
+        block = {}
+        for prop_name in prop_names:
+            try:
+                value = getattr(settings, prop_name)
+            except Exception:
+                continue
+
+            if isinstance(value, bool):
+                block[prop_name] = bool(value)
+            elif isinstance(value, int):
+                block[prop_name] = int(value)
+            elif isinstance(value, float):
+                block[prop_name] = float(value)
+            elif isinstance(value, str):
+                block[prop_name] = value
+
+        if block:
+            state[settings_name] = block
+
+    return state
+
+
+def _property_has_default_value(settings, prop_name: str) -> bool:
+    if settings is None or not prop_name:
+        return True
+
+    try:
+        prop = settings.bl_rna.properties.get(prop_name)
+    except Exception:
+        prop = None
+    if prop is None:
+        return False
+
+    try:
+        current = getattr(settings, prop_name)
+    except Exception:
+        return False
+
+    try:
+        default = prop.default
+    except Exception:
+        return False
+
+    if isinstance(current, float) or isinstance(default, float):
+        try:
+            return abs(float(current) - float(default)) <= 1e-9
+        except Exception:
+            return False
+
+    return current == default
+
+
+def _apply_persisted_ui_state_to_scene(scene, only_if_default: bool = True):
+    raw = _read_persisted_ui_state()
+    if scene is None or not raw:
+        return 0
+
+    applied = 0
+    for settings_name, prop_names in _PERSISTED_UI_SETTINGS.items():
+        settings = getattr(scene, settings_name, None)
+        saved_block = raw.get(settings_name)
+        if settings is None or not isinstance(saved_block, dict):
+            continue
+
+        for prop_name in prop_names:
+            if prop_name not in saved_block:
+                continue
+            if only_if_default and not _property_has_default_value(settings, prop_name):
+                continue
+
+            try:
+                setattr(settings, prop_name, saved_block[prop_name])
+                applied += 1
+            except Exception:
+                pass
+
+    return applied
+
+
+def _apply_persisted_ui_state_to_all_scenes(only_if_default: bool = True):
+    applied = 0
+    for scene in bpy.data.scenes:
+        applied += _apply_persisted_ui_state_to_scene(scene, only_if_default=only_if_default)
+    return applied
+
+
+def _save_current_persisted_ui_state(scene=None):
+    global _PERSISTED_UI_STATE_CACHE
+
+    if scene is None:
+        scene = getattr(bpy.context, "scene", None)
+    if scene is None:
+        return False
+
+    data = _collect_persisted_ui_state(scene)
+    if data == (_PERSISTED_UI_STATE_CACHE or {}):
+        return False
+
+    try:
+        _write_persisted_ui_state(data)
+    except Exception as e:
+        print("=== NH Plugin: failed to write persisted UI state ===")
+        print(f"{_persisted_ui_state_path()} -> {_fmt_exc(e)}")
+        return False
+
+    return True
+
+
+@persistent
+def _restore_persisted_ui_state_on_load(_dummy):
+    global _PERSISTED_UI_STATE_CACHE
+    _apply_persisted_ui_state_to_all_scenes(only_if_default=True)
+    _PERSISTED_UI_STATE_CACHE = _collect_persisted_ui_state(getattr(bpy.context, "scene", None))
+
+
+def _persisted_ui_state_timer():
+    _save_current_persisted_ui_state(getattr(bpy.context, "scene", None))
+    return _PERSISTED_UI_STATE_TIMER_INTERVAL
 
 
 def _fmt_exc(e: Exception) -> str:
@@ -475,7 +716,7 @@ class CRAY_PG_Settings(PropertyGroup):
 class CRAY_PG_SnapSettings(PropertyGroup):
     source_object: PointerProperty(name="Model Object", type=bpy.types.Object)
     memory_object: PointerProperty(name="Memory LOD Object", type=bpy.types.Object)
-    snap_group: StringProperty(name="Snap Group", default="StenaKamennaya")
+    snap_group: StringProperty(name="Snap Group", default="SampleName")
     snap_side: EnumProperty(
         name="Side",
         items=(
@@ -522,6 +763,15 @@ class CRAY_PG_SnapSettings(PropertyGroup):
     batch_cleanup_imported: BoolProperty(name="Cleanup Imported Objects", default=True)
     batch_overwrite_bak: BoolProperty(name="Overwrite .bak", default=True)
 
+class CRAY_PG_ModelSplitSettings(PropertyGroup):
+    part_number: IntProperty(
+        name="Part Number",
+        description="Numeric suffix for the new split part collection",
+        default=1,
+        min=1,
+        max=999,
+    )
+
 
 _COLLIDER_TARGET_LOD_ITEMS = (
     ("6", "Geometry", "Object collision geometry and occluders"),
@@ -540,9 +790,12 @@ _COLLIDER_KNOWN_LOD_NAMES = {
     "9": "Memory",
     "11": "Roadway",
 }
-_COLLIDER_COLLECTION_NAME = "Geometry"
+_COLLIDER_COLLECTION_NAME = "Geometries"
+_COLLIDER_COLLECTION_ALIASES = ("Geometry",)
 _COLLIDER_COLLECTION_COLOR = "COLOR_03"
 _COLLIDER_OBJECT_COLOR = (1.0, 0.93, 0.55, 1.0)
+_MEMORY_COLLECTION_NAME = "Memory"
+_MEMORY_COLLECTION_COLOR = "COLOR_05"
 _MISC_COLLECTION_NAME = "Misc"
 _MISC_COLLECTION_COLOR = "COLOR_04"
 _ROADWAY_LOD_TOKEN = "11"
@@ -919,6 +1172,7 @@ _A3OB_IMPORT_CANDIDATES = (
             "proxy_action",
             "translate_selections",
             "cleanup_empty_selections",
+            "load_textures",
         ),
     ),
     ("import_scene.a3ob_p3d", ("filepath",)),
@@ -978,6 +1232,12 @@ def _call_first_available(op_candidates, **kwargs):
         if fn is None:
             continue
         payload = {k: v for k, v in kwargs.items() if k in allowed_keys}
+        try:
+            rna = fn.get_rna_type()
+            valid_keys = {prop.identifier for prop in rna.properties if prop.identifier != "rna_type"}
+            payload = {k: v for k, v in payload.items() if k in valid_keys}
+        except Exception:
+            pass
         try:
             result = fn(**payload)
             if isinstance(result, set) and "CANCELLED" in result:
@@ -1211,34 +1471,62 @@ def _ensure_memory_lod_object(context, source_obj, preferred_obj=None):
     else:
         memory_obj = _pick_memory_lod_object(context, source_obj)
 
+    memory_collection = _ensure_memory_collection(context, source_obj)
+
     if memory_obj is None:
         memory_mesh = bpy.data.meshes.new("Memory")
         memory_obj = bpy.data.objects.new("Memory", memory_mesh)
-        if source_obj is not None and source_obj.users_collection:
-            source_obj.users_collection[0].objects.link(memory_obj)
+        if memory_collection is not None:
+            memory_collection.objects.link(memory_obj)
         else:
             context.scene.collection.objects.link(memory_obj)
         if source_obj is not None:
             memory_obj.matrix_world = source_obj.matrix_world.copy()
+    else:
+        _move_object_to_collection(memory_obj, memory_collection)
 
     _set_memory_lod_a3ob_props(memory_obj)
     return memory_obj
 
-def _get_two_selected_vertex_world_positions(context):
-    active = context.view_layer.objects.active
-    if active is None or active.type != "MESH" or active.mode != "EDIT":
-        raise RuntimeError("Active object must be a mesh in Edit Mode")
+def _sort_snap_pair_world_points(context, world_points):
+    points = [p.copy() for p in world_points]
+    if len(points) != 2:
+        return points
 
-    bm = bmesh.from_edit_mesh(active.data)
-    selected = [active.matrix_world @ v.co for v in bm.verts if v.select]
-    if len(selected) != 2:
-        raise RuntimeError(f"Select exactly 2 vertices in Edit Mode (selected: {len(selected)})")
-    return active, selected
+    area = getattr(context, "area", None)
+    space = getattr(context, "space_data", None)
+    region_3d = getattr(space, "region_3d", None) if space is not None else None
+    if area is not None and area.type == "VIEW_3D" and region_3d is not None:
+        try:
+            view_points = [(region_3d.view_matrix @ p.to_4d()).to_3d() for p in points]
+            delta = view_points[1] - view_points[0]
+            primary_axis = 0 if abs(delta[0]) >= abs(delta[1]) else 1
+            secondary_axis = 1 - primary_axis
+            if abs(delta[primary_axis]) > 1e-6 or abs(delta[secondary_axis]) > 1e-6:
+                indexed = list(zip(points, view_points))
+                indexed.sort(
+                    key=lambda item: (
+                        item[1][primary_axis],
+                        item[1][secondary_axis],
+                        item[0][2],
+                        item[0][1],
+                        item[0][0],
+                    )
+                )
+                return [item[0] for item in indexed]
+        except Exception:
+            pass
 
-def _create_snap_pair_in_memory(memory_obj, world_points, snap_group: str, snap_side: str, replace_existing: bool):
+    delta = points[1] - points[0]
+    axis_order = sorted(range(3), key=lambda idx: abs(delta[idx]), reverse=True)
+    points.sort(key=lambda point: tuple(point[idx] for idx in axis_order) + (point[0], point[1], point[2]))
+    return points
+
+def _create_snap_pair_in_memory(context, memory_obj, world_points, snap_group: str, snap_side: str, replace_existing: bool):
     mesh = memory_obj.data
     to_local = memory_obj.matrix_world.inverted()
-    local_points = [to_local @ p for p in world_points]
+    ordered_world_points = _sort_snap_pair_world_points(context, world_points)
+    local_points = [to_local @ p for p in ordered_world_points]
 
     base_idx = len(mesh.vertices)
     mesh.vertices.add(2)
@@ -1387,54 +1675,6 @@ class CRAY_OT_EnsureMemoryLOD(Operator):
         self.report({"INFO"}, f"Memory LOD ready: {memory_obj.name}")
         return {"FINISHED"}
 
-class CRAY_OT_CreateSnapPair(Operator):
-    bl_idname = "cray.create_snap_pair"
-    bl_label = "Create .sp Pair From Selected Vertices"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        ss = context.scene.cray_snap_settings
-
-        snap_group = (ss.snap_group or "").strip()
-        if not snap_group:
-            self.report({"ERROR"}, "Snap Group is empty")
-            return {"CANCELLED"}
-        if not _SP_GROUP_RE.fullmatch(snap_group):
-            self.report({"ERROR"}, "Snap Group must contain only letters and digits")
-            return {"CANCELLED"}
-
-        try:
-            active_obj, world_points = _get_two_selected_vertex_world_positions(context)
-        except Exception as e:
-            self.report({"ERROR"}, _fmt_exc(e))
-            return {"CANCELLED"}
-
-        if context.mode != "OBJECT":
-            try:
-                bpy.ops.object.mode_set(mode="OBJECT")
-            except Exception as e:
-                self.report({"ERROR"}, f"Failed to switch to Object Mode: {_fmt_exc(e)}")
-                return {"CANCELLED"}
-
-        source_obj = ss.source_object if ss.source_object is not None else active_obj
-        if ss.memory_object is not None and ss.memory_object.type != "MESH":
-            self.report({"ERROR"}, "Memory LOD Object must be a mesh")
-            return {"CANCELLED"}
-
-        memory_obj = _ensure_memory_lod_object(context, source_obj, preferred_obj=ss.memory_object)
-        ss.memory_object = memory_obj
-
-        created_names = _create_snap_pair_in_memory(
-            memory_obj=memory_obj,
-            world_points=world_points,
-            snap_group=snap_group,
-            snap_side=ss.snap_side,
-            replace_existing=ss.replace_existing,
-        )
-
-        self.report({"INFO"}, f"Created {len(created_names)} points in {memory_obj.name}: {', '.join(created_names)}")
-        return {"FINISHED"}
-
 class CRAY_OT_CreateSnapPairFromModelEdge(Operator):
     bl_idname = "cray.create_snap_pair_from_model_edge"
     bl_label = "Create .sp Pair From Model Edge"
@@ -1487,6 +1727,7 @@ class CRAY_OT_CreateSnapPairFromModelEdge(Operator):
         ss.memory_object = memory_obj
 
         created_names = _create_snap_pair_in_memory(
+            context=context,
             memory_obj=memory_obj,
             world_points=world_points,
             snap_group=snap_group,
@@ -1581,6 +1822,7 @@ class CRAY_OT_SnapBatchProcess(Operator):
                     proxy_action="SEPARATE",
                     translate_selections=False,
                     cleanup_empty_selections=False,
+                    load_textures=False,
                 )
             if used_import is None:
                 fail_count += 1
@@ -1614,6 +1856,7 @@ class CRAY_OT_SnapBatchProcess(Operator):
                     edge_tolerance=ss.edge_tolerance,
                 )
                 _create_snap_pair_in_memory(
+                    context=context,
                     memory_obj=memory_obj,
                     world_points=world_points,
                     snap_group=snap_group,
@@ -1726,9 +1969,11 @@ def _object_in_logical_collection(obj, collection_name: str) -> bool:
     if obj is None:
         return False
 
-    wanted_name = _logical_collection_name(collection_name)
+    wanted_names = _logical_collection_names(collection_name)
+    if collection_name == _COLLIDER_COLLECTION_NAME:
+        wanted_names.update(_logical_collection_names(_COLLIDER_COLLECTION_ALIASES))
     for col in getattr(obj, "users_collection", []):
-        if _logical_collection_name(getattr(col, "name", "")) == wanted_name:
+        if _logical_collection_name(getattr(col, "name", "")) in wanted_names:
             return True
     return False
 
@@ -1780,6 +2025,18 @@ def _logical_collection_name(name: str) -> str:
     return re.sub(r"\.\d{3}$", "", (name or "").strip().lower())
 
 
+def _logical_collection_names(*names) -> set:
+    result = set()
+    for name in names:
+        if not name:
+            continue
+        if isinstance(name, (tuple, list, set)):
+            result.update(_logical_collection_names(*name))
+            continue
+        result.add(_logical_collection_name(name))
+    return result
+
+
 def _preferred_collider_parent_collection(context, source_obj):
     source_col = None
     if source_obj is not None and source_obj.users_collection:
@@ -1809,23 +2066,33 @@ def _ensure_collider_collection(context, source_obj):
     if parent is None:
         parent = context.scene.collection
 
-    return _ensure_named_child_collection(parent, _COLLIDER_COLLECTION_NAME, _COLLIDER_COLLECTION_COLOR)
+    return _ensure_named_child_collection(
+        parent,
+        _COLLIDER_COLLECTION_NAME,
+        _COLLIDER_COLLECTION_COLOR,
+        aliases=_COLLIDER_COLLECTION_ALIASES,
+    )
 
 
-def _ensure_named_child_collection(parent_collection, collection_name, color_tag=None):
+def _ensure_named_child_collection(parent_collection, collection_name, color_tag=None, aliases=()):
     if parent_collection is None:
         return None
 
     target = parent_collection.children.get(collection_name)
+    logical_names = _logical_collection_names(collection_name, aliases)
     if target is None:
-        wanted_name = _logical_collection_name(collection_name)
         for child in parent_collection.children:
-            if _logical_collection_name(child.name) == wanted_name:
+            if _logical_collection_name(child.name) in logical_names:
                 target = child
                 break
     if target is None:
         target = bpy.data.collections.new(collection_name)
         parent_collection.children.link(target)
+    elif _logical_collection_name(target.name) != _logical_collection_name(collection_name):
+        try:
+            target.name = collection_name
+        except Exception:
+            pass
 
     if color_tag:
         try:
@@ -1834,6 +2101,13 @@ def _ensure_named_child_collection(parent_collection, collection_name, color_tag
             pass
 
     return target
+
+
+def _ensure_memory_collection(context, source_obj):
+    parent = _preferred_collider_parent_collection(context, source_obj)
+    if parent is None:
+        parent = context.scene.collection
+    return _ensure_named_child_collection(parent, _MEMORY_COLLECTION_NAME, _MEMORY_COLLECTION_COLOR)
 
 
 def _ensure_misc_collection(context, source_obj):
@@ -2086,10 +2360,6 @@ def _enable_collider_object_color_preview(context):
 def _ensure_collider_lod_object(context, source_obj, lod_token, preferred_obj=None):
     if preferred_obj is not None and preferred_obj.type == "MESH":
         target_obj = preferred_obj
-        _set_collider_lod_a3ob_props(target_obj, lod_token)
-        _apply_collider_visual_style(target_obj)
-        _enable_collider_object_color_preview(context)
-        return target_obj
     else:
         target_obj = _pick_collider_lod_object(context, source_obj, lod_token)
 
@@ -3560,7 +3830,7 @@ class CRAY_OT_SelectIsolatedVertices(Operator):
 
 
 class CRAY_OT_EnsureColliderLOD(Operator):
-    """Create or find the Geometry LOD object and move it into the Geometry collection"""
+    """Create or find the Geometry LOD object and move it into the Geometries collection"""
 
     bl_idname = "cray.ensure_collider_lod"
     bl_label = "Create/Find Collider LOD"
@@ -3768,7 +4038,6 @@ _TEXTURE_SUFFIX_RE = re.compile(
     r"([_-])(co|ca|as|nohq|no|n|smdi|spec|det|detail|em|ao|rough|metal|mask)$",
     re.IGNORECASE,
 )
-
 def _norm_path(p: str) -> str:
     return (p or "").replace("/", "\\")
 
@@ -4757,6 +5026,524 @@ def _set_a3ob_material_paths(mat: bpy.types.Material, paa_abs: str | None, rvmat
             raise RuntimeError("RVMAT path field not found in A3OB Material Properties")
         setattr(pg, rvmat_id, rvmat_abs)
 
+def _iter_unique_materials_from_objects(objects):
+    materials = []
+    seen = set()
+    for obj in objects or []:
+        if obj is None or getattr(obj, "type", None) != "MESH":
+            continue
+        for slot in getattr(obj, "material_slots", []):
+            mat = getattr(slot, "material", None)
+            if mat is None:
+                continue
+            ptr = mat.as_pointer()
+            if ptr in seen:
+                continue
+            seen.add(ptr)
+            materials.append(mat)
+    return materials
+
+def _enable_preview_material_alpha(material: bpy.types.Material):
+    try:
+        material.blend_method = "HASHED"
+    except Exception:
+        pass
+
+    try:
+        material.shadow_method = "HASHED"
+    except Exception:
+        pass
+
+def _apply_image_color_space(image, color_space: str):
+    if image is None:
+        return
+
+    if color_space == "DATA":
+        try:
+            image.colorspace_settings.is_data = True
+        except Exception:
+            try:
+                image.colorspace_settings.name = "Non-Color"
+            except Exception:
+                pass
+    else:
+        try:
+            image.colorspace_settings.is_data = False
+        except Exception:
+            pass
+
+def _has_image_alpha(image) -> bool:
+    if image is None:
+        return False
+
+    try:
+        if getattr(image, "alpha_mode", "NONE") != "NONE":
+            return True
+    except Exception:
+        pass
+
+    try:
+        return int(getattr(image, "channels", 0) or 0) >= 4
+    except Exception:
+        return False
+
+def _remove_image_if_unused(image):
+    if image is None:
+        return
+
+    try:
+        if image.users == 0:
+            bpy.data.images.remove(image)
+    except Exception:
+        pass
+
+def _find_existing_paa_preview_image(filepath: str, color_space: str):
+    filepath = os.path.abspath(bpy.path.abspath(filepath)).lower()
+    is_data = color_space == "DATA"
+
+    for image in bpy.data.images:
+        image_path = getattr(image, "filepath_raw", "") or getattr(image, "filepath", "")
+        if not image_path:
+            continue
+
+        try:
+            image_path = os.path.abspath(bpy.path.abspath(image_path)).lower()
+        except Exception:
+            continue
+
+        if image_path != filepath:
+            continue
+
+        try:
+            image_is_data = bool(image.colorspace_settings.is_data)
+        except Exception:
+            image_is_data = False
+
+        if image_is_data == is_data:
+            return image
+
+    return None
+
+def _create_blender_image_from_paa_texture(filepath: str, tex, color_space: str):
+    paa_ns = _import_first_available_module(
+        (
+            "bl_ext.user_default.Arma3ObjectBuilder.io.data_paa",
+            "Arma3ObjectBuilder.io.data_paa",
+        )
+    )
+    if paa_ns is None:
+        return None
+
+    paa_type = getattr(paa_ns, "PAA_Type", None)
+    if paa_type is None:
+        return None
+
+    dxt1 = getattr(paa_type, "DXT1", None)
+    dxt5 = getattr(paa_type, "DXT5", None)
+    if tex.type not in (dxt1, dxt5):
+        return None
+
+    mip = tex.mips[0]
+    mip.decompress(tex.type)
+    swiztagg = tex.get_tagg("SWIZ")
+    if swiztagg is not None:
+        mip.swizzle(swiztagg.data)
+
+    alpha = tex.type == dxt5
+    img = bpy.data.images.new(
+        os.path.basename(filepath),
+        mip.width,
+        mip.height,
+        alpha=alpha,
+        is_data=color_space == "DATA",
+    )
+    img.filepath_raw = filepath
+    if alpha:
+        img.alpha_mode = "PREMUL"
+    else:
+        img.alpha_mode = "NONE"
+
+    _apply_image_color_space(img, color_space)
+
+    img.pixels = [value for c in zip(*mip.data) for value in c]
+    img.update()
+    img.pack()
+    return img
+
+def _load_paa_image_with_original_a3ob(filepath: str, color_space: str = "SRGB", check_existing: bool = True):
+    filepath = os.path.abspath(bpy.path.abspath(filepath))
+    if check_existing:
+        existing = _find_existing_paa_preview_image(filepath, color_space)
+        if existing is not None:
+            return existing, None
+
+    paa_mod = _import_first_available_module(
+        (
+            "bl_ext.user_default.Arma3ObjectBuilder.io.data_paa",
+            "Arma3ObjectBuilder.io.data_paa",
+        )
+    )
+    if paa_mod is None:
+        return None, None
+
+    try:
+        with open(filepath, "rb") as file:
+            tex = paa_mod.PAA_File.read(file)
+    except Exception:
+        return None, None
+
+    return _create_blender_image_from_paa_texture(filepath, tex, color_space), tex
+
+def _ensure_a3ob_import_paa_helpers():
+    import_paa_mod = _import_first_available_module(
+        (
+            "bl_ext.user_default.Arma3ObjectBuilder.io.import_paa",
+            "Arma3ObjectBuilder.io.import_paa",
+        )
+    )
+    if import_paa_mod is None:
+        return None
+
+    if not callable(getattr(import_paa_mod, "find_existing_image", None)):
+        setattr(import_paa_mod, "find_existing_image", _find_existing_paa_preview_image)
+
+    if not callable(getattr(import_paa_mod, "create_image_from_texture", None)):
+        def _module_create_image_from_texture(filepath, tex, color_space):
+            return _create_blender_image_from_paa_texture(filepath, tex, color_space)
+        setattr(import_paa_mod, "create_image_from_texture", _module_create_image_from_texture)
+
+    if not callable(getattr(import_paa_mod, "load_file", None)):
+        def _module_load_file(filepath, color_space="SRGB", check_existing=True):
+            return _load_paa_image_with_original_a3ob(filepath, color_space=color_space, check_existing=check_existing)
+        setattr(import_paa_mod, "load_file", _module_load_file)
+
+    return import_paa_mod
+
+def _resolve_a3ob_texture_path(texture_path: str) -> str:
+    raw = (texture_path or "").strip()
+    if not raw:
+        return ""
+
+    import_p3d_mod = _import_first_available_module(
+        (
+            "bl_ext.user_default.Arma3ObjectBuilder.io.import_p3d",
+            "Arma3ObjectBuilder.io.import_p3d",
+        )
+    )
+    resolver = getattr(import_p3d_mod, "resolve_texture_path", None) if import_p3d_mod is not None else None
+    if callable(resolver):
+        try:
+            resolved = resolver(raw)
+            if resolved:
+                resolved = os.path.abspath(bpy.path.abspath(resolved))
+                if os.path.isfile(resolved):
+                    return _norm_path(resolved)
+        except Exception:
+            pass
+
+    utils_mod = _import_first_available_module(
+        (
+            "bl_ext.user_default.Arma3ObjectBuilder.utilities.generic",
+            "Arma3ObjectBuilder.utilities.generic",
+        )
+    )
+    restore_absolute = getattr(utils_mod, "restore_absolute", None) if utils_mod is not None else None
+
+    candidates = []
+    try:
+        candidates.append(os.path.abspath(bpy.path.abspath(raw)))
+    except Exception:
+        pass
+
+    if callable(restore_absolute):
+        for extension in ("", ".paa"):
+            try:
+                candidate = restore_absolute(raw, extension)
+            except TypeError:
+                try:
+                    candidate = restore_absolute(raw)
+                except Exception:
+                    candidate = ""
+            except Exception:
+                candidate = ""
+            if candidate:
+                candidates.append(candidate)
+
+    if os.path.splitext(raw)[1] == "":
+        try:
+            candidates.append(os.path.abspath(bpy.path.abspath(raw + ".paa")))
+        except Exception:
+            pass
+
+    checked = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            candidate_abs = os.path.abspath(bpy.path.abspath(candidate))
+        except Exception:
+            continue
+        key = os.path.normcase(candidate_abs)
+        if key in checked:
+            continue
+        checked.add(key)
+        if os.path.isfile(candidate_abs):
+            return _norm_path(candidate_abs)
+
+    return ""
+
+def _paa_preview_cache_path(paa_abs_path: str) -> str:
+    root, _ = os.path.splitext(paa_abs_path)
+    return root + ".png"
+
+def _save_image_as_png(image, filepath: str):
+    folder = os.path.dirname(filepath)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+
+    prev_filepath_raw = getattr(image, "filepath_raw", "")
+    prev_filepath = getattr(image, "filepath", "")
+    prev_file_format = getattr(image, "file_format", None)
+
+    try:
+        image.filepath_raw = filepath
+        image.filepath = filepath
+        if prev_file_format is not None:
+            image.file_format = "PNG"
+        image.save()
+    finally:
+        try:
+            image.filepath_raw = prev_filepath_raw
+        except Exception:
+            pass
+        try:
+            image.filepath = prev_filepath
+        except Exception:
+            pass
+        if prev_file_format is not None:
+            try:
+                image.file_format = prev_file_format
+            except Exception:
+                pass
+
+def _load_external_image(filepath: str, color_space: str = "SRGB"):
+    image = bpy.data.images.load(filepath, check_existing=True)
+    _apply_image_color_space(image, color_space)
+    return image
+
+def _load_material_preview_image(texture_path: str, keep_converted_textures: bool, color_space: str = "SRGB"):
+    resolved_path = _resolve_a3ob_texture_path(texture_path)
+    if not resolved_path:
+        return None, False, "", "missing", ""
+
+    ext = os.path.splitext(resolved_path)[1].lower()
+    if ext != ".paa":
+        try:
+            image = _load_external_image(resolved_path, color_space)
+            return image, _has_image_alpha(image), resolved_path, "file", ""
+        except Exception:
+            return None, False, resolved_path, "missing", ""
+
+    import_paa_mod = _import_first_available_module(
+        (
+            "bl_ext.user_default.Arma3ObjectBuilder.io.import_paa",
+            "Arma3ObjectBuilder.io.import_paa",
+        )
+    )
+    if import_paa_mod is None:
+        import_paa_mod = _ensure_a3ob_import_paa_helpers()
+    else:
+        import_paa_mod = _ensure_a3ob_import_paa_helpers() or import_paa_mod
+    if import_paa_mod is None:
+        return None, False, resolved_path, "missing", ""
+
+    load_file = getattr(import_paa_mod, "load_file", None)
+    if not callable(load_file):
+        def _fallback_load_file(filepath, color_space="SRGB", check_existing=True):
+            return _load_paa_image_with_original_a3ob(filepath, color_space=color_space, check_existing=check_existing)
+        load_file = _fallback_load_file
+
+    cache_path = _paa_preview_cache_path(resolved_path)
+    if keep_converted_textures and os.path.isfile(cache_path):
+        cache_valid = True
+        try:
+            cache_valid = os.path.getmtime(cache_path) >= os.path.getmtime(resolved_path)
+        except Exception:
+            cache_valid = True
+
+        if cache_valid:
+            try:
+                image = _load_external_image(cache_path, color_space)
+                return image, _has_image_alpha(image), resolved_path, "cache_hit", cache_path
+            except Exception:
+                try:
+                    os.remove(cache_path)
+                except Exception:
+                    pass
+
+    try:
+        image, tex = load_file(resolved_path, color_space)
+    except Exception:
+        return None, False, resolved_path, "missing", cache_path
+
+    if image is None:
+        return None, False, resolved_path, "missing", cache_path
+
+    has_alpha = _has_image_alpha(image)
+    try:
+        paa_ns = getattr(import_paa_mod, "paa", None)
+        paa_type = getattr(paa_ns, "PAA_Type", None) if paa_ns is not None else None
+        dxt5 = getattr(paa_type, "DXT5", None) if paa_type is not None else None
+        if tex is not None and dxt5 is not None:
+            has_alpha = getattr(tex, "type", None) == dxt5
+    except Exception:
+        pass
+
+    if keep_converted_textures:
+        try:
+            _save_image_as_png(image, cache_path)
+            cache_image = _load_external_image(cache_path, color_space)
+            cache_has_alpha = _has_image_alpha(cache_image) or has_alpha
+            _remove_image_if_unused(image)
+            return cache_image, cache_has_alpha, resolved_path, "cache_created", cache_path
+        except Exception as e:
+            print("=== Import/Export planner: failed to write texture cache ===")
+            print(f"{resolved_path} -> {_fmt_exc(e)}")
+
+    return image, has_alpha, resolved_path, "paa_runtime", cache_path
+
+def _setup_import_preview_nodes(material: bpy.types.Material, image, texture_label: str, has_alpha: bool):
+    if material is None or image is None:
+        return False
+
+    material.use_nodes = True
+    node_tree = getattr(material, "node_tree", None)
+    if node_tree is None:
+        return False
+
+    nodes = node_tree.nodes
+    links = node_tree.links
+    nodes.clear()
+
+    node_output = nodes.new("ShaderNodeOutputMaterial")
+    node_output.location = (300, 0)
+
+    node_shader = nodes.new("ShaderNodeBsdfPrincipled")
+    node_shader.location = (0, 0)
+    links.new(node_shader.outputs["BSDF"], node_output.inputs["Surface"])
+
+    node_texture = nodes.new("ShaderNodeTexImage")
+    node_texture.location = (-320, 0)
+    node_texture.image = image
+    node_texture.label = os.path.basename(texture_label or getattr(image, "filepath", "") or image.name)
+    links.new(node_texture.outputs["Color"], node_shader.inputs["Base Color"])
+
+    if has_alpha:
+        try:
+            links.new(node_texture.outputs["Alpha"], node_shader.inputs["Alpha"])
+            _enable_preview_material_alpha(material)
+        except Exception:
+            pass
+
+    return True
+
+def _postprocess_imported_material_previews(context, imported_objs, *, show_materials: bool, keep_converted_textures: bool):
+    result = {
+        "materials_total": 0,
+        "textured_candidates": 0,
+        "previewed": 0,
+        "missing": 0,
+        "cache_hits": 0,
+        "cache_created": 0,
+        "errors": [],
+    }
+
+    if not show_materials:
+        return result
+
+    materials = _iter_unique_materials_from_objects(imported_objs)
+    result["materials_total"] = len(materials)
+
+    for mat in materials:
+        paa_path, _ = _get_a3ob_material_paths(mat)
+        if not paa_path:
+            continue
+
+        result["textured_candidates"] += 1
+        image, has_alpha, resolved_path, source_kind, _cache_path = _load_material_preview_image(
+            paa_path,
+            keep_converted_textures,
+            color_space="SRGB",
+        )
+        if image is None:
+            result["missing"] += 1
+            continue
+
+        try:
+            if _setup_import_preview_nodes(mat, image, resolved_path or paa_path, has_alpha):
+                result["previewed"] += 1
+                if source_kind == "cache_hit":
+                    result["cache_hits"] += 1
+                elif source_kind == "cache_created":
+                    result["cache_created"] += 1
+        except Exception as e:
+            result["errors"].append(f"{mat.name}: {_fmt_exc(e)}")
+
+    scene = getattr(context, "scene", None)
+    tex_settings = getattr(scene, "cray_texreplace_settings", None) if scene is not None else None
+    preview_obj = getattr(tex_settings, "picked_object", None) if tex_settings is not None else None
+    if preview_obj in imported_objs and tex_settings is not None:
+        try:
+            _collect_object_image_materials(preview_obj, tex_settings.obj_preview_items)
+        except Exception:
+            pass
+
+    return result
+
+def _get_import_preview_settings(context, operator=None):
+    scene = getattr(context, "scene", None)
+    settings = getattr(scene, "cray_ie_settings", None) if scene is not None else None
+
+    show_materials = bool(getattr(settings, "import_show_materials", True))
+    if operator is not None and hasattr(operator, "load_textures"):
+        try:
+            show_materials = bool(getattr(operator, "load_textures"))
+        except Exception:
+            pass
+
+    keep_converted_textures = bool(getattr(settings, "import_keep_converted_textures", False))
+    return show_materials, keep_converted_textures
+
+def _log_import_preview_summary(filepath: str, stats):
+    if not stats:
+        return
+
+    previewed = int(stats.get("previewed", 0) or 0)
+    missing = int(stats.get("missing", 0) or 0)
+    cache_hits = int(stats.get("cache_hits", 0) or 0)
+    cache_created = int(stats.get("cache_created", 0) or 0)
+    errors = list(stats.get("errors", []) or [])
+
+    if previewed == 0 and missing == 0 and cache_hits == 0 and cache_created == 0 and not errors:
+        return
+
+    print("=== Import/Export planner: material previews ===")
+    print(f"{os.path.basename(filepath) or filepath}")
+    print(
+        "materials: {materials_total}, textured: {textured_candidates}, previewed: {previewed}, "
+        "missing: {missing}, cache hits: {cache_hits}, cache created: {cache_created}".format(
+            materials_total=int(stats.get("materials_total", 0) or 0),
+            textured_candidates=int(stats.get("textured_candidates", 0) or 0),
+            previewed=previewed,
+            missing=missing,
+            cache_hits=cache_hits,
+            cache_created=cache_created,
+        )
+    )
+    if errors:
+        for item in errors[:20]:
+            print(item)
+
 # ---------- UI data ----------
 
 class CRAY_PG_TexDBItem(PropertyGroup):
@@ -5227,6 +6014,12 @@ def _looks_like_p3d_collection_name(name: str) -> bool:
     n = (name or "").strip().lower()
     return ".p3d" in n
 
+def _looks_like_split_part_collection_name(name: str) -> bool:
+    n = (name or "").strip()
+    if not n:
+        return False
+    return re.search(r"_\d+\.p3d$", n, flags=re.IGNORECASE) is not None
+
 def _build_ie_import_basename_map(settings):
     mapping = {}
     for item in settings.import_files:
@@ -5300,6 +6093,226 @@ def _export_filename_for_collection(collection, source_path: str):
     if ".p3d" not in base.lower():
         base = base + ".p3d"
     return _INVALID_FILENAME_CHARS_RE.sub("_", base)
+
+def _clear_ie_source_path_tag(id_data):
+    if id_data is None:
+        return
+    try:
+        if _IE_SOURCE_PATH_KEY in id_data:
+            del id_data[_IE_SOURCE_PATH_KEY]
+    except Exception:
+        pass
+
+def _set_ie_source_path_tag(id_data, source_path: str):
+    if id_data is None:
+        return
+    src = _norm_path(bpy.path.abspath(source_path)) if source_path else ""
+    if not src:
+        _clear_ie_source_path_tag(id_data)
+        return
+    try:
+        id_data[_IE_SOURCE_PATH_KEY] = src
+    except Exception:
+        pass
+
+def _derive_split_export_source_path(source_root, split_root_name: str) -> str:
+    source_path = _resolve_collection_source_path(source_root)
+    if not source_path:
+        return ""
+
+    source_dir = os.path.dirname(source_path)
+    if not source_dir:
+        return ""
+
+    base = _strip_blender_numeric_suffix((split_root_name or "").strip())
+    if not base:
+        base = "export"
+    if ".p3d" not in base.lower():
+        base = base + ".p3d"
+    base = _INVALID_FILENAME_CHARS_RE.sub("_", base)
+    return _norm_path(os.path.join(source_dir, base))
+
+def _find_p3d_root_collection_for_object(context, obj):
+    if obj is None:
+        return None
+
+    scene_root = getattr(getattr(context, "scene", None), "collection", None)
+    if scene_root is None:
+        return None
+
+    best = None
+    best_depth = -1
+    for col in getattr(obj, "users_collection", []):
+        path = _find_collection_path(scene_root, col.as_pointer())
+        if not path:
+            continue
+        for depth, item in enumerate(path):
+            if _looks_like_p3d_collection_name(item.name) and depth >= best_depth:
+                best = item
+                best_depth = depth
+
+    return best
+
+def _best_object_collection_path_under_root(root_collection, obj):
+    if root_collection is None or obj is None:
+        return None
+
+    best = None
+    for col in getattr(obj, "users_collection", []):
+        path = _find_collection_path(root_collection, col.as_pointer())
+        if not path:
+            continue
+        if best is None or len(path) > len(best):
+            best = path
+
+    return best
+
+def _format_split_part_collection_name(source_root_name: str, part_number: int) -> str:
+    base_name = _strip_blender_numeric_suffix((source_root_name or "").strip())
+    if not base_name:
+        base_name = "part"
+
+    suffix = f"_{int(part_number):02d}"
+    stem, ext = os.path.splitext(base_name)
+    if ext.lower() == ".p3d":
+        return f"{stem}{suffix}{ext}"
+    return f"{base_name}{suffix}.p3d"
+
+def _ensure_split_part_root_collection(context, source_root, part_number: int):
+    scene_root = getattr(getattr(context, "scene", None), "collection", None)
+    parent = _find_parent_collection(scene_root, source_root) if scene_root is not None else None
+    if parent is None:
+        parent = scene_root if scene_root is not None else source_root
+    if parent is None:
+        return None
+
+    part_name = _format_split_part_collection_name(getattr(source_root, "name", ""), part_number)
+    target = parent.children.get(part_name)
+    if target is None:
+        existing = bpy.data.collections.get(part_name)
+        if existing is not None:
+            target = existing
+            try:
+                if all(ch != target for ch in parent.children):
+                    parent.children.link(target)
+            except Exception:
+                pass
+        else:
+            target = bpy.data.collections.new(part_name)
+            parent.children.link(target)
+
+    try:
+        source_color = getattr(source_root, "color_tag", None)
+        if source_color:
+            target.color_tag = source_color
+    except Exception:
+        pass
+
+    split_source_path = _derive_split_export_source_path(source_root, part_name)
+    _set_ie_source_path_tag(target, split_source_path)
+    return target
+
+def _ensure_split_collection_path(dest_root, source_path):
+    current = dest_root
+    for source_col in list(source_path or [])[1:]:
+        color_tag = None
+        try:
+            color_tag = getattr(source_col, "color_tag", None)
+        except Exception:
+            color_tag = None
+        current = _ensure_named_child_collection(current, source_col.name, color_tag=color_tag)
+        _clear_ie_source_path_tag(current)
+    return current
+
+def _duplicate_object_for_split(obj):
+    if obj is None:
+        return None
+
+    new_obj = obj.copy()
+    data = getattr(obj, "data", None)
+    if data is not None:
+        try:
+            new_obj.data = data.copy()
+        except Exception:
+            pass
+
+    try:
+        new_obj.parent = None
+    except Exception:
+        pass
+
+    try:
+        new_obj.matrix_world = obj.matrix_world.copy()
+    except Exception:
+        pass
+
+    _clear_ie_source_path_tag(new_obj)
+    return new_obj
+
+def _rewire_split_copy_object_refs(copies_by_source):
+    source_to_copy = {src: dup for src, dup in copies_by_source.items() if src is not None and dup is not None}
+    if not source_to_copy:
+        return
+
+    for source_obj, dup_obj in list(source_to_copy.items()):
+        if dup_obj is None:
+            continue
+
+        try:
+            parent_src = source_obj.parent
+        except Exception:
+            parent_src = None
+
+        world_matrix = None
+        try:
+            world_matrix = source_obj.matrix_world.copy()
+        except Exception:
+            world_matrix = None
+
+        if parent_src in source_to_copy:
+            dup_parent = source_to_copy[parent_src]
+            try:
+                dup_obj.parent = dup_parent
+                dup_obj.matrix_parent_inverse = dup_parent.matrix_world.inverted()
+            except Exception:
+                pass
+            if world_matrix is not None:
+                try:
+                    dup_obj.matrix_world = world_matrix
+                except Exception:
+                    pass
+        else:
+            try:
+                dup_obj.parent = None
+            except Exception:
+                pass
+            if world_matrix is not None:
+                try:
+                    dup_obj.matrix_world = world_matrix
+                except Exception:
+                    pass
+
+        for modifier in getattr(dup_obj, "modifiers", []):
+            try:
+                target_obj = getattr(modifier, "object", None)
+            except Exception:
+                target_obj = None
+            if target_obj in source_to_copy:
+                try:
+                    modifier.object = source_to_copy[target_obj]
+                except Exception:
+                    pass
+
+        for constraint in getattr(dup_obj, "constraints", []):
+            try:
+                target_obj = getattr(constraint, "target", None)
+            except Exception:
+                target_obj = None
+            if target_obj in source_to_copy:
+                try:
+                    constraint.target = source_to_copy[target_obj]
+                except Exception:
+                    pass
 
 
 def _resolve_object_source_p3d(obj):
@@ -5480,6 +6493,27 @@ def _patch_a3ob_import_read_file():
                 print("=== Import/Export planner: failed to add A3OB import to planner ===")
                 print(f"{_module_name} -> {_fmt_exc(e)}")
 
+            try:
+                show_materials, keep_converted = _get_import_preview_settings(context, operator)
+                operator_loads_textures = False
+                if hasattr(operator, "load_textures"):
+                    try:
+                        operator_loads_textures = bool(getattr(operator, "load_textures"))
+                    except Exception:
+                        operator_loads_textures = False
+                if operator_loads_textures and not keep_converted:
+                    return lod_objects
+                stats = _postprocess_imported_material_previews(
+                    context,
+                    lod_objects or [],
+                    show_materials=show_materials,
+                    keep_converted_textures=keep_converted,
+                )
+                _log_import_preview_summary(filepath, stats)
+            except Exception as e:
+                print("=== Import/Export planner: failed to build material previews ===")
+                print(f"{_module_name} -> {_fmt_exc(e)}")
+
             return lod_objects
 
         mod.read_file = _wrapped_read_file
@@ -5511,6 +6545,16 @@ class CRAY_PG_IEFileItem(PropertyGroup):
 class CRAY_PG_IEPlannerSettings(PropertyGroup):
     import_files: CollectionProperty(type=CRAY_PG_IEFileItem)
     import_active_index: IntProperty(default=0)
+    import_show_materials: BoolProperty(
+        name="Show material textures after import",
+        default=True,
+        description="Create Image Texture preview nodes for imported A3OB materials so textures are visible in Blender immediately",
+    )
+    import_keep_converted_textures: BoolProperty(
+        name="Keep converted .png next to source .paa",
+        default=False,
+        description="Save Blender-friendly .png copies near imported .paa files and reuse them on later imports instead of converting again",
+    )
     disable_collections_after_import: BoolProperty(
         name="Disable all collections after import",
         default=False,
@@ -5545,6 +6589,11 @@ class CRAY_PG_IEPlannerSettings(PropertyGroup):
         name="Only .p3d-like root collections",
         default=True,
         description="Skip root collections that do not look like imported .p3d collections",
+    )
+    export_only_split_parts: BoolProperty(
+        name="Only split part collections (_01, _02, ...)",
+        default=False,
+        description="Export only root collections whose names end with a numeric split suffix like _01.p3d",
     )
     export_force_all_lods: BoolProperty(
         name="Force export all LODs (skip validation)",
@@ -5659,7 +6708,11 @@ class CRAY_OT_IE_ImportBatch(Operator):
             pre_obj_ptrs = {o.as_pointer() for o in bpy.data.objects}
             pre_col_ptrs = {c.as_pointer() for c in bpy.data.collections}
             with _suppress_a3ob_import_tracking():
-                res, op_id, err = _call_first_available(_A3OB_IMPORT_CANDIDATES, filepath=fp)
+                res, op_id, err = _call_first_available(
+                    _A3OB_IMPORT_CANDIDATES,
+                    filepath=fp,
+                    load_textures=False,
+                )
             if op_id:
                 used_op = op_id
             if res is None:
@@ -5673,6 +6726,13 @@ class CRAY_OT_IE_ImportBatch(Operator):
                     imported_objs=imported_objs,
                     pre_collection_ptrs=pre_col_ptrs,
                 )
+                stats = _postprocess_imported_material_previews(
+                    context,
+                    imported_objs,
+                    show_materials=st.import_show_materials,
+                    keep_converted_textures=st.import_keep_converted_textures,
+                )
+                _log_import_preview_summary(fp, stats)
 
         if st.disable_collections_after_import:
             _disable_all_collections_in_view_layer(context, st.disable_mode)
@@ -5684,6 +6744,116 @@ class CRAY_OT_IE_ImportBatch(Operator):
             self.report({"WARNING"}, f"Imported {imported}, failed {len(failed)} (see System Console)")
         else:
             self.report({"INFO"}, f"Imported {imported} file(s){' via ' + used_op if used_op else ''}")
+        return {"FINISHED"}
+
+class CRAY_OT_ModelSplitDuplicateToPart(Operator):
+    bl_idname = "cray.model_split_duplicate_to_part"
+    bl_label = "Create Part Collection From Selected"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        st = context.scene.cray_model_split_settings
+        selected = [obj for obj in context.selected_objects if obj is not None]
+        if not selected:
+            self.report({"ERROR"}, "Select the separated objects you want to turn into a new model part")
+            return {"CANCELLED"}
+
+        missing_root = []
+        roots = {}
+        for obj in selected:
+            root = _find_p3d_root_collection_for_object(context, obj)
+            if root is None:
+                missing_root.append(obj.name)
+                continue
+            roots[root.as_pointer()] = root
+
+        if missing_root:
+            preview = ", ".join(missing_root[:5])
+            if len(missing_root) > 5:
+                preview += ", ..."
+            self.report({"ERROR"}, f"Selected objects are not inside a .p3d root collection: {preview}")
+            return {"CANCELLED"}
+
+        if len(roots) != 1:
+            root_names = ", ".join(sorted({root.name for root in roots.values()}, key=lambda x: x.lower()))
+            self.report({"ERROR"}, f"Select objects from exactly one .p3d root collection (found: {root_names})")
+            return {"CANCELLED"}
+
+        source_root = next(iter(roots.values()))
+        dest_root = _ensure_split_part_root_collection(context, source_root, st.part_number)
+        if dest_root is None:
+            self.report({"ERROR"}, "Could not create destination part collection")
+            return {"CANCELLED"}
+
+        copies_by_source = {}
+        created = []
+        failed = []
+
+        for src_obj in selected:
+            source_path = _best_object_collection_path_under_root(source_root, src_obj)
+            if not source_path:
+                failed.append(f"{src_obj.name} -> collection path under {source_root.name} not found")
+                continue
+
+            dest_leaf = _ensure_split_collection_path(dest_root, source_path)
+            if dest_leaf is None:
+                failed.append(f"{src_obj.name} -> failed to create destination collection path")
+                continue
+
+            dup_obj = _duplicate_object_for_split(src_obj)
+            if dup_obj is None:
+                failed.append(f"{src_obj.name} -> failed to duplicate object")
+                continue
+
+            try:
+                dest_leaf.objects.link(dup_obj)
+                copies_by_source[src_obj] = dup_obj
+                created.append(dup_obj)
+            except Exception as e:
+                failed.append(f"{src_obj.name} -> {_fmt_exc(e)}")
+                try:
+                    if bpy.data.objects.get(dup_obj.name) is not None and dup_obj.users == 0:
+                        bpy.data.objects.remove(dup_obj)
+                except Exception:
+                    pass
+
+        _rewire_split_copy_object_refs(copies_by_source)
+        _ensure_collection_visible_in_view_layer(context, dest_root)
+
+        if created:
+            _deselect_all_in_view_layer(context)
+            for obj in created:
+                try:
+                    obj.hide_set(False)
+                except Exception:
+                    pass
+                try:
+                    obj.hide_viewport = False
+                except Exception:
+                    pass
+                try:
+                    obj.select_set(True)
+                except Exception:
+                    pass
+            try:
+                context.view_layer.objects.active = created[0]
+            except Exception:
+                pass
+
+        if failed:
+            print("=== Model Split: Failures ===")
+            for item in failed:
+                print(item)
+
+        if not created:
+            self.report({"ERROR"}, "No part objects were created")
+            return {"CANCELLED"}
+
+        msg = f"Created {len(created)} object copy/copies in {dest_root.name}"
+        if failed:
+            self.report({"WARNING"}, msg + f", failed {len(failed)} (see System Console)")
+        else:
+            self.report({"INFO"}, msg)
         return {"FINISHED"}
 
 class CRAY_PG_AssetProxySettings(PropertyGroup):
@@ -6206,6 +7376,7 @@ def _build_temp_asset_library_from_paths(op, context, filepaths):
                 proxy_action="SEPARATE",
                 translate_selections=False,
                 cleanup_empty_selections=False,
+                load_textures=False,
             )
         if res is None:
             failed.append(f"{os.path.basename(fp)}: {_fmt_exc(err) if err else 'import failed'}")
@@ -6613,6 +7784,8 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
             source_hint = _resolve_collection_source_path(col, import_basename_map)
             if st.export_only_p3d_named and not source_hint and not _looks_like_p3d_collection_name(col.name):
                 continue
+            if st.export_only_split_parts and not _looks_like_split_part_collection_name(col.name):
+                continue
             candidates.append((col, source_hint))
 
         if not candidates:
@@ -6885,9 +8058,12 @@ class CRAY_PT_SnapPointsPanel(Panel):
 
         layout.separator()
         box = layout.box()
-        box.label(text="Manual: 2 selected vertices", icon="EDITMODE_HLT")
-        box.label(text="Select exactly 2 vertices in Edit Mode", icon="INFO")
-        box.operator("cray.create_snap_pair", icon="MESH_DATA")
+        box.label(text="Auto: Model Edge", icon="MOD_EDGESPLIT")
+        box.prop(ss, "edge_axis")
+        box.prop(ss, "edge_side", expand=True)
+        box.prop(ss, "edge_span_axis")
+        box.prop(ss, "edge_tolerance")
+        box.operator("cray.create_snap_pair_from_model_edge", icon="MESH_DATA")
 
 class CRAY_PT_ColliderPanel(Panel):
     bl_idname = "VIEW3D_PT_cray_collider"
@@ -7066,12 +8242,15 @@ class CRAY_PT_ImportExportPlannerPanel(Panel):
         ibox.template_list("CRAY_UL_ie_files", "", st, "import_files", st, "import_active_index", rows=6)
         ibox.operator("cray.ie_import_batch", icon="FILE_REFRESH")
         ibox.separator()
+        ibox.prop(st, "import_show_materials")
+        row_preview = ibox.row()
+        row_preview.enabled = bool(st.import_show_materials)
+        row_preview.prop(st, "import_keep_converted_textures")
+        ibox.separator()
         ibox.prop(st, "disable_collections_after_import")
         row2 = ibox.row()
         row2.enabled = bool(st.disable_collections_after_import)
         row2.prop(st, "disable_mode", text="")
-        ibox.label(text="File > Import > .p3d (A3OB) is auto-added here.", icon="INFO")
-        ibox.label(text="Batch import uses A3OB operators (fallback search).", icon="INFO")
 
         ebox = layout.box()
         ebox.label(text="Batch Export Collections (Arma 3 Object Builder)", icon="EXPORT")
@@ -7081,9 +8260,28 @@ class CRAY_PT_ImportExportPlannerPanel(Panel):
         row3.prop(st, "export_directory")
         ebox.prop(st, "export_create_bak")
         ebox.prop(st, "export_only_p3d_named")
+        ebox.prop(st, "export_only_split_parts")
         ebox.prop(st, "export_force_all_lods")
         ebox.operator("cray.ie_export_collections_batch", icon="FILE_TICK")
-        ebox.label(text="Each root collection exports separately.", icon="INFO")
+
+class CRAY_PT_ModelSplitPanel(Panel):
+    bl_idname = "VIEW3D_PT_cray_model_split"
+    bl_label = "Model Split"
+    bl_category = "NH Plugin"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        st = context.scene.cray_model_split_settings
+
+        box = layout.box()
+        box.label(text="Separate -> Part Model", icon="OUTLINER_COLLECTION")
+        box.prop(st, "part_number")
+        box.label(text="Select separated objects from one .p3d root", icon="INFO")
+        box.label(text="Original collection stays unchanged", icon="INFO")
+        box.operator("cray.model_split_duplicate_to_part", icon="DUPLICATE")
 
 class CRAY_PT_TextureReplacePanel(Panel):
     bl_idname = "VIEW3D_PT_cray_texreplace"
@@ -7136,7 +8334,6 @@ classes = (
     CRAY_OT_LoadConfig,
     CRAY_OT_ScatterProxies,
     CRAY_OT_EnsureMemoryLOD,
-    CRAY_OT_CreateSnapPair,
     CRAY_OT_CreateSnapPairFromModelEdge,
     CRAY_OT_SnapBatchProcess,
     CRAY_OT_CopySelectedVertsToGeometry,
@@ -7162,6 +8359,7 @@ classes = (
 
     CRAY_PG_IEFileItem,
     CRAY_PG_IEPlannerSettings,
+    CRAY_PG_ModelSplitSettings,
     CRAY_PG_AssetLibrarySettings,
     CRAY_PG_AssetProxySettings,
     CRAY_UL_IEFiles,
@@ -7172,6 +8370,7 @@ classes = (
     CRAY_OT_IE_RemoveFile,
     CRAY_OT_IE_ClearFiles,
     CRAY_OT_IE_ImportBatch,
+    CRAY_OT_ModelSplitDuplicateToPart,
     CRAY_OT_ConvertSelectedToProxies,
     CRAY_OT_FixShadingByPipeline,
     CRAY_OT_RepairA3OBSelections,
@@ -7183,10 +8382,13 @@ classes = (
     CRAY_PT_AssetProxyPanel,
     CRAY_PT_FixesPanel,
     CRAY_PT_ImportExportPlannerPanel,
+    CRAY_PT_ModelSplitPanel,
     CRAY_PT_TextureReplacePanel,
 )
 
 def register():
+    global _PERSISTED_UI_STATE_CACHE
+
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.cray_settings = PointerProperty(type=CRAY_PG_Settings)
@@ -7194,8 +8396,16 @@ def register():
     bpy.types.Scene.cray_collider_settings = PointerProperty(type=CRAY_PG_ColliderSettings)
     bpy.types.Scene.cray_texreplace_settings = PointerProperty(type=CRAY_PG_TexReplaceSettings)
     bpy.types.Scene.cray_ie_settings = PointerProperty(type=CRAY_PG_IEPlannerSettings)
+    bpy.types.Scene.cray_model_split_settings = PointerProperty(type=CRAY_PG_ModelSplitSettings)
     bpy.types.Scene.cray_asset_library_settings = PointerProperty(type=CRAY_PG_AssetLibrarySettings)
     bpy.types.Scene.cray_asset_proxy_settings = PointerProperty(type=CRAY_PG_AssetProxySettings)
+    _PERSISTED_UI_STATE_CACHE = _read_persisted_ui_state()
+    _apply_persisted_ui_state_to_all_scenes(only_if_default=True)
+    _PERSISTED_UI_STATE_CACHE = _collect_persisted_ui_state(getattr(bpy.context, "scene", None))
+    if _restore_persisted_ui_state_on_load not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_restore_persisted_ui_state_on_load)
+    if not bpy.app.timers.is_registered(_persisted_ui_state_timer):
+        bpy.app.timers.register(_persisted_ui_state_timer, first_interval=_PERSISTED_UI_STATE_TIMER_INTERVAL, persistent=True)
     _patch_a3ob_import_read_file()
     if not bpy.app.timers.is_registered(_ensure_a3ob_import_patch_timer):
         bpy.app.timers.register(_ensure_a3ob_import_patch_timer, first_interval=1.0, persistent=True)
@@ -7203,11 +8413,17 @@ def register():
 
 def unregister():
     _unregister_collider_keymaps()
+    _save_current_persisted_ui_state(getattr(bpy.context, "scene", None))
+    if bpy.app.timers.is_registered(_persisted_ui_state_timer):
+        bpy.app.timers.unregister(_persisted_ui_state_timer)
+    if _restore_persisted_ui_state_on_load in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_restore_persisted_ui_state_on_load)
     if bpy.app.timers.is_registered(_ensure_a3ob_import_patch_timer):
         bpy.app.timers.unregister(_ensure_a3ob_import_patch_timer)
     _unpatch_a3ob_import_read_file()
     del bpy.types.Scene.cray_asset_proxy_settings
     del bpy.types.Scene.cray_asset_library_settings
+    del bpy.types.Scene.cray_model_split_settings
     del bpy.types.Scene.cray_ie_settings
     del bpy.types.Scene.cray_texreplace_settings
     del bpy.types.Scene.cray_collider_settings
