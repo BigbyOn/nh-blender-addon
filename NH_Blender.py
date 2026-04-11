@@ -38,6 +38,11 @@ _PROXY_MESH_NAME = "DayZ_ClutterProxyMesh"
 _ASSET_CATALOG_NAME = "Asset"
 _ASSET_CATALOG_FALLBACK_ID = "7d6f3b1d-4d5f-4b1e-9f77-5d1e8dd5c001"
 _ADDON_KEYMAP_ITEMS = []
+_PLAIN_AXIS_HELPER_PROP = "cray_plain_axis_helper"
+_PLAIN_AXIS_ROOT_PROP = "cray_plain_axis_root"
+_PLAIN_AXIS_SOURCE_OBJECT_PROP = "cray_plain_axis_source_object"
+_PLAIN_AXIS_CONSTRAINT_NAME = "NH Plain Axis"
+_PLAIN_AXIS_HOTKEY_REGISTERED = False
 _MESH_KEYMAP_NAME = "Mesh"
 _LINKED_PICK_CONFLICT_KEYMAPS = {
     "Mesh",
@@ -47,6 +52,9 @@ _LINKED_PICK_CONFLICT_KEYMAPS = {
 _PERSISTED_UI_STATE_FILENAME = "nh_blender_ui_state.json"
 _PERSISTED_UI_STATE_TIMER_INTERVAL = 1.0
 _PERSISTED_UI_STATE_CACHE = None
+_TRASH_TINY_ISLAND_MAX_VERTS = 5
+_TRASH_TINY_ISLAND_MAX_FACES = 6
+_TRASH_TINY_ISLAND_MAX_EDGES = 9
 _PERSISTED_UI_SETTINGS = {
     "cray_settings": (
         "vertex_group",
@@ -65,6 +73,7 @@ _PERSISTED_UI_SETTINGS = {
     "cray_snap_settings": (
         "snap_group",
         "snap_side",
+        "show_auto_edge_fallback",
         "edge_axis",
         "edge_side",
         "edge_span_axis",
@@ -90,6 +99,9 @@ _PERSISTED_UI_SETTINGS = {
         "folder",
         "fix_mesh_join_batch",
         "fix_mesh_center_to_origin",
+        "split_planar_ngon_vertex_count",
+        "split_planar_ngon_angle_tolerance",
+        "split_planar_ngon_plane_tolerance",
     ),
     "cray_ie_settings": (
         "import_show_materials",
@@ -244,9 +256,19 @@ def _apply_persisted_ui_state_to_scene(scene, only_if_default: bool = True):
     return applied
 
 
+def _iter_safe_scenes():
+    scenes = getattr(bpy.data, "scenes", None)
+    if scenes is None:
+        return []
+    try:
+        return list(scenes)
+    except Exception:
+        return []
+
+
 def _apply_persisted_ui_state_to_all_scenes(only_if_default: bool = True):
     applied = 0
-    for scene in bpy.data.scenes:
+    for scene in _iter_safe_scenes():
         applied += _apply_persisted_ui_state_to_scene(scene, only_if_default=only_if_default)
     return applied
 
@@ -387,7 +409,9 @@ def _register_addon_keymap_item(keymap, operator_idname, *, event_type, value="P
 
 
 def _register_collider_keymaps():
+    global _PLAIN_AXIS_HOTKEY_REGISTERED
     _unregister_collider_keymaps()
+    _PLAIN_AXIS_HOTKEY_REGISTERED = False
 
     window_manager = getattr(bpy.context, "window_manager", None)
     if window_manager is None:
@@ -426,14 +450,29 @@ def _register_collider_keymaps():
     else:
         print("[NH Plugin] Mouse4 is already in use, skipping Selection -> Hull shortcut.")
 
+    if _mesh_shortcut_is_free(window_manager, event_type="P", value="PRESS", ctrl=True, shift=True):
+        _register_addon_keymap_item(
+            keymap,
+            "cray.create_plain_axis_pivot",
+            event_type="P",
+            value="PRESS",
+            ctrl=True,
+            shift=True,
+        )
+        _PLAIN_AXIS_HOTKEY_REGISTERED = True
+    else:
+        print("[NH Plugin] Ctrl+Shift+P is already in use, skipping Plain Axis Pivot shortcut.")
+
 
 def _unregister_collider_keymaps():
+    global _PLAIN_AXIS_HOTKEY_REGISTERED
     while _ADDON_KEYMAP_ITEMS:
         keymap, kmi = _ADDON_KEYMAP_ITEMS.pop()
         try:
             keymap.keymap_items.remove(kmi)
         except Exception:
             pass
+    _PLAIN_AXIS_HOTKEY_REGISTERED = False
 
 # ------------------------------------------------------------------------
 #  Brace helpers
@@ -758,6 +797,11 @@ class CRAY_PG_SnapSettings(PropertyGroup):
         default=0.03,
         min=0.0,
         max=0.5,
+    )
+    show_auto_edge_fallback: BoolProperty(
+        name="Show Auto Edge Fallback",
+        description="Show fallback settings used only when no 2 vertices are selected in Edit Mode",
+        default=False,
     )
     replace_existing: BoolProperty(name="Replace Existing Named Groups", default=True)
     batch_cleanup_imported: BoolProperty(name="Cleanup Imported Objects", default=True)
@@ -1548,6 +1592,16 @@ def _create_snap_pair_in_memory(context, memory_obj, world_points, snap_group: s
         created_names.append(vg_name)
     return created_names
 
+def _collect_snap_pair_selected_world_points(source_obj):
+    if source_obj is None or source_obj.type != "MESH" or source_obj.mode != "EDIT":
+        return []
+
+    bm = bmesh.from_edit_mesh(source_obj.data)
+    selected = [source_obj.matrix_world @ vert.co for vert in bm.verts if vert.select]
+    if not selected:
+        return []
+    return _dedupe_world_points(selected)
+
 def _axis_index_from_token(token: str) -> int:
     t = (token or "").upper()
     if t == "X":
@@ -1677,7 +1731,11 @@ class CRAY_OT_EnsureMemoryLOD(Operator):
 
 class CRAY_OT_CreateSnapPairFromModelEdge(Operator):
     bl_idname = "cray.create_snap_pair_from_model_edge"
-    bl_label = "Create .sp Pair From Model Edge"
+    bl_label = "Create .sp Pair"
+    bl_description = (
+        "If exactly 2 vertices are selected in Edit Mode, use them directly. "
+        "If no vertices are selected, use the Auto From Edge fallback settings"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -1700,17 +1758,28 @@ class CRAY_OT_CreateSnapPairFromModelEdge(Operator):
             self.report({"ERROR"}, "Model Object must be a mesh")
             return {"CANCELLED"}
 
-        try:
-            world_points = _auto_snap_points_from_model_edge(
-                model_obj=model_obj,
-                edge_axis_token=ss.edge_axis,
-                edge_side_token=ss.edge_side,
-                span_axis_token=ss.edge_span_axis,
-                edge_tolerance=ss.edge_tolerance,
-            )
-        except Exception as e:
-            self.report({"ERROR"}, _fmt_exc(e))
-            return {"CANCELLED"}
+        world_points = _collect_snap_pair_selected_world_points(model_obj)
+        point_source = "selected vertices"
+        if world_points:
+            if len(world_points) != 2:
+                self.report(
+                    {"ERROR"},
+                    "Select exactly 2 vertices for .sp pair creation, or deselect all vertices to use Auto: Model Edge",
+                )
+                return {"CANCELLED"}
+        else:
+            point_source = "model edge"
+            try:
+                world_points = _auto_snap_points_from_model_edge(
+                    model_obj=model_obj,
+                    edge_axis_token=ss.edge_axis,
+                    edge_side_token=ss.edge_side,
+                    span_axis_token=ss.edge_span_axis,
+                    edge_tolerance=ss.edge_tolerance,
+                )
+            except Exception as e:
+                self.report({"ERROR"}, _fmt_exc(e))
+                return {"CANCELLED"}
 
         if context.mode != "OBJECT":
             try:
@@ -1737,7 +1806,7 @@ class CRAY_OT_CreateSnapPairFromModelEdge(Operator):
         self.report(
             {"INFO"},
             (
-                f"Created {len(created_names)} edge points in {memory_obj.name}: "
+                f"Created {len(created_names)} snap points from {point_source} in {memory_obj.name}: "
                 f"{', '.join(created_names)}"
             ),
         )
@@ -3457,6 +3526,34 @@ def _collect_object_bounds_points(source_obj, padding=0.0, min_axis_size=0.0):
         min_axis_size=min_axis_size,
     )
 
+def _collect_single_selected_vertex_world_point(source_obj):
+    if source_obj is None or source_obj.type != "MESH":
+        raise RuntimeError("Source object must be a mesh")
+    if source_obj.mode != "EDIT":
+        raise RuntimeError("Source object must be the active mesh in Edit Mode")
+
+    bm = bmesh.from_edit_mesh(source_obj.data)
+    selected = [vert for vert in bm.verts if vert.select]
+    if len(selected) != 1:
+        raise RuntimeError("Select exactly one vertex on the active mesh")
+    return source_obj.matrix_world @ selected[0].co.copy()
+
+def _try_restore_edit_mode(context, obj):
+    if obj is None or obj.type != "MESH":
+        return
+    if bpy.data.objects.get(obj.name) is None:
+        return
+    try:
+        if context.view_layer.objects.active != obj:
+            context.view_layer.objects.active = obj
+        obj.select_set(True)
+    except Exception:
+        pass
+    try:
+        bpy.ops.object.mode_set(mode="EDIT")
+    except Exception:
+        pass
+
 
 class CRAY_OT_CopySelectedVertsToGeometry(Operator):
     """Copy selected source vertices into the active Geometry LOD as loose points"""
@@ -3826,6 +3923,455 @@ class CRAY_OT_SelectIsolatedVertices(Operator):
         bm.select_flush_mode()
         bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
         self.report({"INFO"}, f"Selected {len(isolated_verts)} isolated vertex/vertices")
+        return {"FINISHED"}
+
+
+def _iter_split_planar_candidate_faces(bm):
+    visible_faces = [face for face in bm.faces if face.is_valid and not face.hide]
+    if not visible_faces:
+        return [], "visible"
+
+    selected_faces = [face for face in visible_faces if face.select]
+    if selected_faces:
+        return selected_faces, "selection"
+
+    selected_verts = {vert for vert in bm.verts if vert.is_valid and not vert.hide and vert.select}
+    selected_edges = {edge for edge in bm.edges if edge.is_valid and not edge.hide and edge.select}
+    if not selected_verts and not selected_edges:
+        return visible_faces, "visible"
+
+    scoped_faces = []
+    for face in visible_faces:
+        if any(vert in selected_verts for vert in face.verts):
+            scoped_faces.append(face)
+            continue
+        if any(edge in selected_edges for edge in face.edges):
+            scoped_faces.append(face)
+
+    if scoped_faces:
+        return scoped_faces, "selection"
+    return visible_faces, "visible"
+
+
+def _split_planar_face_matches_seed_plane(face, plane_point, plane_normal, cos_limit, plane_tolerance):
+    if face is None or not face.is_valid or face.hide:
+        return False
+    if plane_normal.length_squared <= 1e-12:
+        return False
+    if face.normal.length_squared <= 1e-12:
+        return False
+
+    face_normal = face.normal.copy()
+    try:
+        face_normal.normalize()
+    except Exception:
+        return False
+
+    if abs(face_normal.dot(plane_normal)) < cos_limit:
+        return False
+
+    for vert in face.verts:
+        if abs(plane_normal.dot(vert.co - plane_point)) > plane_tolerance:
+            return False
+    return True
+
+
+def _collect_split_planar_region(seed_face, allowed_faces, cos_limit, plane_tolerance):
+    plane_normal = seed_face.normal.copy()
+    if plane_normal.length_squared <= 1e-12 or len(seed_face.verts) < 3:
+        return []
+    plane_normal.normalize()
+    plane_point = seed_face.verts[0].co.copy()
+
+    region_faces = []
+    region_set = {seed_face}
+    stack = [seed_face]
+
+    while stack:
+        face = stack.pop()
+        region_faces.append(face)
+        for edge in face.edges:
+            for neighbor in edge.link_faces:
+                if neighbor == face or neighbor not in allowed_faces or neighbor in region_set:
+                    continue
+                if _split_planar_face_matches_seed_plane(
+                    neighbor,
+                    plane_point,
+                    plane_normal,
+                    cos_limit,
+                    plane_tolerance,
+                ):
+                    region_set.add(neighbor)
+                    stack.append(neighbor)
+
+    return region_faces
+
+
+def _collect_connected_face_island(seed_face, allowed_faces):
+    if seed_face is None or not seed_face.is_valid or seed_face.hide:
+        return []
+
+    island_faces = []
+    island_set = {seed_face}
+    stack = [seed_face]
+
+    while stack:
+        face = stack.pop()
+        island_faces.append(face)
+        for edge in face.edges:
+            for neighbor in edge.link_faces:
+                if neighbor == face or neighbor not in allowed_faces or neighbor in island_set:
+                    continue
+                if neighbor is None or not neighbor.is_valid or neighbor.hide:
+                    continue
+                island_set.add(neighbor)
+                stack.append(neighbor)
+
+    return island_faces
+
+
+def _connected_face_island_counts(island_faces):
+    face_set = {face for face in island_faces if face is not None and face.is_valid}
+    vert_set = {vert for face in face_set for vert in face.verts if vert is not None and vert.is_valid}
+    edge_set = {edge for face in face_set for edge in face.edges if edge is not None and edge.is_valid}
+    return len(vert_set), len(face_set), len(edge_set)
+
+
+def _connected_face_island_is_coplanar(island_faces, cos_limit, plane_tolerance):
+    face_set = [face for face in island_faces if face is not None and face.is_valid and not face.hide]
+    if not face_set:
+        return False
+
+    seed_face = face_set[0]
+    if seed_face.normal.length_squared <= 1e-12 or len(seed_face.verts) < 3:
+        return False
+
+    plane_normal = seed_face.normal.copy()
+    try:
+        plane_normal.normalize()
+    except Exception:
+        return False
+    plane_point = seed_face.verts[0].co.copy()
+
+    for face in face_set:
+        if not _split_planar_face_matches_seed_plane(
+            face,
+            plane_point,
+            plane_normal,
+            cos_limit,
+            plane_tolerance,
+        ):
+            return False
+    return True
+
+
+def _split_planar_region_is_thin(region_faces, plane_point, plane_normal, cos_limit, plane_tolerance):
+    region_set = {face for face in region_faces if face is not None and face.is_valid}
+    if not region_set or plane_normal.length_squared <= 1e-12:
+        return False
+
+    region_verts = {vert for face in region_set for vert in face.verts if vert is not None and vert.is_valid}
+    for vert in region_verts:
+        for linked_face in vert.link_faces:
+            if linked_face in region_set:
+                continue
+            if linked_face is None or not linked_face.is_valid or linked_face.hide:
+                continue
+            if not _split_planar_face_matches_seed_plane(
+                linked_face,
+                plane_point,
+                plane_normal,
+                cos_limit,
+                plane_tolerance,
+            ):
+                return False
+    return True
+
+
+def _add_split_region_match(matches_by_signature, region_faces, boundary_edges, boundary_verts, match_kind):
+    face_set = {face for face in region_faces if face is not None and face.is_valid}
+    if not face_set:
+        return False
+
+    signature = frozenset(face_set)
+    existing = matches_by_signature.get(signature)
+    if existing is None:
+        matches_by_signature[signature] = {
+            "faces": list(face_set),
+            "boundary_edges": [edge for edge in boundary_edges if edge is not None and edge.is_valid],
+            "boundary_verts": [vert for vert in boundary_verts if vert is not None and vert.is_valid],
+            "kind": match_kind,
+        }
+        return True
+
+    if existing.get("kind") != "tiny" and match_kind == "tiny":
+        existing["kind"] = "tiny"
+    elif existing.get("kind") not in {"tiny", "coplanar"} and match_kind == "coplanar":
+        existing["kind"] = "coplanar"
+    return False
+
+
+def _classify_split_planar_region_edges(region_faces):
+    region_set = set(region_faces)
+    boundary_edges = []
+    seen_edges = set()
+    non_manifold = False
+
+    for face in region_faces:
+        for edge in face.edges:
+            if edge in seen_edges:
+                continue
+            seen_edges.add(edge)
+            inside_count = sum(1 for link_face in edge.link_faces if link_face in region_set)
+            if inside_count == 1:
+                boundary_edges.append(edge)
+            elif inside_count > 2:
+                non_manifold = True
+
+    boundary_verts = {vert for edge in boundary_edges for vert in edge.verts}
+    return boundary_edges, boundary_verts, non_manifold
+
+
+def _split_planar_boundary_is_single_loop(boundary_edges, boundary_verts):
+    if not boundary_edges or not boundary_verts:
+        return False
+
+    vert_edges = {vert: [] for vert in boundary_verts}
+    for edge in boundary_edges:
+        if edge is None or not edge.is_valid:
+            return False
+        for vert in edge.verts:
+            if vert not in vert_edges:
+                return False
+            vert_edges[vert].append(edge)
+
+    if any(len(edges) != 2 for edges in vert_edges.values()):
+        return False
+
+    start_vert = next(iter(boundary_verts))
+    seen_verts = set()
+    stack = [start_vert]
+    while stack:
+        vert = stack.pop()
+        if vert in seen_verts:
+            continue
+        seen_verts.add(vert)
+        for edge in vert_edges[vert]:
+            other_vert = edge.other_vert(vert)
+            if other_vert not in seen_verts:
+                stack.append(other_vert)
+
+    return len(seen_verts) == len(boundary_verts)
+
+
+def _find_split_planar_ngon_regions(bm, min_vertex_count, angle_tolerance_deg=0.1, plane_tolerance=0.0001):
+    candidate_faces, scope_label = _iter_split_planar_candidate_faces(bm)
+    if not candidate_faces:
+        return [], scope_label
+
+    allowed_faces = set(candidate_faces)
+    matches_by_signature = {}
+    cos_limit = math.cos(math.radians(max(0.0, min(180.0, float(angle_tolerance_deg)))))
+
+    processed_islands = set()
+    for seed_face in candidate_faces:
+        if seed_face in processed_islands or not seed_face.is_valid:
+            continue
+
+        island_faces = _collect_connected_face_island(seed_face, allowed_faces)
+        if not island_faces:
+            processed_islands.add(seed_face)
+            continue
+
+        island_set = set(island_faces)
+        processed_islands.update(island_set)
+
+        island_vert_count, island_face_count, island_edge_count = _connected_face_island_counts(island_faces)
+        boundary_edges, boundary_verts, non_manifold = _classify_split_planar_region_edges(island_faces)
+        if (
+            island_vert_count <= _TRASH_TINY_ISLAND_MAX_VERTS
+            or island_face_count <= _TRASH_TINY_ISLAND_MAX_FACES
+            or island_edge_count <= _TRASH_TINY_ISLAND_MAX_EDGES
+        ):
+            if not non_manifold:
+                _add_split_region_match(
+                    matches_by_signature,
+                    island_faces,
+                    boundary_edges,
+                    boundary_verts,
+                    "tiny",
+                )
+
+        if _connected_face_island_is_coplanar(
+            island_faces,
+            cos_limit,
+            max(0.0, float(plane_tolerance)),
+        ):
+            _add_split_region_match(
+                matches_by_signature,
+                island_faces,
+                boundary_edges,
+                boundary_verts,
+                "coplanar",
+            )
+
+    processed_faces = set()
+
+    for seed_face in candidate_faces:
+        if seed_face in processed_faces or not seed_face.is_valid:
+            continue
+        if seed_face.normal.length_squared <= 1e-12:
+            processed_faces.add(seed_face)
+            continue
+
+        plane_normal = seed_face.normal.copy()
+        plane_normal.normalize()
+        plane_point = seed_face.verts[0].co.copy()
+
+        region_faces = _collect_split_planar_region(
+            seed_face,
+            allowed_faces,
+            cos_limit,
+            max(0.0, float(plane_tolerance)),
+        )
+        if not region_faces:
+            processed_faces.add(seed_face)
+            continue
+
+        region_set = set(region_faces)
+        processed_faces.update(region_set)
+
+        boundary_edges, boundary_verts, non_manifold = _classify_split_planar_region_edges(region_faces)
+        if non_manifold:
+            continue
+        if len(boundary_verts) < int(min_vertex_count):
+            continue
+        if not _split_planar_boundary_is_single_loop(boundary_edges, boundary_verts):
+            continue
+        if not _split_planar_region_is_thin(
+            region_faces,
+            plane_point,
+            plane_normal,
+            cos_limit,
+            max(0.0, float(plane_tolerance)),
+        ):
+            continue
+
+        _add_split_region_match(
+            matches_by_signature,
+            region_faces,
+            boundary_edges,
+            boundary_verts,
+            "flat",
+        )
+
+    return list(matches_by_signature.values()), scope_label
+
+
+def _select_split_planar_ngon_regions(bm, matches):
+    selected_faces = set()
+    selected_edges = set()
+    selected_verts = set()
+
+    for item in matches:
+        selected_faces.update(face for face in item.get("faces", []) if face is not None and face.is_valid)
+        selected_edges.update(edge for edge in item.get("boundary_edges", []) if edge is not None and edge.is_valid)
+        selected_verts.update(vert for vert in item.get("boundary_verts", []) if vert is not None and vert.is_valid)
+
+    for face in bm.faces:
+        face.select = False
+    for edge in bm.edges:
+        edge.select = False
+    for vert in bm.verts:
+        vert.select = False
+
+    for face in selected_faces:
+        face.select = True
+    for edge in selected_edges:
+        edge.select = True
+    for vert in selected_verts:
+        vert.select = True
+
+
+class CRAY_OT_SelectSplitPlanarNgons(Operator):
+    """Select flat thin face islands whose outer boundary has at least N vertices"""
+
+    bl_idname = "cray.select_split_planar_ngons"
+    bl_label = "Select Flat Thin N-gons"
+    bl_description = (
+        "In Edit Mode, find either flat thin face islands whose outer boundary has at least N vertices, "
+        "or tiny connected face islands where verts <= 5, or faces <= 6, or edges <= 9, "
+        "or any connected face island that lies in one plane. "
+        "If faces, edges, or verts are already selected, "
+        "only that local area is searched"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            context.mode == "EDIT_MESH"
+            and obj is not None
+            and obj.type == "MESH"
+            and obj.mode == "EDIT"
+        )
+
+    def execute(self, context):
+        obj = context.active_object
+        if obj is None or obj.type != "MESH" or context.mode != "EDIT_MESH" or obj.mode != "EDIT":
+            self.report({"ERROR"}, "Active object must be a mesh in Edit Mode")
+            return {"CANCELLED"}
+
+        ts = context.scene.cray_texreplace_settings
+        mesh = obj.data
+        bm = bmesh.from_edit_mesh(mesh)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+
+        try:
+            matches, scope_label = _find_split_planar_ngon_regions(
+                bm,
+                min_vertex_count=max(3, int(ts.split_planar_ngon_vertex_count)),
+                angle_tolerance_deg=float(ts.split_planar_ngon_angle_tolerance),
+                plane_tolerance=float(ts.split_planar_ngon_plane_tolerance),
+            )
+        except Exception as e:
+            self.report({"ERROR"}, f"Failed to analyze split planar regions: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+
+        if not matches:
+            self.report(
+                {"WARNING"},
+                (
+                    f"No flat thin N+ islands or tiny trash islands "
+                    f"(verts <= 5 or faces <= 6 or edges <= 9) "
+                    f"or fully coplanar islands found "
+                    f"in {scope_label} scope"
+                ),
+            )
+            return {"CANCELLED"}
+
+        _select_split_planar_ngon_regions(bm, matches)
+        bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+
+        face_total = sum(len(item["faces"]) for item in matches)
+        edge_total = sum(len(item["boundary_edges"]) for item in matches)
+        vert_total = sum(len(item["boundary_verts"]) for item in matches)
+        tiny_total = sum(1 for item in matches if item.get("kind") == "tiny")
+        coplanar_total = sum(1 for item in matches if item.get("kind") == "coplanar")
+        flat_total = sum(1 for item in matches if item.get("kind") == "flat")
+        self.report(
+            {"INFO"},
+            (
+                f"Selected {len(matches)} island(s): flat N+ {flat_total}, "
+                f"tiny by verts<=5/faces<=6/edges<=9 {tiny_total}, "
+                f"fully coplanar {coplanar_total}; "
+                f"{face_total} faces, {edge_total} boundary edges, {vert_total} boundary verts "
+                f"in {scope_label} scope"
+            ),
+        )
         return {"FINISHED"}
 
 
@@ -4556,7 +5102,7 @@ def _cleanup_target_collection_keep_mesh(target_collection, keep_obj):
 def _unlink_collection_from_all_parents(col):
     if col is None:
         return
-    for scene in list(bpy.data.scenes):
+    for scene in _iter_safe_scenes():
         try:
             if scene.collection.children.get(col.name) is not None:
                 scene.collection.children.unlink(col)
@@ -5576,6 +6122,29 @@ class CRAY_PG_TexReplaceSettings(PropertyGroup):
         description="After Fix Mesh, move merged object's bounds center to world origin",
         default=True,
     )
+    split_planar_ngon_vertex_count: IntProperty(
+        name="Flat Min N",
+        description="Find flat thin face islands whose outer boundary has at least this many vertices",
+        default=4,
+        min=3,
+        max=128,
+    )
+    split_planar_ngon_angle_tolerance: FloatProperty(
+        name="Angle Tol",
+        description="Maximum normal deviation in degrees when grouping faces into one planar island",
+        default=0.1,
+        min=0.0,
+        soft_max=5.0,
+        precision=4,
+    )
+    split_planar_ngon_plane_tolerance: FloatProperty(
+        name="Plane Tol",
+        description="Maximum signed distance from the seed plane for faces in the same planar island",
+        default=0.0001,
+        min=0.0,
+        soft_max=0.01,
+        precision=6,
+    )
     obj_preview_items: bpy.props.CollectionProperty(type=CRAY_PG_ObjMatImagesItem)
     obj_preview_active_index: IntProperty(default=0)
     db_items: bpy.props.CollectionProperty(type=CRAY_PG_TexDBItem)
@@ -5664,6 +6233,10 @@ class CRAY_OT_UpdateObjectPreview(Operator):
 class CRAY_OT_FixMeshHierarchy(Operator):
     bl_idname = "cray.fix_mesh_hierarchy"
     bl_label = "Fix Mesh/Hierarchy"
+    bl_description = (
+        "Use the picked/selected/active mesh as the main target, join meshes in scope, clean helper leftovers, "
+        "and move the result into the fix collection"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -6152,6 +6725,154 @@ def _find_p3d_root_collection_for_object(context, obj):
                 best_depth = depth
 
     return best
+
+def _plain_axis_helper_name(root_collection) -> str:
+    root_name = _strip_blender_numeric_suffix((getattr(root_collection, "name", "") or "").strip())
+    if not root_name:
+        root_name = "Model"
+    root_name = re.sub(r"\s+", " ", root_name).strip()
+    return f"Plain Axis {root_name}"
+
+def _is_plain_axis_helper(obj) -> bool:
+    if obj is None or obj.type != "EMPTY":
+        return False
+    try:
+        if bool(obj.get(_PLAIN_AXIS_HELPER_PROP, False)):
+            return True
+    except Exception:
+        pass
+    return False
+
+def _pick_plain_axis_root_collection(context, source_obj):
+    root = _find_p3d_root_collection_for_object(context, source_obj)
+    if root is not None:
+        return root, True
+    if source_obj is not None and source_obj.users_collection:
+        return source_obj.users_collection[0], False
+    return getattr(getattr(context, "scene", None), "collection", None), False
+
+def _collect_plain_axis_target_objects(root_collection, helper_obj=None):
+    objects = _collect_collection_objects_recursive(root_collection) if root_collection is not None else []
+    if not objects:
+        return []
+
+    object_ptrs = {obj.as_pointer() for obj in objects}
+    targets = []
+    for obj in objects:
+        if helper_obj is not None and obj == helper_obj:
+            continue
+        if _is_plain_axis_helper(obj):
+            continue
+        if obj.parent is not None and obj.parent.as_pointer() in object_ptrs:
+            continue
+        targets.append(obj)
+    return targets
+
+def _iter_plain_axis_constraints(obj, helper_ptrs=None):
+    if obj is None:
+        return
+    for con in getattr(obj, "constraints", []):
+        if getattr(con, "type", "") != "CHILD_OF":
+            continue
+        target = getattr(con, "target", None)
+        target_ptr = target.as_pointer() if target is not None else None
+        if helper_ptrs and target_ptr in helper_ptrs:
+            yield con
+            continue
+        if getattr(con, "name", "") == _PLAIN_AXIS_CONSTRAINT_NAME and target is not None and _is_plain_axis_helper(target):
+            yield con
+
+def _remove_plain_axis_constraints_from_objects(objects, helper_ptrs=None):
+    removed = 0
+    for obj in objects:
+        constraints = list(_iter_plain_axis_constraints(obj, helper_ptrs=helper_ptrs))
+        for con in constraints:
+            try:
+                obj.constraints.remove(con)
+                removed += 1
+            except Exception:
+                pass
+    return removed
+
+def _apply_child_of_inverse_with_fallback(context, obj, constraint):
+    if obj is None or constraint is None:
+        return
+
+    try:
+        with context.temp_override(
+            object=obj,
+            active_object=obj,
+            selected_objects=[obj],
+            selected_editable_objects=[obj],
+        ):
+            bpy.ops.constraint.childof_set_inverse(constraint=constraint.name, owner="OBJECT")
+        return
+    except Exception:
+        pass
+
+    target = getattr(constraint, "target", None)
+    if target is None:
+        return
+    try:
+        constraint.inverse_matrix = target.matrix_world.inverted_safe()
+    except Exception:
+        pass
+
+def _create_plain_axis_helper(context, root_collection, source_obj, world_location):
+    helper_name = _plain_axis_helper_name(root_collection)
+    helper_obj = bpy.data.objects.new(helper_name, None)
+    helper_obj.empty_display_type = "PLAIN_AXES"
+    try:
+        max_dim = max(abs(float(v)) for v in getattr(source_obj, "dimensions", (0.0, 0.0, 0.0)))
+    except Exception:
+        max_dim = 0.0
+    helper_obj.empty_display_size = max(0.05, max_dim * 0.08)
+    helper_obj.matrix_world = Matrix.Translation(world_location)
+    helper_obj[_PLAIN_AXIS_HELPER_PROP] = True
+    helper_obj[_PLAIN_AXIS_ROOT_PROP] = getattr(root_collection, "name", "")
+    helper_obj[_PLAIN_AXIS_SOURCE_OBJECT_PROP] = getattr(source_obj, "name", "")
+    _link_object_to_collection(helper_obj, root_collection)
+    _ensure_collection_visible_in_view_layer(context, root_collection)
+    return helper_obj
+
+def _clear_plain_axis_helpers(context, helper_objects):
+    live_helpers = []
+    seen = set()
+    for obj in helper_objects:
+        if obj is None:
+            continue
+        try:
+            ptr = obj.as_pointer()
+        except Exception:
+            continue
+        if ptr in seen:
+            continue
+        seen.add(ptr)
+        if bpy.data.objects.get(obj.name) is None:
+            continue
+        live_helpers.append(obj)
+
+    if not live_helpers:
+        return 0, 0
+
+    helper_ptrs = {obj.as_pointer() for obj in live_helpers}
+    removed_constraints = _remove_plain_axis_constraints_from_objects(bpy.data.objects, helper_ptrs=helper_ptrs)
+
+    removed_helpers = 0
+    for obj in live_helpers:
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+            removed_helpers += 1
+        except Exception:
+            pass
+
+    return removed_helpers, removed_constraints
+
+def _clear_plain_axis_helpers_in_collection(context, root_collection):
+    if root_collection is None:
+        return 0, 0
+    helpers = [obj for obj in _collect_collection_objects_recursive(root_collection) if _is_plain_axis_helper(obj)]
+    return _clear_plain_axis_helpers(context, helpers)
 
 def _best_object_collection_path_under_root(root_collection, obj):
     if root_collection is None or obj is None:
@@ -6878,9 +7599,12 @@ def _iter_p3d_files_in_folder(folder_abs: str):
     return out
 
 def _ensure_temp_asset_scene():
-    scene = bpy.data.scenes.get(_NH_TEMP_ASSET_SCENE_NAME)
+    scenes = getattr(bpy.data, "scenes", None)
+    if scenes is None:
+        raise RuntimeError("Blender scenes are not available right now")
+    scene = scenes.get(_NH_TEMP_ASSET_SCENE_NAME)
     if scene is None:
-        scene = bpy.data.scenes.new(_NH_TEMP_ASSET_SCENE_NAME)
+        scene = scenes.new(_NH_TEMP_ASSET_SCENE_NAME)
     return scene
 
 
@@ -6891,7 +7615,7 @@ def _ensure_temp_asset_library_root(context):
 
     asset_scene = _ensure_temp_asset_scene()
 
-    for scene in bpy.data.scenes:
+    for scene in _iter_safe_scenes():
         try:
             if scene != asset_scene and any(ch == col for ch in scene.collection.children):
                 scene.collection.children.unlink(col)
@@ -6947,11 +7671,12 @@ def _clear_temp_asset_library(context):
         return 0
     child_count = len(list(_iter_collection_tree(col)))
     _remove_collection_tree(col)
-    asset_scene = bpy.data.scenes.get(_NH_TEMP_ASSET_SCENE_NAME)
+    scenes = getattr(bpy.data, "scenes", None)
+    asset_scene = scenes.get(_NH_TEMP_ASSET_SCENE_NAME) if scenes is not None else None
     if asset_scene is not None:
         try:
             if len(asset_scene.collection.children) == 0:
-                bpy.data.scenes.remove(asset_scene)
+                scenes.remove(asset_scene)
         except Exception:
             pass
     return child_count
@@ -7501,6 +8226,10 @@ class CRAY_OT_ConvertSelectedToProxies(Operator):
 class CRAY_OT_FixShadingByPipeline(Operator):
     bl_idname = "cray.fix_shading_by_pipeline"
     bl_label = "Fix Shading (Merge + Smooth)"
+    bl_description = (
+        "Merge the selected mesh objects if needed, clear split normals, recalculate normals, "
+        "and apply Shade Smooth"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -7678,6 +8407,9 @@ def _repair_invalid_a3ob_selection_links(obj):
 class CRAY_OT_RepairA3OBSelections(Operator):
     bl_idname = "cray.repair_a3ob_selections"
     bl_label = "Repair Invalid A3OB Selections"
+    bl_description = (
+        "Scan selected mesh objects and rebuild broken A3OB vertex-group links, removing invalid or zero-weight references"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -7748,6 +8480,156 @@ class CRAY_OT_RepairA3OBSelections(Operator):
             self.report({"WARNING"}, msg + f", failed: {len(failed)} (see System Console)")
         else:
             self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
+class CRAY_OT_CreatePlainAxisPivot(Operator):
+    bl_idname = "cray.create_plain_axis_pivot"
+    bl_label = "Create Plain Axis Pivot"
+    bl_description = (
+        "In Edit Mode, use the selected vertex as a pivot, create a Plain Axes helper, "
+        "and add Child Of constraints so moving the helper moves the whole imported model"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        source_obj = context.view_layer.objects.active
+        if source_obj is None or source_obj.type != "MESH" or context.mode != "EDIT_MESH" or source_obj.mode != "EDIT":
+            self.report({"ERROR"}, "Active object must be a mesh in Edit Mode")
+            return {"CANCELLED"}
+
+        try:
+            world_location = _collect_single_selected_vertex_world_point(source_obj)
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        root_collection, used_p3d_root = _pick_plain_axis_root_collection(context, source_obj)
+        if root_collection is None:
+            self.report({"ERROR"}, "Could not determine a target collection for Plain Axis")
+            return {"CANCELLED"}
+
+        helper_obj = None
+        constrained = 0
+        failed = []
+        replaced_helpers = 0
+        restored_edit_mode = False
+
+        try:
+            bpy.ops.object.mode_set(mode="OBJECT")
+        except Exception as e:
+            self.report({"ERROR"}, f"Failed to switch to Object Mode: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+
+        try:
+            replaced_helpers, _removed_constraints = _clear_plain_axis_helpers_in_collection(context, root_collection)
+            helper_obj = _create_plain_axis_helper(context, root_collection, source_obj, world_location)
+            target_objects = _collect_plain_axis_target_objects(root_collection, helper_obj=helper_obj)
+            if not target_objects:
+                raise RuntimeError(f"No movable root objects found in collection {root_collection.name}")
+
+            context.view_layer.update()
+
+            enabled_axes = (
+                "use_location_x",
+                "use_location_y",
+                "use_location_z",
+                "use_rotation_x",
+                "use_rotation_y",
+                "use_rotation_z",
+                "use_scale_x",
+                "use_scale_y",
+                "use_scale_z",
+            )
+
+            for obj in target_objects:
+                try:
+                    con = obj.constraints.new(type="CHILD_OF")
+                    con.name = _PLAIN_AXIS_CONSTRAINT_NAME
+                    con.target = helper_obj
+                    for attr in enabled_axes:
+                        try:
+                            setattr(con, attr, True)
+                        except Exception:
+                            pass
+                    context.view_layer.update()
+                    _apply_child_of_inverse_with_fallback(context, obj, con)
+                    constrained += 1
+                except Exception as e:
+                    failed.append(f"{obj.name}: {_fmt_exc(e)}")
+
+            if constrained == 0:
+                raise RuntimeError("Failed to add Child Of constraints to target objects")
+        except Exception as e:
+            if helper_obj is not None:
+                _clear_plain_axis_helpers(context, [helper_obj])
+            try:
+                _try_restore_edit_mode(context, source_obj)
+                restored_edit_mode = True
+            except Exception:
+                pass
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        if not restored_edit_mode:
+            _try_restore_edit_mode(context, source_obj)
+
+        if failed:
+            print("=== Plain Axis Pivot: Failed Objects ===")
+            for item in failed:
+                print(item)
+
+        scope_label = ".p3d root collection" if used_p3d_root else "active object collection"
+        msg = (
+            f"Created Plain Axis in {root_collection.name}: constrained {constrained} root object(s) "
+            f"using {scope_label}"
+        )
+        if replaced_helpers > 0:
+            msg += f", replaced {replaced_helpers} existing helper(s)"
+        if failed:
+            self.report({"WARNING"}, msg + f", failed {len(failed)} object(s) (see System Console)")
+        else:
+            self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
+class CRAY_OT_ClearPlainAxisPivots(Operator):
+    bl_idname = "cray.clear_plain_axis_pivots"
+    bl_label = "Delete All Plain Axes"
+    bl_description = "Delete all Plain Axes helpers created by this tool and remove their Child Of constraints"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        active_before = context.view_layer.objects.active
+        restore_edit_mode = (
+            context.mode == "EDIT_MESH"
+            and active_before is not None
+            and active_before.type == "MESH"
+        )
+
+        if context.mode != "OBJECT":
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception as e:
+                self.report({"ERROR"}, f"Failed to switch to Object Mode: {_fmt_exc(e)}")
+                return {"CANCELLED"}
+
+        helpers = [obj for obj in bpy.data.objects if _is_plain_axis_helper(obj)]
+        if not helpers:
+            if restore_edit_mode:
+                _try_restore_edit_mode(context, active_before)
+            self.report({"INFO"}, "No Plain Axis helpers found in the scene")
+            return {"FINISHED"}
+
+        removed_helpers, removed_constraints = _clear_plain_axis_helpers(context, helpers)
+
+        if restore_edit_mode:
+            _try_restore_edit_mode(context, active_before)
+
+        self.report(
+            {"INFO"},
+            f"Deleted {removed_helpers} Plain Axis helper(s) and removed {removed_constraints} Child Of constraint(s)",
+        )
         return {"FINISHED"}
 
 
@@ -8058,12 +8940,29 @@ class CRAY_PT_SnapPointsPanel(Panel):
 
         layout.separator()
         box = layout.box()
-        box.label(text="Auto: Model Edge", icon="MOD_EDGESPLIT")
-        box.prop(ss, "edge_axis")
-        box.prop(ss, "edge_side", expand=True)
-        box.prop(ss, "edge_span_axis")
-        box.prop(ss, "edge_tolerance")
-        box.operator("cray.create_snap_pair_from_model_edge", icon="MESH_DATA")
+        box.label(text="Create Pair", icon="MESH_DATA")
+        box.operator("cray.create_snap_pair_from_model_edge", text="Create .sp Pair", icon="MESH_DATA")
+        row = box.row(align=True)
+        row.prop(
+            ss,
+            "show_auto_edge_fallback",
+            text="Auto From Edge",
+            emboss=False,
+            icon="TRIA_DOWN" if ss.show_auto_edge_fallback else "TRIA_RIGHT",
+        )
+        if ss.show_auto_edge_fallback:
+            fallback = box.box()
+            fallback.prop(ss, "edge_axis")
+            fallback.prop(ss, "edge_side", expand=True)
+            fallback.prop(ss, "edge_span_axis")
+            fallback.prop(ss, "edge_tolerance")
+
+        layout.separator()
+        pbox = layout.box()
+        pbox.label(text="Plain Axes pivot", icon="EMPTY_AXIS")
+        create_label = "Create Plain Axis Pivot  [Ctrl+Shift+P]" if _PLAIN_AXIS_HOTKEY_REGISTERED else "Create Plain Axis Pivot"
+        pbox.operator("cray.create_plain_axis_pivot", text=create_label, icon="EMPTY_AXIS")
+        pbox.operator("cray.clear_plain_axis_pivots", text="Delete All Plain Axes", icon="TRASH")
 
 class CRAY_PT_ColliderPanel(Panel):
     bl_idname = "VIEW3D_PT_cray_collider"
@@ -8208,18 +9107,30 @@ class CRAY_PT_FixesPanel(Panel):
     def draw(self, context):
         layout = self.layout
         ts = context.scene.cray_texreplace_settings
+
         box = layout.box()
         box.label(text="Shading/Geometry fixes", icon="MOD_SMOOTH")
-        box.label(text="Select mesh object(s)", icon="INFO")
-        box.label(text="If >1 selected: auto-join")
         box.operator("cray.fix_shading_by_pipeline", text="Fix Shading", icon="SHADING_RENDERED")
         box.operator("cray.repair_a3ob_selections", text="Repair Invalid A3OB Selections", icon="GROUP_VERTEX")
         box.separator()
         box.label(text="Hierarchy fix", icon="MOD_REMESH")
         box.prop(ts, "fix_mesh_join_batch")
         box.prop(ts, "fix_mesh_center_to_origin")
-        box.label(text="Fix Mesh uses selected/active object first", icon="INFO")
         box.operator("cray.fix_mesh_hierarchy", text="Fix Mesh/Hierarchy", icon="MOD_REMESH")
+        box.separator()
+        box.label(text="Edit Mode planar search", icon="FACESEL")
+        edit_col = box.column(align=True)
+        edit_col.enabled = (
+            context.mode == "EDIT_MESH"
+            and context.active_object is not None
+            and context.active_object.type == "MESH"
+        )
+        row = edit_col.row(align=True)
+        row.prop(ts, "split_planar_ngon_vertex_count", text="N")
+        row.operator("cray.select_split_planar_ngons", text="Find Flat N+", icon="VIEWZOOM")
+        tol_row = edit_col.row(align=True)
+        tol_row.prop(ts, "split_planar_ngon_angle_tolerance", text="Angle")
+        tol_row.prop(ts, "split_planar_ngon_plane_tolerance", text="Plane")
 
 class CRAY_PT_ImportExportPlannerPanel(Panel):
     bl_idname = "VIEW3D_PT_cray_ie_planner"
@@ -8344,6 +9255,7 @@ classes = (
     CRAY_OT_WeldRoadwayVertices,
     CRAY_OT_OpenRoadwayMaterialFolder,
     CRAY_OT_SelectIsolatedVertices,
+    CRAY_OT_SelectSplitPlanarNgons,
     CRAY_OT_EnsureColliderLOD,
     CRAY_OT_BuildCollider,
 
@@ -8374,6 +9286,8 @@ classes = (
     CRAY_OT_ConvertSelectedToProxies,
     CRAY_OT_FixShadingByPipeline,
     CRAY_OT_RepairA3OBSelections,
+    CRAY_OT_CreatePlainAxisPivot,
+    CRAY_OT_ClearPlainAxisPivots,
     CRAY_OT_IE_ExportCollectionsBatch,
 
     CRAY_PT_ColliderPanel,
