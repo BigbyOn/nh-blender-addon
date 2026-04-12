@@ -1,7 +1,7 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Daryl and Enisam",
-    "version": (0, 3, 1),
+    "version": (0, 4, 0),
     "blender": (5, 1, 0),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "Scatter Arma3 Proxy objects using DayZ clutter config + Texture Replace (.paa/.rvmat) + Replace from DB via A3OB",
@@ -35,6 +35,7 @@ CONFIG_PATH = ""
 CONFIG_SURFACES = {}
 CONFIG_CLUTTER = {}
 _PROXY_MESH_NAME = "DayZ_ClutterProxyMesh"
+_SCATTER_PROXY_TAG_PROP = "cray_scatter_proxy"
 _ASSET_CATALOG_NAME = "Asset"
 _ASSET_CATALOG_FALLBACK_ID = "7d6f3b1d-4d5f-4b1e-9f77-5d1e8dd5c001"
 _ADDON_KEYMAP_ITEMS = []
@@ -62,6 +63,7 @@ _PERSISTED_UI_SETTINGS = {
         "selected_surface",
         "grid_size",
         "density_scale",
+        "slope_falloff",
         "max_height_offset",
         "max_distance",
         "random_jitter",
@@ -72,6 +74,8 @@ _PERSISTED_UI_SETTINGS = {
     ),
     "cray_snap_settings": (
         "snap_group",
+        "snap_p3d_name",
+        "snap_pair_code",
         "snap_side",
         "show_auto_edge_fallback",
         "edge_axis",
@@ -629,6 +633,74 @@ def pick_weighted_random(names, probs, rng=None):
             return n
     return names[-1]
 
+def _resolve_scatter_edit_mesh_object(context):
+    obj = getattr(context, "edit_object", None)
+    if obj is None:
+        obj = context.view_layer.objects.active
+    if obj is None or obj.type != "MESH":
+        raise RuntimeError("Active object must be a mesh")
+    if obj.mode != "EDIT":
+        raise RuntimeError("Enter Edit Mode and select polygons on the mesh")
+    return obj
+
+def _collect_selected_face_triangles_world(obj):
+    if obj is None or obj.type != "MESH" or obj.mode != "EDIT":
+        return []
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    world = obj.matrix_world
+    normal_matrix = world.to_3x3().inverted().transposed()
+    triangles = []
+
+    for face in bm.faces:
+        if not face.select or len(face.verts) < 3:
+            continue
+
+        verts_world = [world @ vert.co for vert in face.verts]
+        try:
+            face_normal = (normal_matrix @ face.normal).normalized()
+        except Exception:
+            face_normal = Vector((0.0, 0.0, 1.0))
+
+        v0 = verts_world[0]
+        for idx in range(1, len(verts_world) - 1):
+            v1 = verts_world[idx]
+            v2 = verts_world[idx + 1]
+            area = ((v1 - v0).cross(v2 - v0)).length * 0.5
+            if area <= 1e-10:
+                continue
+            triangles.append((v0.copy(), v1.copy(), v2.copy(), face_normal.copy(), area))
+
+    return triangles
+
+def _sample_point_on_triangle(v0: Vector, v1: Vector, v2: Vector, rng) -> Vector:
+    r1 = math.sqrt(rng.random())
+    r2 = rng.random()
+    return ((1.0 - r1) * v0) + (r1 * (1.0 - r2) * v1) + (r1 * r2 * v2)
+
+def _scatter_slope_density_factor(normal: Vector, falloff: float) -> float:
+    try:
+        up_factor = max(0.0, min(1.0, normal.normalized().z))
+    except Exception:
+        up_factor = 0.0
+
+    if falloff <= 0.0:
+        return 1.0
+    return up_factor ** float(falloff)
+
+def _sanitize_snap_p3d_name_value(value: str) -> str:
+    name = (value or "").strip()
+    if name.lower().endswith(".p3d"):
+        name = name[:-4]
+    return re.sub(r"[^A-Za-z0-9]+", "", name)
+
+def _on_snap_p3d_name_changed(self, context):
+    del context
+    current = getattr(self, "snap_p3d_name", "")
+    sanitized = _sanitize_snap_p3d_name_value(current)
+    if sanitized != current:
+        self.snap_p3d_name = sanitized
+
 
 # ------------------------------------------------------------------------
 #  Proxy mesh & A3OB properties
@@ -715,8 +787,45 @@ def create_proxy_object(context, collection, parent_obj, location: Vector, norma
 
     collection.objects.link(proxy_obj)
     proxy_obj.parent = parent_obj
+    try:
+        proxy_obj[_SCATTER_PROXY_TAG_PROP] = True
+    except Exception:
+        pass
     set_a3ob_proxy_properties(proxy_obj, model_path, proxy_index)
     return proxy_obj
+
+def _is_generated_scatter_proxy(obj, parent_obj=None) -> bool:
+    if obj is None:
+        return False
+    if parent_obj is not None and obj.parent != parent_obj:
+        return False
+    if obj.get(_SCATTER_PROXY_TAG_PROP, False):
+        return True
+
+    try:
+        proxy_mesh = get_proxy_mesh()
+    except Exception:
+        proxy_mesh = None
+
+    if proxy_mesh is not None and getattr(obj, "data", None) == proxy_mesh:
+        if (obj.name or "").startswith("clutter_proxy_"):
+            return True
+    return False
+
+def _clear_generated_scatter_proxies(parent_obj) -> int:
+    if parent_obj is None:
+        return 0
+
+    to_remove = [obj for obj in bpy.data.objects if _is_generated_scatter_proxy(obj, parent_obj=parent_obj)]
+    to_remove.sort(key=lambda item: _obj_depth(item), reverse=True)
+
+    removed = 0
+    for obj in to_remove:
+        if bpy.data.objects.get(obj.name) is None:
+            continue
+        bpy.data.objects.remove(obj, do_unlink=True)
+        removed += 1
+    return removed
 
 
 # ------------------------------------------------------------------------
@@ -744,6 +853,13 @@ class CRAY_PG_Settings(PropertyGroup):
     selected_surface: EnumProperty(name="Surface", items=get_surface_enum_items)
     grid_size: FloatProperty(name="Grid Size", default=1.0, min=0.01)
     density_scale: FloatProperty(name="Density Scale", default=1.0, min=0.01, soft_max=8.0)
+    slope_falloff: FloatProperty(
+        name="Slope Falloff",
+        description="Reduce clutter density on steeper faces; 0 disables the reduction",
+        default=2.0,
+        min=0.0,
+        soft_max=4.0,
+    )
     max_height_offset: FloatProperty(name="Height Offset", default=2.0, min=0.0)
     max_distance: FloatProperty(name="Max Distance", default=100.0, min=0.1)
     random_jitter: FloatProperty(name="Random Jitter", default=0.5, min=0.0, max=1.0)
@@ -753,9 +869,34 @@ class CRAY_PG_Settings(PropertyGroup):
     only_hit_source: BoolProperty(name="Only Hit Source", default=True)
 
 class CRAY_PG_SnapSettings(PropertyGroup):
-    source_object: PointerProperty(name="Model Object", type=bpy.types.Object)
-    memory_object: PointerProperty(name="Memory LOD Object", type=bpy.types.Object)
+    source_object: PointerProperty(
+        name="Resolution LOD (A)",
+        description="Resolution/source LOD for the first A target",
+        type=bpy.types.Object,
+    )
+    memory_object: PointerProperty(
+        name="Memory LOD (A)",
+        description="Memory LOD object for the first A target",
+        type=bpy.types.Object,
+    )
+    paired_object: PointerProperty(
+        name="Resolution LOD (V)",
+        description="Resolution/source LOD for the second V target",
+        type=bpy.types.Object,
+    )
+    paired_memory_object: PointerProperty(
+        name="Memory LOD (V)",
+        description="Memory LOD object for the second V target",
+        type=bpy.types.Object,
+    )
     snap_group: StringProperty(name="Snap Group", default="SampleName")
+    snap_p3d_name: StringProperty(
+        name="P3D Name",
+        description="Only letters and digits are kept; spaces, underscores, .p3d and other symbols are removed automatically",
+        default="SampleName",
+        update=_on_snap_p3d_name_changed,
+    )
+    snap_pair_code: StringProperty(name="ID", default="01", maxlen=3)
     snap_side: EnumProperty(
         name="Side",
         items=(
@@ -765,11 +906,11 @@ class CRAY_PG_SnapSettings(PropertyGroup):
         default="a",
     )
     edge_axis: EnumProperty(
-        name="Edge Axis",
+        name="Snap Axis",
         items=(
-            ("X", "X", "Use X min/max edge"),
-            ("Y", "Y", "Use Y min/max edge"),
-            ("Z", "Z", "Use Z min/max edge"),
+            ("X", "X", "Use X in the snap point name pattern"),
+            ("Y", "Y", "Use Y in the snap point name pattern"),
+            ("Z", "Z", "Use Z in the snap point name pattern"),
         ),
         default="X",
     )
@@ -838,7 +979,8 @@ _COLLIDER_COLLECTION_NAME = "Geometries"
 _COLLIDER_COLLECTION_ALIASES = ("Geometry",)
 _COLLIDER_COLLECTION_COLOR = "COLOR_03"
 _COLLIDER_OBJECT_COLOR = (1.0, 0.93, 0.55, 1.0)
-_MEMORY_COLLECTION_NAME = "Memory"
+_MEMORY_COLLECTION_NAME = "Point clouds"
+_MEMORY_COLLECTION_ALIASES = ("Memory",)
 _MEMORY_COLLECTION_COLOR = "COLOR_05"
 _MISC_COLLECTION_NAME = "Misc"
 _MISC_COLLECTION_COLOR = "COLOR_04"
@@ -1036,17 +1178,10 @@ class CRAY_OT_ScatterProxies(Operator):
 
     def execute(self, context):
         s = context.scene.cray_settings
-        obj = s.source_object
-
-        if obj is None or obj.type != "MESH":
-            self.report({"ERROR"}, "Source object must be a mesh")
-            return {"CANCELLED"}
-        if not s.vertex_group:
-            self.report({"ERROR"}, "Vertex group is not set")
-            return {"CANCELLED"}
-        vg = obj.vertex_groups.get(s.vertex_group)
-        if vg is None:
-            self.report({"ERROR"}, f"Vertex group '{s.vertex_group}' not found on object")
+        try:
+            obj = _resolve_scatter_edit_mesh_object(context)
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
         if not s.config_path:
             self.report({"ERROR"}, "Config .cpp path is not set")
@@ -1070,28 +1205,11 @@ class CRAY_OT_ScatterProxies(Operator):
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
 
-        mesh = obj.data
-        vg_index = vg.index
-        mw = obj.matrix_world
-
-        group_verts_world = []
-        for v in mesh.vertices:
-            for g in v.groups:
-                if g.group == vg_index and g.weight > 0.0:
-                    group_verts_world.append(mw @ v.co)
-                    break
-
-        if not group_verts_world:
-            self.report({"ERROR"}, "Vertex group is empty or has no weighted vertices")
+        triangles = _collect_selected_face_triangles_world(obj)
+        if not triangles:
+            self.report({"ERROR"}, "Select polygons in Edit Mode first")
             return {"CANCELLED"}
 
-        xs = [v.x for v in group_verts_world]
-        ys = [v.y for v in group_verts_world]
-        zs = [v.z for v in group_verts_world]
-
-        min_x, max_x = min(xs), max(xs)
-        min_y, max_y = min(ys), max(ys)
-        start_z = max(zs) + s.max_height_offset
         if s.density_scale <= 0.0:
             self.report({"ERROR"}, "Density scale must be > 0")
             return {"CANCELLED"}
@@ -1100,95 +1218,97 @@ class CRAY_OT_ScatterProxies(Operator):
             self.report({"ERROR"}, "Grid size must be > 0")
             return {"CANCELLED"}
 
-        if s.target_collection is not None:
-            target_coll = s.target_collection
-        elif obj.users_collection:
+        if obj.users_collection:
             target_coll = obj.users_collection[0]
         else:
             target_coll = context.scene.collection
 
-        depsgraph = context.evaluated_depsgraph_get()
-        scene = context.scene
-        direction = Vector((0.0, 0.0, -1.0))
-        jitter_radius = 0.5 * grid * s.random_jitter
+        cell_area = grid * grid
+        if cell_area <= 0.0:
+            self.report({"ERROR"}, "Density parameters produced invalid sample area")
+            return {"CANCELLED"}
+
+        return_to_edit = (obj.mode == "EDIT")
+        if return_to_edit:
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception as e:
+                self.report({"ERROR"}, f"Failed to switch to Object Mode: {_fmt_exc(e)}")
+                return {"CANCELLED"}
 
         created_count = 0
         proxy_index = 0
-        cells_total = 0
+        candidate_count = 0
         skipped_by_probability = 0
-        ray_miss_count = 0
-        rejected_non_source = 0
-        hit_count = 0
         limit_reached = False
+        total_area = 0.0
+        removed_count = 0
+        try:
+            removed_count = _clear_generated_scatter_proxies(obj)
 
-        steps_x = max(1, int(math.ceil((max_x - min_x) / grid)) + 1)
-        steps_y = max(1, int(math.ceil((max_y - min_y) / grid)) + 1)
+            for tri_idx, (v0, v1, v2, tri_normal, tri_area) in enumerate(triangles, start=1):
+                total_area += tri_area
+                slope_factor = _scatter_slope_density_factor(tri_normal, s.slope_falloff)
+                if slope_factor <= 1e-6:
+                    continue
 
-        for ix in range(steps_x):
-            x = min_x + ix * grid
-            for iy in range(steps_y):
-                if s.max_proxies > 0 and created_count >= s.max_proxies:
-                    limit_reached = True
+                expected = (tri_area / cell_area) * slope_factor
+                tri_rng = random.Random((int(s.seed) ^ (tri_idx * 2654435761)) & 0xFFFFFFFFFFFFFFFF)
+                samples = int(expected)
+                if tri_rng.random() < max(0.0, expected - samples):
+                    samples += 1
+
+                for sample_idx in range(samples):
+                    if s.max_proxies > 0 and created_count >= s.max_proxies:
+                        limit_reached = True
+                        break
+
+                    candidate_count += 1
+                    sample_rng = random.Random(
+                        ((int(s.seed) & 0xFFFFFFFF) ^ (tri_idx * 73856093) ^ ((sample_idx + 1) * 19349663))
+                        & 0xFFFFFFFFFFFFFFFF
+                    )
+                    if s.spawn_probability < 1.0 and sample_rng.random() > s.spawn_probability:
+                        skipped_by_probability += 1
+                        continue
+
+                    hit_loc = _sample_point_on_triangle(v0, v1, v2, sample_rng)
+                    clutter_class = pick_weighted_random(clutter_names, clutter_probs, rng=sample_rng)
+                    c_def = clutter_defs[clutter_class]
+                    proxy_index += 1
+
+                    create_proxy_object(
+                        context=context,
+                        collection=target_coll,
+                        parent_obj=obj,
+                        location=hit_loc,
+                        normal=tri_normal,
+                        model_path=c_def["model"],
+                        proxy_index=proxy_index,
+                        scale_min=c_def.get("scaleMin", 1.0),
+                        scale_max=c_def.get("scaleMax", 1.0),
+                        rng=sample_rng,
+                    )
+                    created_count += 1
+                if limit_reached:
                     break
-
-                y = min_y + iy * grid
-                cells_total += 1
-
-                cell_seed = (
-                    (s.seed & 0xFFFFFFFF)
-                    ^ ((ix + 1) * 73856093)
-                    ^ ((iy + 1) * 19349663)
-                ) & 0xFFFFFFFFFFFFFFFF
-                cell_rng = random.Random(cell_seed)
-
-                if s.spawn_probability < 1.0 and cell_rng.random() > s.spawn_probability:
-                    skipped_by_probability += 1
-                    continue
-
-                jx = (cell_rng.random() * 2.0 - 1.0) * jitter_radius
-                jy = (cell_rng.random() * 2.0 - 1.0) * jitter_radius
-                origin = Vector((x + jx, y + jy, start_z))
-
-                hit, hit_loc, hit_normal, _, hit_obj, _ = scene.ray_cast(
-                    depsgraph, origin, direction, distance=s.max_distance
-                )
-
-                if not hit:
-                    ray_miss_count += 1
-                    continue
-
-                if s.only_hit_source and getattr(hit_obj, "original", hit_obj) != obj:
-                    rejected_non_source += 1
-                    continue
-
-                hit_count += 1
-                clutter_class = pick_weighted_random(clutter_names, clutter_probs, rng=cell_rng)
-                c_def = clutter_defs[clutter_class]
-                proxy_index += 1
-
-                create_proxy_object(
-                    context=context,
-                    collection=target_coll,
-                    parent_obj=obj,
-                    location=hit_loc,
-                    normal=hit_normal,
-                    model_path=c_def["model"],
-                    proxy_index=proxy_index,
-                    scale_min=c_def.get("scaleMin", 1.0),
-                    scale_max=c_def.get("scaleMax", 1.0),
-                    rng=cell_rng,
-                )
-                created_count += 1
-            if limit_reached:
-                break
+        finally:
+            if return_to_edit:
+                try:
+                    context.view_layer.objects.active = obj
+                except Exception:
+                    pass
+                try:
+                    bpy.ops.object.mode_set(mode="EDIT")
+                except Exception:
+                    pass
 
         limit_suffix = " (max limit reached)" if limit_reached else ""
         self.report(
             {"INFO"},
             (
-                f"Created {created_count} proxies from {cells_total} cells"
-                f" | hits: {hit_count}, miss: {ray_miss_count},"
-                f" prob-skip: {skipped_by_probability}, reject: {rejected_non_source}"
+                f"Removed {removed_count}, created {created_count} proxies from {len(triangles)} selected triangle(s)"
+                f" | area: {total_area:.2f}, candidates: {candidate_count}, prob-skip: {skipped_by_probability}"
                 f"{limit_suffix}"
             ),
         )
@@ -1199,7 +1319,9 @@ class CRAY_OT_ScatterProxies(Operator):
 #  Snap points (.sp_*) for Memory LOD
 # ------------------------------------------------------------------------
 
-_SP_GROUP_RE = re.compile(r"^[A-Za-z0-9]+$")
+_SP_GROUP_RE = re.compile(r"^[A-Za-z0-9_]+$")
+_SP_P3D_NAME_RE = re.compile(r"^[A-Za-z0-9]+$")
+_SP_PAIR_CODE_RE = re.compile(r"^[A-Za-z0-9]{1,3}$")
 
 _A3OB_IMPORT_CANDIDATES = (
     (
@@ -1472,65 +1594,119 @@ def _report_missing_lods_in_console(collection_name: str, filepath: str, expecte
     return missing_keys
 
 def _is_memory_lod_mesh_object(obj) -> bool:
-    if obj is None or obj.type != "MESH":
-        return False
-    if obj.name == "Memory":
-        return True
-    if not hasattr(obj, "a3ob_properties_object"):
-        return False
-    try:
-        props = obj.a3ob_properties_object
-        return str(getattr(props, "lod", "")) == "9"
-    except Exception:
-        return False
+    return _MemoryLodManager.is_memory_lod_mesh_object(obj)
 
 def _pick_memory_lod_object(context, source_obj):
-    if source_obj is not None:
-        for col in source_obj.users_collection:
-            obj = col.objects.get("Memory")
-            if obj is not None and obj.type == "MESH":
-                return obj
-    obj = bpy.data.objects.get("Memory")
-    if obj is not None and obj.type == "MESH":
-        return obj
-    for obj in context.scene.objects:
-        if _is_memory_lod_mesh_object(obj):
-            return obj
-    return None
+    return _MemoryLodManager(context, source_obj).pick_existing_object()
 
 def _set_memory_lod_a3ob_props(memory_obj):
-    if not hasattr(memory_obj, "a3ob_properties_object"):
-        return
-    try:
-        props = memory_obj.a3ob_properties_object
-        props.lod = "9"
-        props.is_a3_lod = True
-        _remove_a3ob_named_property(props, "autocenter")
-    except Exception:
-        pass
+    _MemoryLodManager.apply_a3ob_props(memory_obj)
 
 def _ensure_memory_lod_object(context, source_obj, preferred_obj=None):
-    if preferred_obj is not None and preferred_obj.type == "MESH":
-        memory_obj = preferred_obj
-    else:
-        memory_obj = _pick_memory_lod_object(context, source_obj)
+    return _MemoryLodManager(context, source_obj).ensure_object(preferred_obj=preferred_obj)
 
-    memory_collection = _ensure_memory_collection(context, source_obj)
+class _MemoryLodManager:
+    OBJECT_NAME = "Memory"
 
-    if memory_obj is None:
-        memory_mesh = bpy.data.meshes.new("Memory")
-        memory_obj = bpy.data.objects.new("Memory", memory_mesh)
-        if memory_collection is not None:
-            memory_collection.objects.link(memory_obj)
+    def __init__(self, context, source_obj=None, parent_collection=None):
+        self.context = context
+        self.source_obj = source_obj
+        self.parent_collection = parent_collection
+
+    @staticmethod
+    def is_memory_lod_mesh_object(obj) -> bool:
+        if obj is None or obj.type != "MESH":
+            return False
+        if obj.name == _MemoryLodManager.OBJECT_NAME:
+            return True
+        if not hasattr(obj, "a3ob_properties_object"):
+            return False
+        try:
+            props = obj.a3ob_properties_object
+            return str(getattr(props, "lod", "")) == "9"
+        except Exception:
+            return False
+
+    def pick_existing_object(self):
+        if self.parent_collection is not None:
+            memory_collection = self.ensure_collection()
+            if memory_collection is not None:
+                direct = memory_collection.objects.get(self.OBJECT_NAME)
+                if direct is not None and direct.type == "MESH":
+                    return direct
+                for obj in memory_collection.objects:
+                    if self.is_memory_lod_mesh_object(obj):
+                        return obj
+            return None
+
+        if self.source_obj is not None:
+            memory_collection = self.ensure_collection()
+            if memory_collection is not None:
+                direct = memory_collection.objects.get(self.OBJECT_NAME)
+                if direct is not None and direct.type == "MESH":
+                    return direct
+                for obj in memory_collection.objects:
+                    if self.is_memory_lod_mesh_object(obj):
+                        return obj
+
+            for col in self.source_obj.users_collection:
+                obj = col.objects.get(self.OBJECT_NAME)
+                if obj is not None and obj.type == "MESH":
+                    return obj
+            return None
+
+        obj = bpy.data.objects.get(self.OBJECT_NAME)
+        if obj is not None and obj.type == "MESH":
+            return obj
+
+        for obj in self.context.scene.objects:
+            if self.is_memory_lod_mesh_object(obj):
+                return obj
+        return None
+
+    @staticmethod
+    def apply_a3ob_props(memory_obj):
+        if not hasattr(memory_obj, "a3ob_properties_object"):
+            return
+        try:
+            props = memory_obj.a3ob_properties_object
+            props.lod = "9"
+            props.is_a3_lod = True
+            _remove_a3ob_named_property(props, "autocenter")
+        except Exception:
+            pass
+
+    def ensure_collection(self):
+        if self.parent_collection is not None:
+            return _ensure_named_child_collection(
+                self.parent_collection,
+                _MEMORY_COLLECTION_NAME,
+                _MEMORY_COLLECTION_COLOR,
+                aliases=_MEMORY_COLLECTION_ALIASES,
+            )
+        return _ensure_memory_collection(self.context, self.source_obj)
+
+    def ensure_object(self, preferred_obj=None):
+        if preferred_obj is not None and preferred_obj.type == "MESH":
+            memory_obj = preferred_obj
         else:
-            context.scene.collection.objects.link(memory_obj)
-        if source_obj is not None:
-            memory_obj.matrix_world = source_obj.matrix_world.copy()
-    else:
-        _move_object_to_collection(memory_obj, memory_collection)
+            memory_obj = self.pick_existing_object()
 
-    _set_memory_lod_a3ob_props(memory_obj)
-    return memory_obj
+        memory_collection = self.ensure_collection()
+        if memory_obj is None:
+            memory_mesh = bpy.data.meshes.new(self.OBJECT_NAME)
+            memory_obj = bpy.data.objects.new(self.OBJECT_NAME, memory_mesh)
+            if memory_collection is not None:
+                memory_collection.objects.link(memory_obj)
+            else:
+                self.context.scene.collection.objects.link(memory_obj)
+            if self.source_obj is not None:
+                memory_obj.matrix_world = self.source_obj.matrix_world.copy()
+        else:
+            _move_object_to_collection(memory_obj, memory_collection)
+
+        self.apply_a3ob_props(memory_obj)
+        return memory_obj
 
 def _sort_snap_pair_world_points(context, world_points):
     points = [p.copy() for p in world_points]
@@ -1591,6 +1767,162 @@ def _create_snap_pair_in_memory(context, memory_obj, world_points, snap_group: s
         vg.add([base_idx + i], 1.0, "REPLACE")
         created_names.append(vg_name)
     return created_names
+
+def _normalize_snap_p3d_name(value: str) -> str:
+    return _sanitize_snap_p3d_name_value(value)
+
+def _build_snap_name_base(p3d_name: str, pair_code: str, axis_token: str) -> str:
+    axis = (axis_token or "X").strip().lower() or "x"
+    return f"{p3d_name}{pair_code}{axis}"
+
+def _build_snap_point_name(p3d_name: str, pair_code: str, axis_token: str, snap_side: str, point_index: int) -> str:
+    base = _build_snap_name_base(p3d_name, pair_code, axis_token)
+    return f".sp_{base}_{snap_side}_{point_index}"
+
+def _create_named_snap_points_in_memory(memory_obj, world_points, point_names, replace_existing: bool):
+    if memory_obj is None or memory_obj.type != "MESH":
+        raise RuntimeError("Memory LOD Object must be a mesh")
+    if len(world_points) != len(point_names):
+        raise RuntimeError("Point and name count mismatch")
+
+    mesh = memory_obj.data
+    to_local = memory_obj.matrix_world.inverted()
+    local_points = [(to_local @ point.copy()) for point in world_points]
+
+    base_idx = len(mesh.vertices)
+    mesh.vertices.add(len(local_points))
+    for offset, local_point in enumerate(local_points):
+        mesh.vertices[base_idx + offset].co = local_point
+    mesh.update()
+
+    created_names = []
+    for offset, point_name in enumerate(point_names):
+        if replace_existing:
+            old = memory_obj.vertex_groups.get(point_name)
+            if old is not None:
+                memory_obj.vertex_groups.remove(old)
+
+        vg = memory_obj.vertex_groups.get(point_name)
+        if vg is None:
+            vg = memory_obj.vertex_groups.new(name=point_name)
+        vg.add([base_idx + offset], 1.0, "REPLACE")
+        created_names.append(point_name)
+    return created_names
+
+class _SnapPointNamePattern:
+    def __init__(self, p3d_name: str, pair_code: str, axis_token: str):
+        self.p3d_name = p3d_name
+        self.pair_code = pair_code
+        self.axis_token = (axis_token or "X").strip().upper() or "X"
+
+    @classmethod
+    def from_settings(cls, settings):
+        p3d_name = _normalize_snap_p3d_name(getattr(settings, "snap_p3d_name", "") or getattr(settings, "snap_group", ""))
+        if not p3d_name:
+            raise RuntimeError("P3D Name is empty")
+        if not _SP_P3D_NAME_RE.fullmatch(p3d_name):
+            raise RuntimeError("P3D Name must contain only letters and digits")
+
+        pair_code = (getattr(settings, "snap_pair_code", "") or "").strip()
+        if not pair_code:
+            raise RuntimeError("ID is empty")
+        if not _SP_PAIR_CODE_RE.fullmatch(pair_code):
+            raise RuntimeError("ID must contain 1-3 letters or digits")
+        return cls(p3d_name=p3d_name, pair_code=pair_code, axis_token=getattr(settings, "edge_axis", "X"))
+
+    @classmethod
+    def from_preview_settings(cls, settings):
+        p3d_name = _normalize_snap_p3d_name(getattr(settings, "snap_p3d_name", "") or getattr(settings, "snap_group", "")) or "SampleName"
+        if not _SP_P3D_NAME_RE.fullmatch(p3d_name):
+            p3d_name = "SampleName"
+
+        pair_code = (getattr(settings, "snap_pair_code", "") or "").strip() or "01"
+        if not _SP_PAIR_CODE_RE.fullmatch(pair_code):
+            pair_code = "01"
+        return cls(p3d_name=p3d_name, pair_code=pair_code, axis_token=getattr(settings, "edge_axis", "X"))
+
+    @property
+    def preview_base(self) -> str:
+        return _build_snap_name_base(self.p3d_name, self.pair_code, self.axis_token)
+
+    def build_pair_names(self, snap_side: str):
+        return [
+            _build_snap_point_name(self.p3d_name, self.pair_code, self.axis_token, snap_side, point_index)
+            for point_index in range(2)
+        ]
+
+class _SnapPointPairBuilder:
+    _SIDE_LABELS = {
+        "a": "Memory LOD (A)",
+        "v": "Memory LOD (V)",
+    }
+
+    def __init__(self, context, settings):
+        self.context = context
+        self.settings = settings
+        self.naming = _SnapPointNamePattern.from_settings(settings)
+
+    def _require_mesh_object(self, obj, label: str):
+        if obj is None or obj.type != "MESH" or obj.data is None:
+            raise RuntimeError(f"{label} must be a mesh")
+        return obj
+
+    def resolve_memory_a(self):
+        memory_obj = getattr(self.settings, "memory_object", None)
+        if memory_obj is None:
+            raise RuntimeError("Pick or create Memory LOD (A) first")
+        return self._require_mesh_object(memory_obj, "Memory LOD (A)")
+
+    def resolve_memory_v(self):
+        memory_obj = getattr(self.settings, "paired_memory_object", None)
+        if memory_obj is None:
+            raise RuntimeError("Pick or create Memory LOD (V) first")
+        return self._require_mesh_object(memory_obj, "Memory LOD (V)")
+
+    def ensure_object_mode(self):
+        if self.context.mode == "OBJECT":
+            return
+        try:
+            bpy.ops.object.mode_set(mode="OBJECT")
+        except Exception as e:
+            raise RuntimeError(f"Failed to switch to Object Mode: {_fmt_exc(e)}")
+
+    def collect_selected_points(self):
+        edit_obj = getattr(self.context, "edit_object", None)
+        if edit_obj is None or edit_obj.type != "MESH":
+            raise RuntimeError("Select exactly 2 vertices in Edit Mode on any mesh")
+
+        world_points = _collect_snap_pair_selected_world_points(edit_obj)
+        if len(world_points) != 2:
+            raise RuntimeError("Select exactly 2 vertices in Edit Mode")
+
+        return _sort_snap_pair_world_points(self.context, world_points)
+
+    def create_dual_model_set(self):
+        world_points = self.collect_selected_points()
+        memory_a = self.resolve_memory_a()
+        memory_v = self.resolve_memory_v()
+        if memory_a == memory_v:
+            raise RuntimeError("Pick two different Memory LOD objects")
+
+        self.ensure_object_mode()
+        self.settings.snap_p3d_name = self.naming.p3d_name
+
+        created_names = []
+        targets = (
+            ("a", memory_a),
+            ("v", memory_v),
+        )
+        for side_token, memory_obj in targets:
+            created_names.extend(
+                _create_named_snap_points_in_memory(
+                    memory_obj=memory_obj,
+                    world_points=world_points,
+                    point_names=self.naming.build_pair_names(side_token),
+                    replace_existing=self.settings.replace_existing,
+                )
+            )
+        return targets, created_names
 
 def _collect_snap_pair_selected_world_points(source_obj):
     if source_obj is None or source_obj.type != "MESH" or source_obj.mode != "EDIT":
@@ -1707,106 +2039,66 @@ def _cleanup_imported_objects(imported_obj_names, pre_collection_ptrs):
         except Exception:
             pass
 
+def _is_p3d_root_collection_name(name: str) -> bool:
+    base = _strip_blender_numeric_suffix((name or "").strip())
+    return base.lower().endswith(".p3d")
+
+def _iter_p3d_root_collections(scene):
+    if scene is None or scene.collection is None:
+        return []
+
+    roots = []
+    for col in _collect_collections_deep(scene.collection):
+        if col is None or col == scene.collection:
+            continue
+        if _is_p3d_root_collection_name(col.name):
+            roots.append(col)
+    return roots
+
 class CRAY_OT_EnsureMemoryLOD(Operator):
     bl_idname = "cray.ensure_memory_lod"
-    bl_label = "Create/Find Memory LOD"
+    bl_label = "Create/Find Memory LODs"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         ss = context.scene.cray_snap_settings
-        source_obj = ss.source_object
-        if source_obj is None:
-            active = context.view_layer.objects.active
-            if active is not None and active.type == "MESH":
-                source_obj = active
-
-        if ss.memory_object is not None and ss.memory_object.type != "MESH":
-            self.report({"ERROR"}, "Memory LOD Object must be a mesh")
+        root_collections = _iter_p3d_root_collections(context.scene)
+        if not root_collections:
+            self.report({"ERROR"}, "No .p3d collections found in the scene")
             return {"CANCELLED"}
 
-        memory_obj = _ensure_memory_lod_object(context, source_obj, preferred_obj=ss.memory_object)
-        ss.memory_object = memory_obj
-        self.report({"INFO"}, f"Memory LOD ready: {memory_obj.name}")
+        prepared = []
+        for root_col in root_collections:
+            memory_obj = _MemoryLodManager(context, parent_collection=root_col).ensure_object()
+            prepared.append(f"{root_col.name} -> {memory_obj.name}")
+
+        preview = ", ".join(prepared[:3])
+        if len(prepared) > 3:
+            preview = f"{preview}, ..."
+        self.report({"INFO"}, f"Prepared {len(prepared)} Memory LODs: {preview}")
         return {"FINISHED"}
 
 class CRAY_OT_CreateSnapPairFromModelEdge(Operator):
     bl_idname = "cray.create_snap_pair_from_model_edge"
-    bl_label = "Create .sp Pair"
+    bl_label = "Create Snap Points"
     bl_description = (
-        "If exactly 2 vertices are selected in Edit Mode, use them directly. "
-        "If no vertices are selected, use the Auto From Edge fallback settings"
+        "Copy 2 selected vertices from the active Edit Mode mesh into both chosen Memory LODs"
     )
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         ss = context.scene.cray_snap_settings
-
-        snap_group = (ss.snap_group or "").strip()
-        if not snap_group:
-            self.report({"ERROR"}, "Snap Group is empty")
-            return {"CANCELLED"}
-        if not _SP_GROUP_RE.fullmatch(snap_group):
-            self.report({"ERROR"}, "Snap Group must contain only letters and digits")
+        try:
+            targets, created_names = _SnapPointPairBuilder(context, ss).create_dual_model_set()
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
 
-        model_obj = ss.source_object
-        if model_obj is None:
-            active = context.view_layer.objects.active
-            if active is not None and active.type == "MESH":
-                model_obj = active
-        if model_obj is None or model_obj.type != "MESH":
-            self.report({"ERROR"}, "Model Object must be a mesh")
-            return {"CANCELLED"}
-
-        world_points = _collect_snap_pair_selected_world_points(model_obj)
-        point_source = "selected vertices"
-        if world_points:
-            if len(world_points) != 2:
-                self.report(
-                    {"ERROR"},
-                    "Select exactly 2 vertices for .sp pair creation, or deselect all vertices to use Auto: Model Edge",
-                )
-                return {"CANCELLED"}
-        else:
-            point_source = "model edge"
-            try:
-                world_points = _auto_snap_points_from_model_edge(
-                    model_obj=model_obj,
-                    edge_axis_token=ss.edge_axis,
-                    edge_side_token=ss.edge_side,
-                    span_axis_token=ss.edge_span_axis,
-                    edge_tolerance=ss.edge_tolerance,
-                )
-            except Exception as e:
-                self.report({"ERROR"}, _fmt_exc(e))
-                return {"CANCELLED"}
-
-        if context.mode != "OBJECT":
-            try:
-                bpy.ops.object.mode_set(mode="OBJECT")
-            except Exception as e:
-                self.report({"ERROR"}, f"Failed to switch to Object Mode: {_fmt_exc(e)}")
-                return {"CANCELLED"}
-
-        if ss.memory_object is not None and ss.memory_object.type != "MESH":
-            self.report({"ERROR"}, "Memory LOD Object must be a mesh")
-            return {"CANCELLED"}
-
-        memory_obj = _ensure_memory_lod_object(context, model_obj, preferred_obj=ss.memory_object)
-        ss.memory_object = memory_obj
-
-        created_names = _create_snap_pair_in_memory(
-            context=context,
-            memory_obj=memory_obj,
-            world_points=world_points,
-            snap_group=snap_group,
-            snap_side=ss.snap_side,
-            replace_existing=ss.replace_existing,
-        )
+        target_names = ", ".join(f"{side.upper()}: {memory_obj.name}" for side, memory_obj in targets)
         self.report(
             {"INFO"},
             (
-                f"Created {len(created_names)} snap points from {point_source} in {memory_obj.name}: "
+                f"Created {len(created_names)} snap points in {target_names}: "
                 f"{', '.join(created_names)}"
             ),
         )
@@ -1837,7 +2129,7 @@ class CRAY_OT_SnapBatchProcess(Operator):
             self.report({"ERROR"}, "Snap Group is empty")
             return {"CANCELLED"}
         if not _SP_GROUP_RE.fullmatch(snap_group):
-            self.report({"ERROR"}, "Snap Group must contain only letters and digits")
+            self.report({"ERROR"}, "Snap Group must contain only letters, digits and underscores")
             return {"CANCELLED"}
 
         paths = []
@@ -2176,7 +2468,12 @@ def _ensure_memory_collection(context, source_obj):
     parent = _preferred_collider_parent_collection(context, source_obj)
     if parent is None:
         parent = context.scene.collection
-    return _ensure_named_child_collection(parent, _MEMORY_COLLECTION_NAME, _MEMORY_COLLECTION_COLOR)
+    return _ensure_named_child_collection(
+        parent,
+        _MEMORY_COLLECTION_NAME,
+        _MEMORY_COLLECTION_COLOR,
+        aliases=_MEMORY_COLLECTION_ALIASES,
+    )
 
 
 def _ensure_misc_collection(context, source_obj):
@@ -8870,13 +9167,13 @@ class CRAY_PT_ClutterProxiesPanel(Panel):
     def draw(self, context):
         layout = self.layout
         s = context.scene.cray_settings
+        edit_obj = getattr(context, "edit_object", None)
+        edit_name = edit_obj.name if edit_obj is not None and edit_obj.type == "MESH" else "<enter Edit Mode on mesh>"
 
         col = layout.column(align=True)
-        col.label(text="Source")
-        col.prop(s, "source_object")
-        if s.source_object and s.source_object.type == "MESH":
-            col.prop_search(s, "vertex_group", s.source_object, "vertex_groups")
-        col.prop(s, "target_collection")
+        col.label(text="Selection")
+        col.label(text=edit_name, icon="MESH_DATA")
+        col.label(text="Selected polygons in Edit Mode are used", icon="INFO")
 
         layout.separator()
 
@@ -8892,18 +9189,10 @@ class CRAY_PT_ClutterProxiesPanel(Panel):
         col.label(text="Density (DayZ-style)")
         col.prop(s, "grid_size")
         col.prop(s, "density_scale")
-        col.prop(s, "random_jitter")
+        col.prop(s, "slope_falloff")
         col.prop(s, "spawn_probability")
         col.prop(s, "max_proxies")
         col.prop(s, "seed")
-
-        layout.separator()
-
-        col = layout.column(align=True)
-        col.label(text="Raycast")
-        col.prop(s, "max_height_offset")
-        col.prop(s, "max_distance")
-        col.prop(s, "only_hit_source")
 
         layout.separator()
         layout.operator("object.cray_scatter_proxies", icon="PARTICLES")
@@ -8923,39 +9212,42 @@ class CRAY_PT_SnapPointsPanel(Panel):
     def draw(self, context):
         layout = self.layout
         ss = context.scene.cray_snap_settings
+        preview_pattern = _SnapPointNamePattern.from_preview_settings(ss)
+        can_create = bool(
+            ss.memory_object is not None and
+            ss.paired_memory_object is not None and
+            ss.memory_object != ss.paired_memory_object
+        )
 
         col = layout.column(align=True)
         col.label(text="Target")
-        col.prop(ss, "source_object")
-        col.prop(ss, "memory_object")
-        col.operator("cray.ensure_memory_lod", icon="OUTLINER_OB_MESH")
+        col.prop(ss, "memory_object", text="")
+        col.separator()
+        col.prop(ss, "paired_memory_object", text="")
+        col.operator("cray.ensure_memory_lod", text="Create/Find Point clouds > Memory", icon="OUTLINER_OB_MESH")
 
         layout.separator()
 
         col = layout.column(align=True)
         col.label(text="Name Pattern")
-        col.prop(ss, "snap_group")
-        col.prop(ss, "snap_side", expand=True)
+        col.prop(ss, "snap_p3d_name")
+        col.prop(ss, "snap_pair_code")
+        col.label(text="Snap Axis")
+        axis_row = col.row(align=True)
+        axis_row.prop(ss, "edge_axis", expand=True)
+        col.label(text=f".sp_{preview_pattern.preview_base}_a_0 / .sp_{preview_pattern.preview_base}_v_1", icon="INFO")
         col.prop(ss, "replace_existing")
 
         layout.separator()
-        box = layout.box()
-        box.label(text="Create Pair", icon="MESH_DATA")
-        box.operator("cray.create_snap_pair_from_model_edge", text="Create .sp Pair", icon="MESH_DATA")
-        row = box.row(align=True)
-        row.prop(
-            ss,
-            "show_auto_edge_fallback",
-            text="Auto From Edge",
-            emboss=False,
-            icon="TRIA_DOWN" if ss.show_auto_edge_fallback else "TRIA_RIGHT",
-        )
-        if ss.show_auto_edge_fallback:
-            fallback = box.box()
-            fallback.prop(ss, "edge_axis")
-            fallback.prop(ss, "edge_side", expand=True)
-            fallback.prop(ss, "edge_span_axis")
-            fallback.prop(ss, "edge_tolerance")
+        info = layout.box()
+        info.label(text="Select exactly 2 vertices in Edit Mode on any LOD", icon="INFO")
+        create_row = info.row()
+        create_row.enabled = can_create
+        create_row.operator("cray.create_snap_pair_from_model_edge", text="Create Snap Points", icon="MESH_DATA")
+        if ss.memory_object is None or ss.paired_memory_object is None:
+            info.label(text="Pick or create both Memory LODs first", icon="INFO")
+        elif ss.memory_object == ss.paired_memory_object:
+            info.label(text="Choose two different Memory LODs", icon="ERROR")
 
         layout.separator()
         pbox = layout.box()

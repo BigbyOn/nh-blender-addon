@@ -4,7 +4,7 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 
 Расположение в Blender: `3D Viewport -> N Panel -> NH Plugin`
 
-Текущая версия: **0.2.1**
+Текущая версия: **0.4.0**
 
 ## Возможности
 
@@ -176,6 +176,7 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 
 Последнее обновление:
 
+- `0.4.0` (`2026-04-12`) — `Snap Points` переведён на ручной A/V workflow с двумя `Memory`-LOD, `Point clouds > Memory` создаётся по `.p3d`-коллекциям автоматически, а scatter травы теперь строится по выделенным полигонам с пересборкой прокси и `Slope Falloff`
 - `0.2.1` (`2026-04-03`) — исправлено создание `Memory`/collider collection, `Geometry` collection переименована в `Geometries`, а `span point` 0/1 теперь сортируются по текущему вьюпорту
 - `0.2.0` (`2026-03-30`) — целевая версия Blender обновлена до `5.1`, релизная версия аддона поднята до `0.2.0`
 - `0.1.9` (`2026-03-29`) — target LOD selector для collider workflow, `Roadway Material` picker и более точный selection-based `Weld Roadway`
