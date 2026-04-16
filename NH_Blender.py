@@ -54,8 +54,8 @@ _PERSISTED_UI_STATE_FILENAME = "nh_blender_ui_state.json"
 _PERSISTED_UI_STATE_TIMER_INTERVAL = 1.0
 _PERSISTED_UI_STATE_CACHE = None
 _TRASH_TINY_ISLAND_MAX_VERTS = 5
-_TRASH_TINY_ISLAND_MAX_FACES = 6
-_TRASH_TINY_ISLAND_MAX_EDGES = 9
+_TRASH_TINY_ISLAND_MAX_FACES = 5
+_TRASH_TINY_ISLAND_MAX_EDGES = 8
 _PERSISTED_UI_SETTINGS = {
     "cray_settings": (
         "vertex_group",
@@ -88,6 +88,10 @@ _PERSISTED_UI_SETTINGS = {
     ),
     "cray_model_split_settings": (
         "part_number",
+        "named_model_name",
+        "named_transfer_mode",
+        "named_export_mode",
+        "named_export_directory",
     ),
     "cray_collider_settings": (
         "target_lod",
@@ -103,11 +107,14 @@ _PERSISTED_UI_SETTINGS = {
         "folder",
         "fix_mesh_join_batch",
         "fix_mesh_center_to_origin",
+        "fix_list_path",
         "split_planar_ngon_vertex_count",
         "split_planar_ngon_angle_tolerance",
         "split_planar_ngon_plane_tolerance",
     ),
     "cray_ie_settings": (
+        "quick_add_p3d_name",
+        "quick_add_search_root",
         "import_show_materials",
         "import_keep_converted_textures",
         "disable_collections_after_import",
@@ -956,6 +963,33 @@ class CRAY_PG_ModelSplitSettings(PropertyGroup):
         min=1,
         max=999,
     )
+    named_model_name: StringProperty(
+        name="New Model Name",
+        default="",
+        description="Name of the new standalone model; .p3d is added automatically",
+    )
+    named_transfer_mode: EnumProperty(
+        name="Selected Chunk Action",
+        items=(
+            ("MOVE", "Move", "Move selected objects out of the source model into the standalone model"),
+            ("COPY", "Copy", "Copy selected objects into the standalone model and keep originals"),
+        ),
+        default="MOVE",
+    )
+    named_export_mode: EnumProperty(
+        name="Export Target",
+        items=(
+            ("SOURCE_SIBLING", "Next to source", "Save Back to source path next to the original model"),
+            ("CUSTOM_DIR", "Custom folder", "Save Back to source path into a selected folder"),
+        ),
+        default="SOURCE_SIBLING",
+    )
+    named_export_directory: StringProperty(
+        name="Export Folder",
+        default="",
+        subtype="DIR_PATH",
+        description="Folder used when Export Target is set to Custom folder",
+    )
 
 
 _COLLIDER_TARGET_LOD_ITEMS = (
@@ -1551,6 +1585,221 @@ def _collect_expected_lod_entries(export_objects):
                 rec["objects"].append(obj.name)
 
     return expected
+
+def _is_a3ob_resolution_lod_object(obj) -> bool:
+    if obj is None or obj.type != "MESH":
+        return False
+    if not hasattr(obj, "a3ob_properties_object"):
+        return False
+
+    try:
+        props = obj.a3ob_properties_object
+        if not bool(getattr(props, "is_a3_lod", False)):
+            return False
+        lod_value = str(getattr(props, "lod", "") or "").strip()
+        if lod_value == "0":
+            return True
+        try:
+            return int(lod_value) == 0
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+def _format_resolution_lod_index_value(value) -> str:
+    try:
+        num = float(value)
+    except Exception:
+        raw = str(value or "").strip()
+        return raw or "0"
+
+    if math.isfinite(num) and abs(num - round(num)) <= 1e-6:
+        return str(int(round(num)))
+    return f"{num:g}"
+
+def _actual_top_level_collection_key_under_root(root_collection, obj):
+    source_path = _best_object_collection_path_under_root(root_collection, obj)
+    if not source_path:
+        return "<root>", ("<root>",)
+
+    actual_parts = tuple(getattr(col, "name", "") or "" for col in list(source_path)[1:])
+    if not actual_parts:
+        return "<root>", ("<root>",)
+    return actual_parts[0], actual_parts
+
+def _collect_resolution_lod_index_conflicts(root_collection, export_objects):
+    buckets = {}
+
+    for obj in export_objects:
+        if not _is_a3ob_resolution_lod_object(obj):
+            continue
+
+        try:
+            props = obj.a3ob_properties_object
+            resolution_value = int(getattr(props, "resolution", 0) or 0)
+        except Exception:
+            resolution_value = 0
+
+        top_level_key, actual_parts = _actual_top_level_collection_key_under_root(root_collection, obj)
+        resolution_key = _format_resolution_lod_index_value(resolution_value)
+
+        branch_bucket = buckets.setdefault(top_level_key, {})
+        branch_bucket.setdefault(resolution_key, []).append(
+            {
+                "object_name": obj.name,
+                "actual_branch": actual_parts,
+            }
+        )
+
+    conflicts = []
+    for branch_key, resolution_map in buckets.items():
+        for resolution_key, items in resolution_map.items():
+            if len(items) <= 1:
+                continue
+            conflicts.append(
+                {
+                    "branch_name": branch_key,
+                    "resolution_index": resolution_key,
+                    "items": items,
+                }
+            )
+
+    conflicts.sort(
+        key=lambda rec: (
+            rec["branch_name"],
+            rec["resolution_index"],
+        )
+    )
+    return conflicts
+
+def _report_resolution_lod_index_conflicts_in_console(collection_name: str, filepath: str, conflicts):
+    if not conflicts:
+        return
+
+    print("=== Batch Export Collections: Duplicate Resolution LOD indices ===")
+    print(f"Collection: {collection_name}")
+    print(f"File: {filepath}")
+    print(
+        "WARNING: Duplicate Resolution LOD indices were found inside the same actual top-level collection branch."
+    )
+    for rec in conflicts:
+        print(f"Top-level branch: {rec['branch_name']}")
+        print(f"Resolution index: {rec['resolution_index']}")
+        for item in rec["items"]:
+            actual_branch = " > ".join(item["actual_branch"])
+            print(f" - {item['object_name']} | actual branch: {actual_branch}")
+
+def _is_a3ob_lod_root_object(obj) -> bool:
+    if obj is None or obj.type != "MESH" or obj.parent is not None:
+        return False
+    if not hasattr(obj, "a3ob_properties_object"):
+        return False
+    try:
+        return bool(getattr(obj.a3ob_properties_object, "is_a3_lod", False))
+    except Exception:
+        return False
+
+def _is_a3ob_proxy_object(obj) -> bool:
+    if obj is None or obj.type != "MESH":
+        return False
+    if not hasattr(obj, "a3ob_properties_object_proxy"):
+        return False
+    try:
+        return bool(getattr(obj.a3ob_properties_object_proxy, "is_a3_proxy", False))
+    except Exception:
+        return False
+
+def _iter_a3ob_export_meshes_for_lod_root(root_obj):
+    if not _is_a3ob_lod_root_object(root_obj):
+        return []
+
+    meshes = [root_obj]
+    for child in getattr(root_obj, "children", []):
+        if child is None or child.type != "MESH":
+            continue
+        if _is_a3ob_proxy_object(child):
+            continue
+        meshes.append(child)
+    return meshes
+
+def _mesh_ngon_stats(mesh_obj):
+    if mesh_obj is None or mesh_obj.type != "MESH" or mesh_obj.data is None:
+        return 0, 0
+
+    ngon_count = 0
+    max_sides = 0
+    for poly in getattr(mesh_obj.data, "polygons", []):
+        side_count = len(getattr(poly, "vertices", ()))
+        if side_count <= 4:
+            continue
+        ngon_count += 1
+        if side_count > max_sides:
+            max_sides = side_count
+    return ngon_count, max_sides
+
+def _collect_export_ngon_issues(root_collection, export_objects):
+    issues = []
+    seen_lod_roots = set()
+
+    for obj in export_objects:
+        if not _is_a3ob_lod_root_object(obj):
+            continue
+        try:
+            root_ptr = obj.as_pointer()
+        except Exception:
+            root_ptr = None
+        if root_ptr in seen_lod_roots:
+            continue
+        if root_ptr is not None:
+            seen_lod_roots.add(root_ptr)
+
+        try:
+            lod_name = str(obj.a3ob_properties_object.get_name())
+        except Exception:
+            lod_name = obj.name
+
+        for mesh_obj in _iter_a3ob_export_meshes_for_lod_root(obj):
+            ngon_count, max_sides = _mesh_ngon_stats(mesh_obj)
+            if ngon_count <= 0:
+                continue
+            _, actual_parts = _actual_top_level_collection_key_under_root(root_collection, mesh_obj)
+            issues.append(
+                {
+                    "lod_object_name": obj.name,
+                    "lod_name": lod_name,
+                    "mesh_object_name": mesh_obj.name,
+                    "ngon_count": ngon_count,
+                    "max_sides": max_sides,
+                    "actual_branch": actual_parts,
+                }
+            )
+
+    issues.sort(
+        key=lambda rec: (
+            rec["lod_name"],
+            rec["mesh_object_name"],
+        )
+    )
+    return issues
+
+def _report_export_ngon_issues_in_console(collection_name: str, filepath: str, issues):
+    if not issues:
+        return
+
+    print("=== Batch Export Collections: N-gons detected ===")
+    print(f"Collection: {collection_name}")
+    print(f"File: {filepath}")
+    print(
+        "WARNING: A3OB validation will skip LODs that contain n-gons. "
+        "Triangulate or remove faces with more than 4 vertices before export."
+    )
+    for item in issues:
+        actual_branch = " > ".join(item["actual_branch"])
+        print(
+            f" - LOD: {item['lod_name']} | root: {item['lod_object_name']} | "
+            f"mesh: {item['mesh_object_name']} | n-gon faces: {item['ngon_count']} | "
+            f"max verts on one face: {item['max_sides']} | branch: {actual_branch}"
+        )
 
 
 def _read_exported_lod_entries(filepath: str):
@@ -4461,119 +4710,56 @@ def _split_planar_boundary_is_single_loop(boundary_edges, boundary_verts):
     return len(seen_verts) == len(boundary_verts)
 
 
-def _find_split_planar_ngon_regions(bm, min_vertex_count, angle_tolerance_deg=0.1, plane_tolerance=0.0001):
+def _collect_candidate_face_islands(bm):
     candidate_faces, scope_label = _iter_split_planar_candidate_faces(bm)
     if not candidate_faces:
         return [], scope_label
 
     allowed_faces = set(candidate_faces)
-    matches_by_signature = {}
-    cos_limit = math.cos(math.radians(max(0.0, min(180.0, float(angle_tolerance_deg)))))
+    islands = []
+    processed = set()
 
-    processed_islands = set()
     for seed_face in candidate_faces:
-        if seed_face in processed_islands or not seed_face.is_valid:
+        if seed_face in processed or not seed_face.is_valid:
             continue
 
         island_faces = _collect_connected_face_island(seed_face, allowed_faces)
         if not island_faces:
-            processed_islands.add(seed_face)
+            processed.add(seed_face)
             continue
 
-        island_set = set(island_faces)
-        processed_islands.update(island_set)
-
-        island_vert_count, island_face_count, island_edge_count = _connected_face_island_counts(island_faces)
-        boundary_edges, boundary_verts, non_manifold = _classify_split_planar_region_edges(island_faces)
-        if (
-            island_vert_count <= _TRASH_TINY_ISLAND_MAX_VERTS
-            or island_face_count <= _TRASH_TINY_ISLAND_MAX_FACES
-            or island_edge_count <= _TRASH_TINY_ISLAND_MAX_EDGES
-        ):
-            if not non_manifold:
-                _add_split_region_match(
-                    matches_by_signature,
-                    island_faces,
-                    boundary_edges,
-                    boundary_verts,
-                    "tiny",
-                )
-
-        if _connected_face_island_is_coplanar(
-            island_faces,
-            cos_limit,
-            max(0.0, float(plane_tolerance)),
-        ):
-            _add_split_region_match(
-                matches_by_signature,
-                island_faces,
-                boundary_edges,
-                boundary_verts,
-                "coplanar",
-            )
-
-    processed_faces = set()
-
-    for seed_face in candidate_faces:
-        if seed_face in processed_faces or not seed_face.is_valid:
-            continue
-        if seed_face.normal.length_squared <= 1e-12:
-            processed_faces.add(seed_face)
+        island_faces = [face for face in island_faces if face is not None and face.is_valid]
+        if not island_faces:
             continue
 
-        plane_normal = seed_face.normal.copy()
-        plane_normal.normalize()
-        plane_point = seed_face.verts[0].co.copy()
+        processed.update(island_faces)
+        islands.append(island_faces)
 
-        region_faces = _collect_split_planar_region(
-            seed_face,
-            allowed_faces,
-            cos_limit,
-            max(0.0, float(plane_tolerance)),
-        )
-        if not region_faces:
-            processed_faces.add(seed_face)
-            continue
-
-        region_set = set(region_faces)
-        processed_faces.update(region_set)
-
-        boundary_edges, boundary_verts, non_manifold = _classify_split_planar_region_edges(region_faces)
-        if non_manifold:
-            continue
-        if len(boundary_verts) < int(min_vertex_count):
-            continue
-        if not _split_planar_boundary_is_single_loop(boundary_edges, boundary_verts):
-            continue
-        if not _split_planar_region_is_thin(
-            region_faces,
-            plane_point,
-            plane_normal,
-            cos_limit,
-            max(0.0, float(plane_tolerance)),
-        ):
-            continue
-
-        _add_split_region_match(
-            matches_by_signature,
-            region_faces,
-            boundary_edges,
-            boundary_verts,
-            "flat",
-        )
-
-    return list(matches_by_signature.values()), scope_label
+    return islands, scope_label
 
 
-def _select_split_planar_ngon_regions(bm, matches):
+def _build_face_island_match(island_faces, kind, counts=None):
+    face_set = {face for face in island_faces if face is not None and face.is_valid}
+    edge_set = {edge for face in face_set for edge in face.edges if edge is not None and edge.is_valid}
+    vert_set = {vert for face in face_set for vert in face.verts if vert is not None and vert.is_valid}
+    return {
+        "faces": list(face_set),
+        "edges": list(edge_set),
+        "verts": list(vert_set),
+        "kind": kind,
+        "counts": counts or {},
+    }
+
+
+def _select_face_island_matches(bm, matches):
     selected_faces = set()
     selected_edges = set()
     selected_verts = set()
 
     for item in matches:
         selected_faces.update(face for face in item.get("faces", []) if face is not None and face.is_valid)
-        selected_edges.update(edge for edge in item.get("boundary_edges", []) if edge is not None and edge.is_valid)
-        selected_verts.update(vert for vert in item.get("boundary_verts", []) if vert is not None and vert.is_valid)
+        selected_edges.update(edge for edge in item.get("edges", []) if edge is not None and edge.is_valid)
+        selected_verts.update(vert for vert in item.get("verts", []) if vert is not None and vert.is_valid)
 
     for face in bm.faces:
         face.select = False
@@ -4589,18 +4775,162 @@ def _select_split_planar_ngon_regions(bm, matches):
     for vert in selected_verts:
         vert.select = True
 
+    bm.select_flush_mode()
+
+
+def _find_small_trash_face_islands(bm):
+    islands, scope_label = _collect_candidate_face_islands(bm)
+    matches = []
+
+    for island_faces in islands:
+        vert_count, face_count, edge_count = _connected_face_island_counts(island_faces)
+        if (
+            vert_count < _TRASH_TINY_ISLAND_MAX_VERTS
+            or edge_count < _TRASH_TINY_ISLAND_MAX_EDGES
+            or face_count < _TRASH_TINY_ISLAND_MAX_FACES
+        ):
+            matches.append(
+                _build_face_island_match(
+                    island_faces,
+                    "trash",
+                    counts={
+                        "verts": vert_count,
+                        "edges": edge_count,
+                        "faces": face_count,
+                    },
+                )
+            )
+
+    return matches, scope_label
+
+
+def _find_coplanar_plate_face_islands(bm, angle_tolerance_deg=0.1, plane_tolerance=0.0001):
+    islands, scope_label = _collect_candidate_face_islands(bm)
+    matches = []
+    cos_limit = math.cos(math.radians(max(0.0, min(180.0, float(angle_tolerance_deg)))))
+    plane_tolerance = max(0.0, float(plane_tolerance))
+
+    for island_faces in islands:
+        if not _connected_face_island_is_coplanar(island_faces, cos_limit, plane_tolerance):
+            continue
+
+        seed_face = next((face for face in island_faces if face is not None and face.is_valid), None)
+        if seed_face is None or seed_face.normal.length_squared <= 1e-12 or len(seed_face.verts) < 3:
+            continue
+
+        plane_normal = seed_face.normal.copy()
+        plane_normal.normalize()
+        plane_point = seed_face.verts[0].co.copy()
+
+        boundary_edges, boundary_verts, non_manifold = _classify_split_planar_region_edges(island_faces)
+        if non_manifold:
+            continue
+        if not _split_planar_boundary_is_single_loop(boundary_edges, boundary_verts):
+            continue
+        if not _split_planar_region_is_thin(
+            island_faces,
+            plane_point,
+            plane_normal,
+            cos_limit,
+            plane_tolerance,
+        ):
+            continue
+
+        vert_count, face_count, edge_count = _connected_face_island_counts(island_faces)
+        matches.append(
+            _build_face_island_match(
+                island_faces,
+                "plate",
+                counts={
+                    "verts": vert_count,
+                    "edges": edge_count,
+                    "faces": face_count,
+                },
+            )
+        )
+
+    return matches, scope_label
+
 
 class CRAY_OT_SelectSplitPlanarNgons(Operator):
-    """Select flat thin face islands whose outer boundary has at least N vertices"""
+    """Select tiny connected face islands treated as trash"""
 
     bl_idname = "cray.select_split_planar_ngons"
-    bl_label = "Select Flat Thin N-gons"
+    bl_label = "Select Trash Islands"
     bl_description = (
-        "In Edit Mode, find either flat thin face islands whose outer boundary has at least N vertices, "
-        "or tiny connected face islands where verts <= 5, or faces <= 6, or edges <= 9, "
-        "or any connected face island that lies in one plane. "
-        "If faces, edges, or verts are already selected, "
-        "only that local area is searched"
+        "In Edit Mode, find connected face islands treated as trash: "
+        "verts < 5 or edges < 8 or faces < 5. "
+        "If faces, edges, or verts are already selected, only that local area is searched"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            context.mode == "EDIT_MESH"
+            and obj is not None
+            and obj.type == "MESH"
+            and obj.mode == "EDIT"
+        )
+
+    def execute(self, context):
+        obj = context.active_object
+        if obj is None or obj.type != "MESH" or context.mode != "EDIT_MESH" or obj.mode != "EDIT":
+            self.report({"ERROR"}, "Active object must be a mesh in Edit Mode")
+            return {"CANCELLED"}
+
+        mesh = obj.data
+        bm = bmesh.from_edit_mesh(mesh)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+
+        try:
+            matches, scope_label = _find_small_trash_face_islands(bm)
+        except Exception as e:
+            self.report({"ERROR"}, f"Failed to analyze trash islands: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+
+        if not matches:
+            self.report(
+                {"WARNING"},
+                (
+                    f"No trash islands found "
+                    f"(verts < {_TRASH_TINY_ISLAND_MAX_VERTS} or "
+                    f"edges < {_TRASH_TINY_ISLAND_MAX_EDGES} or "
+                    f"faces < {_TRASH_TINY_ISLAND_MAX_FACES}) "
+                    f"in {scope_label} scope"
+                ),
+            )
+            return {"CANCELLED"}
+
+        context.tool_settings.mesh_select_mode = (False, False, True)
+        _select_face_island_matches(bm, matches)
+        bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+
+        face_total = sum(len(item["faces"]) for item in matches)
+        edge_total = sum(len(item["edges"]) for item in matches)
+        vert_total = sum(len(item["verts"]) for item in matches)
+        self.report(
+            {"INFO"},
+            (
+                f"Selected {len(matches)} trash island(s): "
+                f"{face_total} faces, {edge_total} edges, {vert_total} verts "
+                f"in {scope_label} scope"
+            ),
+        )
+        return {"FINISHED"}
+
+
+class CRAY_OT_SelectCoplanarPlateIslands(Operator):
+    """Select connected face islands that form a flat plate in one plane"""
+
+    bl_idname = "cray.select_coplanar_plate_islands"
+    bl_label = "Select Flat Plates"
+    bl_description = (
+        "In Edit Mode, find connected face islands that lie in one plane like a flat plate. "
+        "If faces, edges, or verts are already selected, only that local area is searched"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -4628,44 +4958,31 @@ class CRAY_OT_SelectSplitPlanarNgons(Operator):
         bm.faces.ensure_lookup_table()
 
         try:
-            matches, scope_label = _find_split_planar_ngon_regions(
+            matches, scope_label = _find_coplanar_plate_face_islands(
                 bm,
-                min_vertex_count=max(3, int(ts.split_planar_ngon_vertex_count)),
                 angle_tolerance_deg=float(ts.split_planar_ngon_angle_tolerance),
                 plane_tolerance=float(ts.split_planar_ngon_plane_tolerance),
             )
         except Exception as e:
-            self.report({"ERROR"}, f"Failed to analyze split planar regions: {_fmt_exc(e)}")
+            self.report({"ERROR"}, f"Failed to analyze flat plates: {_fmt_exc(e)}")
             return {"CANCELLED"}
 
         if not matches:
-            self.report(
-                {"WARNING"},
-                (
-                    f"No flat thin N+ islands or tiny trash islands "
-                    f"(verts <= 5 or faces <= 6 or edges <= 9) "
-                    f"or fully coplanar islands found "
-                    f"in {scope_label} scope"
-                ),
-            )
+            self.report({"WARNING"}, f"No flat plates found in {scope_label} scope")
             return {"CANCELLED"}
 
-        _select_split_planar_ngon_regions(bm, matches)
+        context.tool_settings.mesh_select_mode = (False, False, True)
+        _select_face_island_matches(bm, matches)
         bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
 
         face_total = sum(len(item["faces"]) for item in matches)
-        edge_total = sum(len(item["boundary_edges"]) for item in matches)
-        vert_total = sum(len(item["boundary_verts"]) for item in matches)
-        tiny_total = sum(1 for item in matches if item.get("kind") == "tiny")
-        coplanar_total = sum(1 for item in matches if item.get("kind") == "coplanar")
-        flat_total = sum(1 for item in matches if item.get("kind") == "flat")
+        edge_total = sum(len(item["edges"]) for item in matches)
+        vert_total = sum(len(item["verts"]) for item in matches)
         self.report(
             {"INFO"},
             (
-                f"Selected {len(matches)} island(s): flat N+ {flat_total}, "
-                f"tiny by verts<=5/faces<=6/edges<=9 {tiny_total}, "
-                f"fully coplanar {coplanar_total}; "
-                f"{face_total} faces, {edge_total} boundary edges, {vert_total} boundary verts "
+                f"Selected {len(matches)} flat plate island(s): "
+                f"{face_total} faces, {edge_total} edges, {vert_total} verts "
                 f"in {scope_label} scope"
             ),
         )
@@ -6403,6 +6720,12 @@ class CRAY_PG_ObjMatImagesItem(PropertyGroup):
 class CRAY_PG_TexReplaceSettings(PropertyGroup):
     folder: StringProperty(name="Folder", default="P:\\NH_ObjectTextures", subtype="DIR_PATH")
     picked_object: PointerProperty(name="Select Object", type=bpy.types.Object)
+    fix_list_path: StringProperty(
+        name="Fix List .txt",
+        description="Structured text file with bad component names per .p3d and LOD",
+        default="",
+        subtype="FILE_PATH",
+    )
     fix_mesh_join_batch: IntProperty(
         name="Fix Mesh Join Batch",
         description=(
@@ -6923,6 +7246,55 @@ def _planner_add_import_file(settings, filepath: str) -> bool:
     settings.import_active_index = len(settings.import_files) - 1
     return True
 
+
+def _normalize_p3d_lookup_key(value: str) -> str:
+    raw = (value or "").replace("/", "\\").strip()
+    if not raw:
+        return ""
+    raw = raw.split("\\")[-1]
+    raw = _strip_blender_numeric_suffix(raw)
+    if raw.lower().endswith(".p3d"):
+        raw = raw[:-4]
+    return raw.strip().lower()
+
+
+def _display_p3d_name(value: str) -> str:
+    key = _normalize_p3d_lookup_key(value)
+    if not key:
+        return ""
+    return key + ".p3d"
+
+
+def _find_existing_scene_p3d_root(scene, model_name_or_path: str):
+    wanted = _normalize_p3d_lookup_key(model_name_or_path)
+    if not wanted:
+        return None
+
+    for col in _iter_p3d_root_collections(scene):
+        if _normalize_p3d_lookup_key(getattr(col, "name", "") or "") == wanted:
+            return col
+    return None
+
+
+def _find_p3d_paths_by_name(search_root: str, model_name: str):
+    root_abs = bpy.path.abspath(search_root) if search_root else ""
+    root_abs = os.path.abspath(root_abs) if root_abs else ""
+    wanted = _normalize_p3d_lookup_key(model_name)
+    if not root_abs or not os.path.isdir(root_abs) or not wanted:
+        return []
+
+    matches = []
+    for root, _, files in os.walk(root_abs):
+        for fn in files:
+            if not fn.lower().endswith(".p3d"):
+                continue
+            if _normalize_p3d_lookup_key(fn) != wanted:
+                continue
+            matches.append(_norm_path(os.path.join(root, fn)))
+
+    matches.sort(key=lambda item: (len(item), item.lower()))
+    return matches
+
 def _resolve_collection_source_path(collection, import_basename_map=None):
     src = collection.get(_IE_SOURCE_PATH_KEY)
     if isinstance(src, str) and src.strip():
@@ -7229,6 +7601,157 @@ def _ensure_split_part_root_collection(context, source_root, part_number: int):
     split_source_path = _derive_split_export_source_path(source_root, part_name)
     _set_ie_source_path_tag(target, split_source_path)
     return target
+
+def _format_named_split_model_collection_name(model_name: str) -> str:
+    base_name = _strip_blender_numeric_suffix((model_name or "").strip())
+    base_name = _INVALID_FILENAME_CHARS_RE.sub("_", base_name)
+    base_name = re.sub(r"\s+", " ", base_name).strip(" .")
+    if not base_name:
+        base_name = "new_model"
+
+    stem, ext = os.path.splitext(base_name)
+    if ext.lower() == ".p3d":
+        safe_stem = stem.strip(" .") or "new_model"
+        return f"{safe_stem}.p3d"
+    return f"{base_name}.p3d"
+
+def _derive_named_split_export_source_path(source_root, model_root_name: str, export_mode: str, export_directory: str = "") -> str:
+    filename = _format_named_split_model_collection_name(model_root_name)
+    if export_mode == "CUSTOM_DIR":
+        export_dir = bpy.path.abspath(export_directory) if export_directory else ""
+        export_dir = os.path.abspath(export_dir) if export_dir else ""
+        if not export_dir:
+            return ""
+        return _norm_path(os.path.join(export_dir, filename))
+    return _derive_split_export_source_path(source_root, filename)
+
+def _ensure_named_split_model_root_collection(context, source_root, model_name: str, export_mode: str, export_directory: str = ""):
+    scene_root = getattr(getattr(context, "scene", None), "collection", None)
+    parent = _find_parent_collection(scene_root, source_root) if scene_root is not None else None
+    if parent is None:
+        parent = scene_root if scene_root is not None else source_root
+    if parent is None:
+        return None
+
+    target_name = _format_named_split_model_collection_name(model_name)
+    target = parent.children.get(target_name)
+    if target is None:
+        existing = bpy.data.collections.get(target_name)
+        if existing is not None:
+            target = existing
+            try:
+                if all(ch != target for ch in parent.children):
+                    parent.children.link(target)
+            except Exception:
+                pass
+        else:
+            target = bpy.data.collections.new(target_name)
+            parent.children.link(target)
+
+    try:
+        source_color = getattr(source_root, "color_tag", None)
+        if source_color:
+            target.color_tag = source_color
+    except Exception:
+        pass
+
+    split_source_path = _derive_named_split_export_source_path(
+        source_root,
+        target_name,
+        export_mode,
+        export_directory,
+    )
+    _set_ie_source_path_tag(target, split_source_path)
+    return target
+
+def _flatten_named_split_legacy_visuals_collection(dest_root):
+    if dest_root is None:
+        return
+
+    visuals = None
+    for child in list(getattr(dest_root, "children", [])):
+        if _logical_collection_name(getattr(child, "name", "")) == _logical_collection_name("visuals"):
+            visuals = child
+            break
+    if visuals is None:
+        return
+
+    legacy_resolution = None
+    for child in list(getattr(visuals, "children", [])):
+        if _logical_collection_name(getattr(child, "name", "")) == _logical_collection_name("resolution 0"):
+            legacy_resolution = child
+            break
+
+    if legacy_resolution is None:
+        return
+
+    for obj in list(getattr(legacy_resolution, "objects", [])):
+        try:
+            _move_object_to_collection(obj, visuals)
+        except Exception:
+            pass
+    if len(legacy_resolution.objects) == 0 and len(legacy_resolution.children) == 0:
+        try:
+            bpy.data.collections.remove(legacy_resolution)
+        except Exception:
+            pass
+
+def _focus_created_split_objects(context, dest_root, created):
+    _ensure_collection_visible_in_view_layer(context, dest_root)
+    if not created:
+        return
+
+    _deselect_all_in_view_layer(context)
+    for obj in created:
+        try:
+            obj.hide_set(False)
+        except Exception:
+            pass
+        try:
+            obj.hide_viewport = False
+        except Exception:
+            pass
+        try:
+            obj.select_set(True)
+        except Exception:
+            pass
+    try:
+        context.view_layer.objects.active = created[0]
+    except Exception:
+        pass
+
+def _prepare_moved_objects_for_named_split(objects):
+    moved_set = {obj for obj in objects if obj is not None}
+    if not moved_set:
+        return
+
+    for obj in list(moved_set):
+        if obj is None:
+            continue
+
+        world_matrix = None
+        try:
+            world_matrix = obj.matrix_world.copy()
+        except Exception:
+            pass
+
+        try:
+            parent_obj = obj.parent
+        except Exception:
+            parent_obj = None
+
+        if parent_obj not in moved_set:
+            try:
+                obj.parent = None
+            except Exception:
+                pass
+            if world_matrix is not None:
+                try:
+                    obj.matrix_world = world_matrix
+                except Exception:
+                    pass
+
+        _clear_ie_source_path_tag(obj)
 
 def _ensure_split_collection_path(dest_root, source_path):
     current = dest_root
@@ -7563,6 +8086,17 @@ class CRAY_PG_IEFileItem(PropertyGroup):
 class CRAY_PG_IEPlannerSettings(PropertyGroup):
     import_files: CollectionProperty(type=CRAY_PG_IEFileItem)
     import_active_index: IntProperty(default=0)
+    quick_add_p3d_name: StringProperty(
+        name="P3D Name",
+        default="",
+        description="Type a model name like darkvalley_brick_farm_a and add the matching .p3d from NH_Objects",
+    )
+    quick_add_search_root: StringProperty(
+        name="NH_Objects Root",
+        default=r"P:\NH_Objects",
+        subtype="DIR_PATH",
+        description="Root folder where the addon searches for .p3d files by name",
+    )
     import_show_materials: BoolProperty(
         name="Show material textures after import",
         default=True,
@@ -7671,6 +8205,63 @@ class CRAY_OT_IE_AddFiles(Operator):
             self.report({"INFO"}, msg)
         return {"FINISHED"}
 
+
+class CRAY_OT_IE_AddByName(Operator):
+    bl_idname = "cray.ie_add_by_name"
+    bl_label = "Add By Name"
+    bl_description = "Find a .p3d in NH_Objects by model name and add it to the import list"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        st = context.scene.cray_ie_settings
+
+        model_name = (getattr(st, "quick_add_p3d_name", "") or "").strip()
+        model_key = _normalize_p3d_lookup_key(model_name)
+        if not model_key:
+            self.report({"ERROR"}, "Type a .p3d name like darkvalley_brick_farm_a")
+            return {"CANCELLED"}
+
+        search_root = bpy.path.abspath(getattr(st, "quick_add_search_root", "") or "")
+        search_root = os.path.abspath(search_root) if search_root else ""
+        if not search_root or not os.path.isdir(search_root):
+            self.report({"ERROR"}, "NH_Objects root folder was not found")
+            return {"CANCELLED"}
+
+        existing_root = _find_existing_scene_p3d_root(context.scene, model_key)
+        if existing_root is not None:
+            self.report({"WARNING"}, f"{existing_root.name} is already imported in the scene")
+            return {"CANCELLED"}
+
+        matches = _find_p3d_paths_by_name(search_root, model_key)
+        if not matches:
+            self.report({"ERROR"}, f"{_display_p3d_name(model_key)} was not found in {search_root}")
+            return {"CANCELLED"}
+
+        chosen = matches[0]
+        added = _planner_add_import_file(st, chosen)
+        st.quick_add_p3d_name = model_key
+
+        if not added:
+            self.report({"WARNING"}, f"{os.path.basename(chosen)} is already in the import list")
+            return {"CANCELLED"}
+
+        if len(matches) > 1:
+            print("=== Batch Import: multiple .p3d matches found ===")
+            print(f"Requested: {model_key}")
+            for path in matches:
+                print(path)
+            self.report(
+                {"WARNING"},
+                (
+                    f"Added {os.path.basename(chosen)}; found {len(matches)} matches, "
+                    f"used the first one (see System Console)"
+                ),
+            )
+            return {"FINISHED"}
+
+        self.report({"INFO"}, f"Added {os.path.basename(chosen)} to the import list")
+        return {"FINISHED"}
+
 class CRAY_OT_IE_RemoveFile(Operator):
     bl_idname = "cray.ie_remove_file"
     bl_label = "Remove"
@@ -7714,11 +8305,16 @@ class CRAY_OT_IE_ImportBatch(Operator):
             return {"CANCELLED"}
 
         imported = 0
+        skipped_existing = []
         failed = []
         used_op = None
 
         for it in st.import_files:
             fp = bpy.path.abspath(it.path)
+            existing_root = _find_existing_scene_p3d_root(context.scene, fp)
+            if existing_root is not None:
+                skipped_existing.append(f"{os.path.basename(fp)} -> already imported as {existing_root.name}")
+                continue
             if not fp or not os.path.isfile(fp):
                 failed.append(f"{it.path} -> file not found")
                 continue
@@ -7755,13 +8351,20 @@ class CRAY_OT_IE_ImportBatch(Operator):
         if st.disable_collections_after_import:
             _disable_all_collections_in_view_layer(context, st.disable_mode)
 
+        if skipped_existing:
+            print("=== Batch Import: Skipped already imported ===")
+            for item in skipped_existing:
+                print(item)
+
         if failed:
             print("=== Batch Import: Failures ===")
             for f in failed:
                 print(f)
-            self.report({"WARNING"}, f"Imported {imported}, failed {len(failed)} (see System Console)")
+            msg = f"Imported {imported}, skipped existing {len(skipped_existing)}, failed {len(failed)}"
+            self.report({"WARNING"}, msg + " (see System Console)")
         else:
-            self.report({"INFO"}, f"Imported {imported} file(s){' via ' + used_op if used_op else ''}")
+            msg = f"Imported {imported} file(s), skipped existing {len(skipped_existing)}"
+            self.report({"INFO"}, msg + (f" via {used_op}" if used_op else ""))
         return {"FINISHED"}
 
 class CRAY_OT_ModelSplitDuplicateToPart(Operator):
@@ -7836,27 +8439,7 @@ class CRAY_OT_ModelSplitDuplicateToPart(Operator):
                     pass
 
         _rewire_split_copy_object_refs(copies_by_source)
-        _ensure_collection_visible_in_view_layer(context, dest_root)
-
-        if created:
-            _deselect_all_in_view_layer(context)
-            for obj in created:
-                try:
-                    obj.hide_set(False)
-                except Exception:
-                    pass
-                try:
-                    obj.hide_viewport = False
-                except Exception:
-                    pass
-                try:
-                    obj.select_set(True)
-                except Exception:
-                    pass
-            try:
-                context.view_layer.objects.active = created[0]
-            except Exception:
-                pass
+        _focus_created_split_objects(context, dest_root, created)
 
         if failed:
             print("=== Model Split: Failures ===")
@@ -7868,6 +8451,143 @@ class CRAY_OT_ModelSplitDuplicateToPart(Operator):
             return {"CANCELLED"}
 
         msg = f"Created {len(created)} object copy/copies in {dest_root.name}"
+        if failed:
+            self.report({"WARNING"}, msg + f", failed {len(failed)} (see System Console)")
+        else:
+            self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+class CRAY_OT_ModelSplitDuplicateToNamedModel(Operator):
+    bl_idname = "cray.model_split_duplicate_to_named_model"
+    bl_label = "Create Named Standalone Model"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        st = context.scene.cray_model_split_settings
+        selected = [obj for obj in context.selected_objects if obj is not None]
+        if not selected:
+            self.report({"ERROR"}, "Select the separated objects you want to turn into a standalone model")
+            return {"CANCELLED"}
+
+        raw_model_name = (getattr(st, "named_model_name", "") or "").strip()
+        if not raw_model_name:
+            self.report({"ERROR"}, "Enter a new model name first")
+            return {"CANCELLED"}
+
+        if st.named_export_mode == "CUSTOM_DIR":
+            export_dir = bpy.path.abspath(getattr(st, "named_export_directory", "") or "")
+            if not export_dir:
+                self.report({"ERROR"}, "Choose an export folder for the new standalone model")
+                return {"CANCELLED"}
+            try:
+                os.makedirs(export_dir, exist_ok=True)
+            except Exception as e:
+                self.report({"ERROR"}, f"Failed to create export folder: {_fmt_exc(e)}")
+                return {"CANCELLED"}
+
+        missing_root = []
+        roots = {}
+        for obj in selected:
+            root = _find_p3d_root_collection_for_object(context, obj)
+            if root is None:
+                missing_root.append(obj.name)
+                continue
+            roots[root.as_pointer()] = root
+
+        if missing_root:
+            preview = ", ".join(missing_root[:5])
+            if len(missing_root) > 5:
+                preview += ", ..."
+            self.report({"ERROR"}, f"Selected objects are not inside a .p3d root collection: {preview}")
+            return {"CANCELLED"}
+
+        if len(roots) != 1:
+            root_names = ", ".join(sorted({root.name for root in roots.values()}, key=lambda x: x.lower()))
+            self.report({"ERROR"}, f"Select objects from exactly one .p3d root collection (found: {root_names})")
+            return {"CANCELLED"}
+
+        source_root = next(iter(roots.values()))
+        dest_root = _ensure_named_split_model_root_collection(
+            context,
+            source_root,
+            raw_model_name,
+            st.named_export_mode,
+            st.named_export_directory,
+        )
+        if dest_root is None:
+            self.report({"ERROR"}, "Could not create destination standalone model collection")
+            return {"CANCELLED"}
+
+        _flatten_named_split_legacy_visuals_collection(dest_root)
+
+        transfer_mode = str(getattr(st, "named_transfer_mode", "MOVE") or "MOVE").upper()
+
+        created = []
+        failed = []
+        copies_by_source = {}
+
+        if transfer_mode == "MOVE":
+            _prepare_moved_objects_for_named_split(selected)
+
+        for src_obj in selected:
+            source_path = _best_object_collection_path_under_root(source_root, src_obj)
+            if not source_path:
+                failed.append(f"{src_obj.name} -> collection path under {source_root.name} not found")
+                continue
+
+            dest_leaf = _ensure_split_collection_path(dest_root, source_path)
+            if dest_leaf is None:
+                failed.append(f"{src_obj.name} -> failed to create destination collection path")
+                continue
+
+            dup_obj = None
+            try:
+                if transfer_mode == "COPY":
+                    dup_obj = _duplicate_object_for_split(src_obj)
+                    if dup_obj is None:
+                        failed.append(f"{src_obj.name} -> failed to duplicate object")
+                        continue
+                    dest_leaf.objects.link(dup_obj)
+                    copies_by_source[src_obj] = dup_obj
+                    created.append(dup_obj)
+                else:
+                    _move_object_to_collection(src_obj, dest_leaf)
+                    created.append(src_obj)
+            except Exception as e:
+                failed.append(f"{src_obj.name} -> {_fmt_exc(e)}")
+                if transfer_mode == "COPY":
+                    try:
+                        if dup_obj is not None and bpy.data.objects.get(dup_obj.name) is not None and dup_obj.users == 0:
+                            bpy.data.objects.remove(dup_obj)
+                    except Exception:
+                        pass
+
+        if transfer_mode == "COPY":
+            _rewire_split_copy_object_refs(copies_by_source)
+
+        planner_added = False
+        planner_path = _resolve_collection_source_path(dest_root)
+        if planner_path:
+            try:
+                planner_added = _planner_add_import_file(context.scene.cray_ie_settings, planner_path)
+            except Exception:
+                planner_added = False
+
+        _focus_created_split_objects(context, dest_root, created)
+
+        if failed:
+            print("=== Model Split Named Model: Failures ===")
+            for item in failed:
+                print(item)
+
+        if not created:
+            self.report({"ERROR"}, "No standalone model objects were created")
+            return {"CANCELLED"}
+
+        action_word = "Copied" if transfer_mode == "COPY" else "Moved"
+        msg = f"{action_word} {len(created)} object(s) into {dest_root.name} with preserved collection paths"
+        if planner_path:
+            msg += ", added to Import/Export list" if planner_added else ", already in Import/Export list"
         if failed:
             self.report({"WARNING"}, msg + f", failed {len(failed)} (see System Console)")
         else:
@@ -8701,6 +9421,449 @@ def _repair_invalid_a3ob_selection_links(obj):
         bm.free()
 
 
+_FIX_LIST_LOD_KEY_ALIASES = {
+    "geometry": "geometry",
+    "viewgeometry": "geometryview",
+    "geometryview": "geometryview",
+    "firegeometry": "geometryfire",
+    "geometryfire": "geometryfire",
+}
+_FIX_LIST_OBJECT_LOD_MAP = {
+    "6": "geometry",
+    "14": "geometryview",
+    "15": "geometryfire",
+}
+
+
+def _normalize_fix_list_model_name(name: str) -> str:
+    raw = (name or "").strip()
+    if not raw:
+        return ""
+    raw = os.path.basename(raw.replace("\\", "/"))
+    raw = _strip_blender_numeric_suffix(raw)
+    return raw.lower()
+
+
+def _normalize_fix_list_lod_key(name: str) -> str:
+    key = re.sub(r"[^a-z]+", "", (name or "").strip().lower())
+    return _FIX_LIST_LOD_KEY_ALIASES.get(key, "")
+
+
+def _parse_fix_list_file(filepath: str):
+    entries = {}
+    current_model_key = ""
+
+    with open(filepath, "r", encoding="utf-8-sig") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line:
+                continue
+
+            if re.search(r"\.p3d\s*$", line, flags=re.IGNORECASE):
+                display_name = os.path.basename(line.replace("\\", "/")).strip()
+                model_key = _normalize_fix_list_model_name(display_name or line)
+                if not model_key:
+                    current_model_key = ""
+                    continue
+                current_model_key = model_key
+                rec = entries.setdefault(
+                    current_model_key,
+                    {
+                        "display_name": display_name or model_key,
+                        "lod_groups": {},
+                    },
+                )
+                if display_name:
+                    rec["display_name"] = display_name
+                continue
+
+            if not current_model_key or ":" not in line:
+                continue
+
+            lod_raw, groups_raw = line.split(":", 1)
+            lod_key = _normalize_fix_list_lod_key(lod_raw)
+            if not lod_key:
+                continue
+
+            group_names = []
+            for item in groups_raw.split(","):
+                token = item.strip().rstrip(";").strip()
+                if token:
+                    group_names.append(token)
+
+            if not group_names:
+                continue
+
+            lod_groups = entries[current_model_key]["lod_groups"].setdefault(lod_key, set())
+            lod_groups.update(group_names)
+
+    return entries
+
+
+def _detect_fix_list_lod_key(obj) -> str:
+    if obj is None or obj.type != "MESH":
+        return ""
+
+    if hasattr(obj, "a3ob_properties_object"):
+        try:
+            lod_token = str(getattr(obj.a3ob_properties_object, "lod", "") or "").strip()
+        except Exception:
+            lod_token = ""
+        if lod_token in _FIX_LIST_OBJECT_LOD_MAP:
+            return _FIX_LIST_OBJECT_LOD_MAP[lod_token]
+
+    return _normalize_fix_list_lod_key(_strip_blender_numeric_suffix(getattr(obj, "name", "") or ""))
+
+
+def _select_fix_list_groups_on_active_lod(context, obj, group_names):
+    if obj is None or obj.type != "MESH" or obj.data is None:
+        raise RuntimeError("Active object must be a mesh")
+
+    group_lookup = {
+        (vg.name or "").strip().lower(): vg
+        for vg in obj.vertex_groups
+        if (vg.name or "").strip()
+    }
+
+    matched_groups = []
+    missing_groups = []
+    target_group_indices = set()
+    for group_name in group_names:
+        key = (group_name or "").strip().lower()
+        vg = group_lookup.get(key)
+        if vg is None:
+            missing_groups.append(group_name)
+            continue
+        matched_groups.append(vg.name)
+        target_group_indices.add(int(vg.index))
+
+    if not target_group_indices:
+        return {
+            "matched_groups": [],
+            "missing_groups": missing_groups,
+            "selected_vert_count": 0,
+        }
+
+    _activate_object_vertex_edit(context, obj)
+    context.tool_settings.mesh_select_mode = (True, False, False)
+
+    try:
+        bpy.ops.mesh.reveal(select=False)
+    except Exception:
+        pass
+    try:
+        bpy.ops.mesh.select_all(action="DESELECT")
+    except Exception:
+        pass
+
+    used_vertex_group_ops = False
+    lower_lookup = {
+        (vg.name or "").strip().lower(): vg
+        for vg in obj.vertex_groups
+        if (vg.name or "").strip()
+    }
+    for group_name in matched_groups:
+        vg = lower_lookup.get((group_name or "").strip().lower())
+        if vg is None:
+            continue
+        try:
+            obj.vertex_groups.active_index = int(vg.index)
+            bpy.ops.object.vertex_group_select()
+            used_vertex_group_ops = True
+        except Exception:
+            used_vertex_group_ops = False
+            break
+
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.verts.ensure_lookup_table()
+    layer = bm.verts.layers.deform.verify()
+
+    selected_vert_count = sum(1 for vert in bm.verts if vert.select)
+    if not used_vertex_group_ops or selected_vert_count == 0:
+        selected_vert_count = 0
+        for vert in bm.verts:
+            deform = vert[layer]
+            is_selected = any(float(deform.get(group_index, 0.0)) > 0.0 for group_index in target_group_indices)
+            vert.select = is_selected
+            if is_selected:
+                selected_vert_count += 1
+
+        for edge in bm.edges:
+            edge.select = False
+        for face in bm.faces:
+            face.select = False
+
+        bm.select_flush_mode()
+
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+    try:
+        obj.update_from_editmode()
+    except Exception:
+        pass
+    try:
+        obj.data.update()
+    except Exception:
+        pass
+    _tag_redraw_all_areas(context)
+
+    return {
+        "matched_groups": sorted(set(matched_groups), key=str.lower),
+        "missing_groups": missing_groups,
+        "selected_vert_count": selected_vert_count,
+    }
+
+
+def _delete_selected_components_keep_vertices(context, mesh):
+    if mesh is None:
+        raise RuntimeError("Mesh data is not available")
+
+    bm = bmesh.from_edit_mesh(mesh)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+
+    explicit_faces = {face for face in bm.faces if face.is_valid and face.select}
+    explicit_edges = {edge for edge in bm.edges if edge.is_valid and edge.select}
+    selected_verts = {vert for vert in bm.verts if vert.is_valid and vert.select}
+
+    for edge in explicit_edges:
+        selected_verts.update(vert for vert in edge.verts if vert.is_valid)
+    for face in explicit_faces:
+        selected_verts.update(vert for vert in face.verts if vert.is_valid)
+
+    if not selected_verts and not explicit_edges and not explicit_faces:
+        raise RuntimeError("Select at least one vertex, edge or face in Edit Mode")
+
+    faces_to_delete = {face for face in explicit_faces if face.is_valid}
+    faces_to_delete.update(
+        face
+        for face in bm.faces
+        if face.is_valid and all(vert in selected_verts for vert in face.verts)
+    )
+
+    edges_to_delete = {edge for edge in explicit_edges if edge.is_valid}
+    edges_to_delete.update(
+        edge
+        for edge in bm.edges
+        if edge.is_valid and all(vert in selected_verts for vert in edge.verts)
+    )
+
+    deleted_face_count = len(faces_to_delete)
+    if faces_to_delete:
+        bmesh.ops.delete(bm, geom=list(faces_to_delete), context="FACES")
+
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+
+    valid_edges_to_delete = [edge for edge in edges_to_delete if edge.is_valid]
+    deleted_edge_count = len(valid_edges_to_delete)
+    if valid_edges_to_delete:
+        bmesh.ops.delete(bm, geom=valid_edges_to_delete, context="EDGES")
+
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+
+    kept_verts = [vert for vert in selected_verts if vert.is_valid]
+    context.tool_settings.mesh_select_mode = (True, False, False)
+    for face in bm.faces:
+        face.select = False
+    for edge in bm.edges:
+        edge.select = False
+    for vert in bm.verts:
+        vert.select = False
+    for vert in kept_verts:
+        vert.select = True
+
+    bm.select_flush_mode()
+    bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=True)
+
+    return {
+        "deleted_faces": deleted_face_count,
+        "deleted_edges": deleted_edge_count,
+        "kept_verts": len(kept_verts),
+    }
+
+
+class CRAY_OT_OpenFixListFile(Operator):
+    bl_idname = "cray.open_fix_list_file"
+    bl_label = "Choose Fix List"
+    bl_description = "Pick a structured .txt file with bad component names"
+    bl_options = {"REGISTER", "UNDO"}
+
+    filepath: StringProperty(
+        name="Fix List File",
+        description="Choose a .txt file with bad component names per .p3d and LOD",
+        subtype="FILE_PATH",
+    )
+    filter_glob: StringProperty(default="*.txt", options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        del event
+
+        ts = context.scene.cray_texreplace_settings
+        current_path = bpy.path.abspath(getattr(ts, "fix_list_path", "") or "")
+        if current_path and os.path.isfile(current_path):
+            self.filepath = current_path
+        else:
+            blend_dir = bpy.path.abspath("//")
+            if blend_dir and os.path.isdir(blend_dir):
+                self.filepath = os.path.join(blend_dir, "")
+            else:
+                self.filepath = os.path.join(os.getcwd(), "")
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        ts = context.scene.cray_texreplace_settings
+
+        try:
+            filepath = os.path.abspath(bpy.path.abspath(self.filepath or ""))
+        except Exception as e:
+            self.report({"ERROR"}, f"Could not resolve fix-list path: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+
+        if not filepath or not os.path.isfile(filepath):
+            self.report({"ERROR"}, "Choose an existing .txt file")
+            return {"CANCELLED"}
+
+        if os.path.splitext(filepath)[1].lower() != ".txt":
+            self.report({"ERROR"}, "Choose a .txt file")
+            return {"CANCELLED"}
+
+        ts.fix_list_path = filepath
+        self.report({"INFO"}, f"Fix list set: {os.path.basename(filepath)}")
+        return {"FINISHED"}
+
+
+class CRAY_OT_SelectFixListComponentsOnActiveLOD(Operator):
+    bl_idname = "cray.select_fix_list_components_on_active_lod"
+    bl_label = "Select Bad Components From List"
+    bl_description = (
+        "Read the structured fix-list .txt, match the active object's .p3d root collection name, "
+        "and select bad component vertices for the active Geometry/View Geometry/Fire Geometry LOD"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        ts = context.scene.cray_texreplace_settings
+        active_obj = context.view_layer.objects.active
+        if active_obj is None or active_obj.type != "MESH" or active_obj.data is None:
+            self.report({"ERROR"}, "Active object must be a mesh")
+            return {"CANCELLED"}
+
+        filepath = bpy.path.abspath(getattr(ts, "fix_list_path", "") or "")
+        if not filepath:
+            self.report({"ERROR"}, "Choose a fix-list .txt file first")
+            return {"CANCELLED"}
+        filepath = os.path.abspath(filepath)
+        if not os.path.isfile(filepath):
+            self.report({"ERROR"}, "Fix-list file does not exist")
+            return {"CANCELLED"}
+
+        root_collection = _find_p3d_root_collection_for_object(context, active_obj)
+        if root_collection is None:
+            self.report({"ERROR"}, "Active object is not inside a .p3d root collection")
+            return {"CANCELLED"}
+
+        lod_key = _detect_fix_list_lod_key(active_obj)
+        if lod_key not in {"geometry", "geometryview", "geometryfire"}:
+            self.report({"ERROR"}, "Active object must be Geometry, View Geometry or Fire Geometry")
+            return {"CANCELLED"}
+
+        model_key = _normalize_fix_list_model_name(getattr(root_collection, "name", "") or "")
+        if not model_key:
+            self.report({"ERROR"}, "Could not normalize the .p3d root collection name")
+            return {"CANCELLED"}
+
+        try:
+            entries = _parse_fix_list_file(filepath)
+        except Exception as e:
+            self.report({"ERROR"}, f"Failed to parse fix-list: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+
+        entry = entries.get(model_key)
+        if entry is None:
+            self.report({"WARNING"}, f"No fix-list entry found for {root_collection.name}")
+            return {"CANCELLED"}
+
+        target_groups = sorted(entry.get("lod_groups", {}).get(lod_key, set()), key=str.lower)
+        if not target_groups:
+            lod_label = {
+                "geometry": "Geometry",
+                "geometryview": "View Geometry",
+                "geometryfire": "Fire Geometry",
+            }.get(lod_key, lod_key)
+            self.report({"INFO"}, f"No bad components listed for {entry['display_name']} / {lod_label}")
+            return {"FINISHED"}
+
+        try:
+            stats = _select_fix_list_groups_on_active_lod(context, active_obj, target_groups)
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        matched_count = len(stats["matched_groups"])
+        missing_count = len(stats["missing_groups"])
+        selected_vert_count = int(stats["selected_vert_count"])
+
+        if matched_count == 0:
+            self.report({"WARNING"}, f"Listed groups were not found on {active_obj.name}")
+            return {"CANCELLED"}
+
+        msg = (
+            f"{entry['display_name']} / {active_obj.name}: "
+            f"matched {matched_count} group(s), selected {selected_vert_count} vertex/vertices"
+        )
+        if missing_count > 0:
+            print("=== Fix List: Missing vertex groups ===")
+            print(f"Model: {entry['display_name']}")
+            print(f"LOD: {active_obj.name}")
+            for group_name in stats["missing_groups"]:
+                print(group_name)
+            msg += f", missing {missing_count} group(s) (see System Console)"
+
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
+class CRAY_OT_DeleteSelectedComponentsKeepVertices(Operator):
+    bl_idname = "cray.delete_selected_components_keep_vertices"
+    bl_label = "Delete Faces/Edges Keep Verts"
+    bl_description = (
+        "On the active mesh in Edit Mode, delete faces and edges belonging to the current selection "
+        "while keeping the vertices"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return context.mode == "EDIT_MESH" and obj is not None and obj.type == "MESH"
+
+    def execute(self, context):
+        obj = context.active_object
+        if obj is None or obj.type != "MESH" or obj.data is None:
+            self.report({"ERROR"}, "Active object must be a mesh in Edit Mode")
+            return {"CANCELLED"}
+
+        try:
+            stats = _delete_selected_components_keep_vertices(context, obj.data)
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        self.report(
+            {"INFO"},
+            (
+                f"{obj.name}: deleted {stats['deleted_faces']} face(s) and "
+                f"{stats['deleted_edges']} edge(s), kept {stats['kept_verts']} vertex/vertices"
+            ),
+        )
+        return {"FINISHED"}
+
+
 class CRAY_OT_RepairA3OBSelections(Operator):
     bl_idname = "cray.repair_a3ob_selections"
     bl_label = "Repair Invalid A3OB Selections"
@@ -8956,8 +10119,23 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
 
         import_basename_map = _build_ie_import_basename_map(st)
 
+        candidate_roots = []
+        seen_candidate_ptrs = set()
+        for col in list(context.scene.collection.children) + list(_iter_p3d_root_collections(context.scene)):
+            if col is None:
+                continue
+            try:
+                ptr = col.as_pointer()
+            except Exception:
+                ptr = None
+            if ptr in seen_candidate_ptrs:
+                continue
+            if ptr is not None:
+                seen_candidate_ptrs.add(ptr)
+            candidate_roots.append(col)
+
         candidates = []
-        for col in context.scene.collection.children:
+        for col in candidate_roots:
             if not _collection_has_any_mesh(col):
                 continue
             source_hint = _resolve_collection_source_path(col, import_basename_map)
@@ -9007,6 +10185,21 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
             else:
                 filename = _export_filename_for_collection(col, source_path)
                 filepath = bpy.path.abspath(os.path.join(export_dir, filename))
+
+            resolution_conflicts = _collect_resolution_lod_index_conflicts(col, objects)
+            if resolution_conflicts:
+                _report_resolution_lod_index_conflicts_in_console(col.name, filepath, resolution_conflicts)
+                failed.append(
+                    f"{col.name} -> duplicate Resolution LOD index in one logical collection path "
+                    f"(see System Console)"
+                )
+                continue
+
+            ngon_issues = _collect_export_ngon_issues(col, objects)
+            if ngon_issues:
+                _report_export_ngon_issues_in_console(col.name, filepath, ngon_issues)
+                failed.append(f"{col.name} -> n-gon detected in exportable LOD mesh (see System Console)")
+                continue
 
             target_key = os.path.normcase(os.path.normpath(filepath))
             if st.export_mode == "SOURCE":
@@ -9410,6 +10603,19 @@ class CRAY_PT_FixesPanel(Panel):
         box.prop(ts, "fix_mesh_center_to_origin")
         box.operator("cray.fix_mesh_hierarchy", text="Fix Mesh/Hierarchy", icon="MOD_REMESH")
         box.separator()
+        box.label(text="Component fixes from .txt", icon="FILE_TEXT")
+        file_row = box.row(align=True)
+        file_row.prop(ts, "fix_list_path", text="")
+        file_row.operator("cray.open_fix_list_file", text="", icon="FILE_FOLDER")
+        box.operator("cray.select_fix_list_components_on_active_lod", icon="GROUP_VERTEX")
+        cleanup_col = box.column(align=True)
+        cleanup_col.enabled = (
+            context.mode == "EDIT_MESH"
+            and context.active_object is not None
+            and context.active_object.type == "MESH"
+        )
+        cleanup_col.operator("cray.delete_selected_components_keep_vertices", icon="MESH_DATA")
+        box.separator()
         box.label(text="Edit Mode planar search", icon="FACESEL")
         edit_col = box.column(align=True)
         edit_col.enabled = (
@@ -9418,8 +10624,8 @@ class CRAY_PT_FixesPanel(Panel):
             and context.active_object.type == "MESH"
         )
         row = edit_col.row(align=True)
-        row.prop(ts, "split_planar_ngon_vertex_count", text="N")
-        row.operator("cray.select_split_planar_ngons", text="Find Flat N+", icon="VIEWZOOM")
+        row.operator("cray.select_split_planar_ngons", text="Find Trash", icon="TRASH")
+        row.operator("cray.select_coplanar_plate_islands", text="Find Flat Plates", icon="MESH_GRID")
         tol_row = edit_col.row(align=True)
         tol_row.prop(ts, "split_planar_ngon_angle_tolerance", text="Angle")
         tol_row.prop(ts, "split_planar_ngon_plane_tolerance", text="Plane")
@@ -9442,6 +10648,12 @@ class CRAY_PT_ImportExportPlannerPanel(Panel):
         row.operator("cray.ie_add_files", icon="ADD")
         row.operator("cray.ie_remove_file", icon="REMOVE")
         row.operator("cray.ie_clear_files", icon="TRASH")
+        ibox.separator()
+        ibox.label(text="Quick Add From NH_Objects", icon="VIEWZOOM")
+        ibox.prop(st, "quick_add_search_root")
+        quick_row = ibox.row(align=True)
+        quick_row.prop(st, "quick_add_p3d_name", text="")
+        quick_row.operator("cray.ie_add_by_name", text="Add By Name", icon="ADD")
         ibox.template_list("CRAY_UL_ie_files", "", st, "import_files", st, "import_active_index", rows=6)
         ibox.operator("cray.ie_import_batch", icon="FILE_REFRESH")
         ibox.separator()
@@ -9485,6 +10697,18 @@ class CRAY_PT_ModelSplitPanel(Panel):
         box.label(text="Select separated objects from one .p3d root", icon="INFO")
         box.label(text="Original collection stays unchanged", icon="INFO")
         box.operator("cray.model_split_duplicate_to_part", icon="DUPLICATE")
+
+        named_box = layout.box()
+        named_box.label(text="Separate -> Named Standalone Model", icon="EXPORT")
+        named_box.prop(st, "named_model_name")
+        named_box.prop(st, "named_transfer_mode")
+        named_box.prop(st, "named_export_mode")
+        row = named_box.row()
+        row.enabled = (st.named_export_mode == "CUSTOM_DIR")
+        row.prop(st, "named_export_directory")
+        named_box.label(text="Preserves original paths like Visuals / Geometries / Misc / Point clouds", icon="INFO")
+        named_box.label(text="Saved export path works with Import/Export -> Back to source", icon="INFO")
+        named_box.operator("cray.model_split_duplicate_to_named_model", icon="DUPLICATE")
 
 class CRAY_PT_TextureReplacePanel(Panel):
     bl_idname = "VIEW3D_PT_cray_texreplace"
@@ -9546,8 +10770,12 @@ classes = (
     CRAY_OT_CopySelectedFacesToRoadway,
     CRAY_OT_WeldRoadwayVertices,
     CRAY_OT_OpenRoadwayMaterialFolder,
+    CRAY_OT_OpenFixListFile,
+    CRAY_OT_SelectFixListComponentsOnActiveLOD,
+    CRAY_OT_DeleteSelectedComponentsKeepVertices,
     CRAY_OT_SelectIsolatedVertices,
     CRAY_OT_SelectSplitPlanarNgons,
+    CRAY_OT_SelectCoplanarPlateIslands,
     CRAY_OT_EnsureColliderLOD,
     CRAY_OT_BuildCollider,
 
@@ -9571,10 +10799,12 @@ classes = (
     CRAY_OT_AssetLibraryBuildFromFiles,
     CRAY_OT_AssetLibraryClear,
     CRAY_OT_IE_AddFiles,
+    CRAY_OT_IE_AddByName,
     CRAY_OT_IE_RemoveFile,
     CRAY_OT_IE_ClearFiles,
     CRAY_OT_IE_ImportBatch,
     CRAY_OT_ModelSplitDuplicateToPart,
+    CRAY_OT_ModelSplitDuplicateToNamedModel,
     CRAY_OT_ConvertSelectedToProxies,
     CRAY_OT_FixShadingByPipeline,
     CRAY_OT_RepairA3OBSelections,
