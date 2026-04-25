@@ -915,9 +915,9 @@ class CRAY_PG_SnapSettings(PropertyGroup):
     edge_axis: EnumProperty(
         name="Snap Axis",
         items=(
-            ("X", "X", "Use X in the snap point name pattern"),
-            ("Y", "Y", "Use Y in the snap point name pattern"),
-            ("Z", "Z", "Use Z in the snap point name pattern"),
+            ("X", "X", "Use X in the snap point name pattern and as the preferred 0/1 sort axis"),
+            ("Y", "Y", "Use Y in the snap point name pattern and as the preferred 0/1 sort axis"),
+            ("Z", "Z", "Use Z in the snap point name pattern and as the preferred 0/1 sort axis"),
         ),
         default="X",
     )
@@ -1854,6 +1854,58 @@ def _set_memory_lod_a3ob_props(memory_obj):
 def _ensure_memory_lod_object(context, source_obj, preferred_obj=None):
     return _MemoryLodManager(context, source_obj).ensure_object(preferred_obj=preferred_obj)
 
+def _snap_target_prop_names(side_token: str):
+    side = (side_token or "a").lower()
+    if side == "v":
+        return "paired_object", "paired_memory_object", "Target (V)", "Memory LOD (V)"
+    return "source_object", "memory_object", "Target (A)", "Memory LOD (A)"
+
+def _get_snap_target_object(settings, side_token: str, allow_memory_fallback: bool = False):
+    target_prop, memory_prop, _target_label, _memory_label = _snap_target_prop_names(side_token)
+    obj = getattr(settings, target_prop, None)
+    if obj is None and allow_memory_fallback:
+        obj = getattr(settings, memory_prop, None)
+    return obj
+
+def _set_snap_memory_object(settings, side_token: str, memory_obj):
+    _target_prop, memory_prop, _target_label, _memory_label = _snap_target_prop_names(side_token)
+    try:
+        setattr(settings, memory_prop, memory_obj)
+    except Exception:
+        pass
+
+def _snap_target_memory_scope_key(context, target_obj):
+    if target_obj is None:
+        return None
+
+    root_collection = _find_p3d_root_collection_for_object(context, target_obj)
+    if root_collection is not None:
+        try:
+            return ("p3d", root_collection.as_pointer())
+        except Exception:
+            return ("p3d", root_collection.name)
+
+    for col in getattr(target_obj, "users_collection", []):
+        try:
+            return ("collection", col.as_pointer())
+        except Exception:
+            return ("collection", col.name)
+
+    try:
+        return ("object", target_obj.as_pointer())
+    except Exception:
+        return ("object", target_obj.name)
+
+def _ensure_memory_lod_for_snap_target(context, target_obj):
+    if target_obj is None or target_obj.type != "MESH" or target_obj.data is None:
+        raise RuntimeError("Target Object must be a mesh")
+
+    root_collection = _find_p3d_root_collection_for_object(context, target_obj)
+    if root_collection is not None:
+        return _MemoryLodManager(context, source_obj=target_obj, parent_collection=root_collection).ensure_object()
+
+    return _MemoryLodManager(context, source_obj=target_obj).ensure_object()
+
 class _MemoryLodManager:
     OBJECT_NAME = "Memory"
 
@@ -1957,44 +2009,42 @@ class _MemoryLodManager:
         self.apply_a3ob_props(memory_obj)
         return memory_obj
 
-def _sort_snap_pair_world_points(context, world_points):
+def _snap_axis_index_or_none(axis_token: str):
+    axis = (axis_token or "").strip().upper()
+    if axis == "X":
+        return 0
+    if axis == "Y":
+        return 1
+    if axis == "Z":
+        return 2
+    return None
+
+def _snap_pair_axis_order(points, preferred_axis_token: str = None):
+    if len(points) != 2:
+        return [0, 1, 2]
+
+    delta = points[1] - points[0]
+    axes_by_delta = sorted(range(3), key=lambda idx: (-abs(delta[idx]), idx))
+    preferred_axis = _snap_axis_index_or_none(preferred_axis_token)
+    max_delta = abs(delta[axes_by_delta[0]]) if axes_by_delta else 0.0
+    axis_epsilon = max(1e-6, max_delta * 1e-4)
+    if preferred_axis is not None and abs(delta[preferred_axis]) > axis_epsilon:
+        return [preferred_axis] + [idx for idx in axes_by_delta if idx != preferred_axis]
+    return axes_by_delta
+
+def _sort_snap_pair_world_points(context, world_points, preferred_axis_token: str = None):
     points = [p.copy() for p in world_points]
     if len(points) != 2:
         return points
 
-    area = getattr(context, "area", None)
-    space = getattr(context, "space_data", None)
-    region_3d = getattr(space, "region_3d", None) if space is not None else None
-    if area is not None and area.type == "VIEW_3D" and region_3d is not None:
-        try:
-            view_points = [(region_3d.view_matrix @ p.to_4d()).to_3d() for p in points]
-            delta = view_points[1] - view_points[0]
-            primary_axis = 0 if abs(delta[0]) >= abs(delta[1]) else 1
-            secondary_axis = 1 - primary_axis
-            if abs(delta[primary_axis]) > 1e-6 or abs(delta[secondary_axis]) > 1e-6:
-                indexed = list(zip(points, view_points))
-                indexed.sort(
-                    key=lambda item: (
-                        item[1][primary_axis],
-                        item[1][secondary_axis],
-                        item[0][2],
-                        item[0][1],
-                        item[0][0],
-                    )
-                )
-                return [item[0] for item in indexed]
-        except Exception:
-            pass
-
-    delta = points[1] - points[0]
-    axis_order = sorted(range(3), key=lambda idx: abs(delta[idx]), reverse=True)
+    axis_order = _snap_pair_axis_order(points, preferred_axis_token=preferred_axis_token)
     points.sort(key=lambda point: tuple(point[idx] for idx in axis_order) + (point[0], point[1], point[2]))
     return points
 
-def _create_snap_pair_in_memory(context, memory_obj, world_points, snap_group: str, snap_side: str, replace_existing: bool):
+def _create_snap_pair_in_memory(context, memory_obj, world_points, snap_group: str, snap_side: str, replace_existing: bool, axis_token: str = None):
     mesh = memory_obj.data
     to_local = memory_obj.matrix_world.inverted()
-    ordered_world_points = _sort_snap_pair_world_points(context, world_points)
+    ordered_world_points = _sort_snap_pair_world_points(context, world_points, preferred_axis_token=axis_token)
     local_points = [to_local @ p for p in ordered_world_points]
 
     base_idx = len(mesh.vertices)
@@ -2102,6 +2152,10 @@ class _SnapPointNamePattern:
 
 class _SnapPointPairBuilder:
     _SIDE_LABELS = {
+        "a": "Target (A)",
+        "v": "Target (V)",
+    }
+    _MEMORY_LABELS = {
         "a": "Memory LOD (A)",
         "v": "Memory LOD (V)",
     }
@@ -2116,17 +2170,22 @@ class _SnapPointPairBuilder:
             raise RuntimeError(f"{label} must be a mesh")
         return obj
 
-    def resolve_memory_a(self):
-        memory_obj = getattr(self.settings, "memory_object", None)
-        if memory_obj is None:
-            raise RuntimeError("Pick or create Memory LOD (A) first")
-        return self._require_mesh_object(memory_obj, "Memory LOD (A)")
+    def resolve_target_object(self, side_token: str):
+        side = (side_token or "a").lower()
+        target_obj = _get_snap_target_object(self.settings, side, allow_memory_fallback=True)
+        label = self._SIDE_LABELS.get(side, "Target")
+        if target_obj is None:
+            raise RuntimeError(f"Pick {label} first")
+        return self._require_mesh_object(target_obj, label)
 
-    def resolve_memory_v(self):
-        memory_obj = getattr(self.settings, "paired_memory_object", None)
-        if memory_obj is None:
-            raise RuntimeError("Pick or create Memory LOD (V) first")
-        return self._require_mesh_object(memory_obj, "Memory LOD (V)")
+    def resolve_memory_object(self, side_token: str):
+        side = (side_token or "a").lower()
+        target_obj = self.resolve_target_object(side)
+        memory_obj = _ensure_memory_lod_for_snap_target(self.context, target_obj)
+        memory_label = self._MEMORY_LABELS.get(side, "Memory LOD")
+        memory_obj = self._require_mesh_object(memory_obj, memory_label)
+        _set_snap_memory_object(self.settings, side, memory_obj)
+        return target_obj, memory_obj
 
     def ensure_object_mode(self):
         if self.context.mode == "OBJECT":
@@ -2145,24 +2204,24 @@ class _SnapPointPairBuilder:
         if len(world_points) != 2:
             raise RuntimeError("Select exactly 2 vertices in Edit Mode")
 
-        return _sort_snap_pair_world_points(self.context, world_points)
+        return _sort_snap_pair_world_points(self.context, world_points, preferred_axis_token=self.naming.axis_token)
 
     def create_dual_model_set(self):
         world_points = self.collect_selected_points()
-        memory_a = self.resolve_memory_a()
-        memory_v = self.resolve_memory_v()
+        target_a, memory_a = self.resolve_memory_object("a")
+        target_v, memory_v = self.resolve_memory_object("v")
         if memory_a == memory_v:
-            raise RuntimeError("Pick two different Memory LOD objects")
+            raise RuntimeError("Choose targets from two different model roots")
 
         self.ensure_object_mode()
         self.settings.snap_p3d_name = self.naming.p3d_name
 
         created_names = []
         targets = (
-            ("a", memory_a),
-            ("v", memory_v),
+            ("a", target_a, memory_a),
+            ("v", target_v, memory_v),
         )
-        for side_token, memory_obj in targets:
+        for side_token, _target_obj, memory_obj in targets:
             created_names.extend(
                 _create_named_snap_points_in_memory(
                     memory_obj=memory_obj,
@@ -2306,11 +2365,40 @@ def _iter_p3d_root_collections(scene):
 
 class CRAY_OT_EnsureMemoryLOD(Operator):
     bl_idname = "cray.ensure_memory_lod"
-    bl_label = "Create/Find Memory LODs"
+    bl_label = "Create/Find Point clouds > Memory"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         ss = context.scene.cray_snap_settings
+        prepared = []
+        prepared_scopes = set()
+
+        for side_token in ("a", "v"):
+            target_obj = _get_snap_target_object(ss, side_token, allow_memory_fallback=False)
+            if target_obj is None:
+                continue
+
+            _target_prop, _memory_prop, target_label, _memory_label = _snap_target_prop_names(side_token)
+            if target_obj.type != "MESH" or target_obj.data is None:
+                self.report({"ERROR"}, f"{target_label} must be a mesh")
+                return {"CANCELLED"}
+
+            scope_key = _snap_target_memory_scope_key(context, target_obj)
+            if scope_key in prepared_scopes:
+                continue
+
+            memory_obj = _ensure_memory_lod_for_snap_target(context, target_obj)
+            _set_snap_memory_object(ss, side_token, memory_obj)
+            prepared_scopes.add(scope_key)
+            prepared.append(f"{target_obj.name} -> {memory_obj.name}")
+
+        if prepared:
+            preview = ", ".join(prepared[:3])
+            if len(prepared) > 3:
+                preview = f"{preview}, ..."
+            self.report({"INFO"}, f"Prepared {len(prepared)} target Memory LODs: {preview}")
+            return {"FINISHED"}
+
         root_collections = _iter_p3d_root_collections(context.scene)
         if not root_collections:
             self.report({"ERROR"}, "No .p3d collections found in the scene")
@@ -2331,7 +2419,7 @@ class CRAY_OT_CreateSnapPairFromModelEdge(Operator):
     bl_idname = "cray.create_snap_pair_from_model_edge"
     bl_label = "Create Snap Points"
     bl_description = (
-        "Copy 2 selected vertices from the active Edit Mode mesh into both chosen Memory LODs"
+        "Copy 2 selected vertices from the active Edit Mode mesh into Point clouds > Memory of both chosen targets"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -2343,7 +2431,10 @@ class CRAY_OT_CreateSnapPairFromModelEdge(Operator):
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
 
-        target_names = ", ".join(f"{side.upper()}: {memory_obj.name}" for side, memory_obj in targets)
+        target_names = ", ".join(
+            f"{side.upper()}: {target_obj.name} -> {memory_obj.name}"
+            for side, target_obj, memory_obj in targets
+        )
         self.report(
             {"INFO"},
             (
@@ -2472,6 +2563,7 @@ class CRAY_OT_SnapBatchProcess(Operator):
                     snap_group=snap_group,
                     snap_side=ss.snap_side,
                     replace_existing=ss.replace_existing,
+                    axis_token=ss.edge_axis,
                 )
             except Exception as e:
                 fail_count += 1
@@ -10406,17 +10498,29 @@ class CRAY_PT_SnapPointsPanel(Panel):
         layout = self.layout
         ss = context.scene.cray_snap_settings
         preview_pattern = _SnapPointNamePattern.from_preview_settings(ss)
+        target_a = _get_snap_target_object(ss, "a", allow_memory_fallback=False)
+        target_v = _get_snap_target_object(ss, "v", allow_memory_fallback=False)
+        targets_are_meshes = bool(
+            target_a is not None and
+            target_v is not None and
+            target_a.type == "MESH" and
+            target_v.type == "MESH" and
+            target_a.data is not None and
+            target_v.data is not None
+        )
+        target_scope_a = _snap_target_memory_scope_key(context, target_a)
+        target_scope_v = _snap_target_memory_scope_key(context, target_v)
+        same_target_scope = bool(target_scope_a is not None and target_scope_a == target_scope_v)
         can_create = bool(
-            ss.memory_object is not None and
-            ss.paired_memory_object is not None and
-            ss.memory_object != ss.paired_memory_object
+            targets_are_meshes and
+            not same_target_scope
         )
 
         col = layout.column(align=True)
         col.label(text="Target")
-        col.prop(ss, "memory_object", text="")
+        col.prop(ss, "source_object", text="A Target")
         col.separator()
-        col.prop(ss, "paired_memory_object", text="")
+        col.prop(ss, "paired_object", text="V Target")
         col.operator("cray.ensure_memory_lod", text="Create/Find Point clouds > Memory", icon="OUTLINER_OB_MESH")
 
         layout.separator()
@@ -10437,10 +10541,14 @@ class CRAY_PT_SnapPointsPanel(Panel):
         create_row = info.row()
         create_row.enabled = can_create
         create_row.operator("cray.create_snap_pair_from_model_edge", text="Create Snap Points", icon="MESH_DATA")
-        if ss.memory_object is None or ss.paired_memory_object is None:
-            info.label(text="Pick or create both Memory LODs first", icon="INFO")
-        elif ss.memory_object == ss.paired_memory_object:
-            info.label(text="Choose two different Memory LODs", icon="ERROR")
+        if target_a is None or target_v is None:
+            info.label(text="Pick both target objects; Memory will be created automatically", icon="INFO")
+        elif not targets_are_meshes:
+            info.label(text="Both targets must be mesh objects", icon="ERROR")
+        elif same_target_scope:
+            info.label(text="Choose targets from two different model roots", icon="ERROR")
+        else:
+            info.label(text="Points will be created in each target's Point clouds > Memory", icon="INFO")
 
         layout.separator()
         pbox = layout.box()

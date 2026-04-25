@@ -11,7 +11,7 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 ## Возможности
 
 - Scatter clutter-прокси из DayZ-конфига: `CfgWorlds -> CAWorld -> Clutter` + `CfgSurfaceCharacters`
-- `Snap Points (Memory LOD)` с ручным A/V workflow по 2 выбранным вершинам
+- `Snap Points (Memory LOD)` с ручным A/V workflow по 2 выбранным вершинам и стабильной нумерацией `0/1`
 - Collider LOD workflow для `Geometry` / `View Geometry` / `Fire Geometry`
 - `Misc / Roadway` workflow для подготовки walkway-LOD мешей
 - `Texture Replace` через A3OB material properties (`.paa` / `.rvmat`)
@@ -36,16 +36,19 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 
 Панель `Snap Points (Memory LOD)` работает через ручной workflow:
 
-1. На исходном меше войдите в `Edit Mode`.
-2. Выделите ровно 2 вершины.
-3. Нажмите `Create/Find Point clouds > Memory`, если memory-LOD ещё не создан.
-4. Выберите `P3D Name`, `ID`, сторону `A/V` и `Snap Axis`.
-5. Нажмите `Create Snap Points`.
+1. Выберите `A Target` и `V Target`: обычные mesh-объекты нужных моделей.
+2. Нажмите `Create/Find Point clouds > Memory`, если хотите заранее подготовить memory-LOD.
+3. На исходном меше войдите в `Edit Mode`.
+4. Выделите ровно 2 вершины.
+5. Выберите `P3D Name`, `ID` и `Snap Axis`.
+6. Нажмите `Create Snap Points`.
 
 Что важно:
 
 - `P3D Name` автоматически очищается от пробелов, подчёркиваний, `.p3d` и лишних символов.
+- `Create Snap Points` сам найдёт или создаст `Point clouds > Memory` внутри `.p3d`-веток выбранных `A Target` / `V Target`.
 - `Point clouds > Memory` создаётся в нужной `.p3d`-ветке и не цепляет чужие `Memory` из других моделей.
+- Точки `0/1` сортируются по мировым координатам: сначала выбранная `Snap Axis`, а если пара по ней не различается, то фактическая ось разлёта точек. Меньшая координата получает `0`, большая `1`.
 - Plain-axis pivot инструменты находятся в этой же панели.
 
 ## Geometry Collider
@@ -197,7 +200,7 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 
 Коротко по актуальному состоянию:
 
-- `Unreleased` (`2026-04-16`) — component-fix `.txt` workflow, `Delete Faces/Edges Keep Verts`, поиск `Find Trash` / `Find Flat Plates`, quick-add импорта по имени из `NH_Objects`, named standalone model split и дополнительные export-проверки на duplicate `Resolution LOD` и `n-gon`
+- `Unreleased` (`2026-04-25`) — component-fix `.txt` workflow, `Delete Faces/Edges Keep Verts`, поиск `Find Trash` / `Find Flat Plates`, quick-add импорта по имени из `NH_Objects`, named standalone model split, A/V target workflow для `Snap Points`, стабильная нумерация snap-точек `0/1` и дополнительные export-проверки на duplicate `Resolution LOD` и `n-gon`
 - `0.4.0` (`2026-04-12`) — ручной A/V workflow для `Snap Points`, автоматическое создание `Point clouds > Memory`, scatter по выделенным полигонам и `Slope Falloff`
 - `0.3.1` (`2026-04-07`) — `Import/Export planner`, `Model Split`, кеш texture preview и batch-export фильтр для split-part коллекций
 
