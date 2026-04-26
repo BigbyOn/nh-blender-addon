@@ -89,7 +89,6 @@ _PERSISTED_UI_SETTINGS = {
     "cray_model_split_settings": (
         "part_number",
         "named_model_name",
-        "named_transfer_mode",
         "named_export_mode",
         "named_export_directory",
     ),
@@ -955,6 +954,13 @@ class CRAY_PG_SnapSettings(PropertyGroup):
     batch_cleanup_imported: BoolProperty(name="Cleanup Imported Objects", default=True)
     batch_overwrite_bak: BoolProperty(name="Overwrite .bak", default=True)
 
+_MODEL_SPLIT_TARGET_CATEGORY_ITEMS = (
+    ("RESOLUTION", "Resolution", "A3OB Resolution LOD stored in Visuals"),
+    ("GEOMETRIES", "Geometries", "A3OB Geometry LOD stored in Geometries"),
+    ("POINT_CLOUDS", "Point clouds", "A3OB Memory LOD stored in Point clouds"),
+    ("ROADWAY", "Roadway", "A3OB Roadway LOD stored in Misc"),
+)
+
 class CRAY_PG_ModelSplitSettings(PropertyGroup):
     part_number: IntProperty(
         name="Part Number",
@@ -969,12 +975,28 @@ class CRAY_PG_ModelSplitSettings(PropertyGroup):
         description="Name of the new standalone model; .p3d is added automatically",
     )
     named_transfer_mode: EnumProperty(
-        name="Selected Chunk Action",
+        name="Action",
         items=(
             ("MOVE", "Move", "Move selected objects out of the source model into the standalone model"),
             ("COPY", "Copy", "Copy selected objects into the standalone model and keep originals"),
         ),
         default="MOVE",
+    )
+    named_source_collection: PointerProperty(
+        name="Source Collection",
+        description="Pick the original .p3d root collection that selected meshes come from",
+        type=bpy.types.Collection,
+    )
+    named_target_collection: PointerProperty(
+        name="Target Collection",
+        description="Pick a .p3d root collection or one of its child A3OB category collections",
+        type=bpy.types.Collection,
+    )
+    named_target_category: EnumProperty(
+        name="Category",
+        description="A3OB category where selected mesh objects should be placed",
+        items=_MODEL_SPLIT_TARGET_CATEGORY_ITEMS,
+        default="RESOLUTION",
     )
     named_export_mode: EnumProperty(
         name="Export Target",
@@ -1009,6 +1031,8 @@ _COLLIDER_KNOWN_LOD_NAMES = {
     "9": "Memory",
     "11": "Roadway",
 }
+_VISUALS_COLLECTION_NAME = "Visuals"
+_VISUALS_COLLECTION_COLOR = "COLOR_02"
 _COLLIDER_COLLECTION_NAME = "Geometries"
 _COLLIDER_COLLECTION_ALIASES = ("Geometry",)
 _COLLIDER_COLLECTION_COLOR = "COLOR_03"
@@ -1025,53 +1049,125 @@ _ROADWAY_MATERIAL_NONE = "__NONE__"
 _ROADWAY_MATERIAL_ENUM_CACHE = [
     (_ROADWAY_MATERIAL_NONE, "<no materials>", "Roadway object has no assigned materials")
 ]
+_FIRE_GEOMETRY_LOD_TOKEN = "15"
+_FIRE_GEOMETRY_RVMAT_FOLDER = r"P:\DZ\data\data\penetration"
+_FIRE_GEOMETRY_MATERIAL_NONE = "__NONE__"
+_FIRE_GEOMETRY_MATERIAL_ENUM_CACHE = [
+    (_FIRE_GEOMETRY_MATERIAL_NONE, "<no materials>", "Selected Fire Geometry object has no assigned materials")
+]
+_COLLIDER_LOD_SYNCING_FROM_OBJECT = False
+_MODEL_SPLIT_TARGET_CATEGORY_SPECS = {
+    "RESOLUTION": {
+        "collection": _VISUALS_COLLECTION_NAME,
+        "aliases": (),
+        "color": _VISUALS_COLLECTION_COLOR,
+        "lod": "0",
+    },
+    "GEOMETRIES": {
+        "collection": _COLLIDER_COLLECTION_NAME,
+        "aliases": _COLLIDER_COLLECTION_ALIASES,
+        "color": _COLLIDER_COLLECTION_COLOR,
+        "lod": "6",
+    },
+    "POINT_CLOUDS": {
+        "collection": _MEMORY_COLLECTION_NAME,
+        "aliases": _MEMORY_COLLECTION_ALIASES,
+        "color": _MEMORY_COLLECTION_COLOR,
+        "lod": "9",
+    },
+    "ROADWAY": {
+        "collection": _MISC_COLLECTION_NAME,
+        "aliases": (),
+        "color": _MISC_COLLECTION_COLOR,
+        "lod": _ROADWAY_LOD_TOKEN,
+    },
+}
+_MODEL_SPLIT_VISUAL_LODS = {"0", "1", "2", "3", "18"}
+_MODEL_SPLIT_GEOMETRY_LODS = {
+    "6", "7", "8", "14", "15", "16", "17", "19", "20", "21", "22", "23", "24", "30"
+}
+_MODEL_SPLIT_POINT_CLOUD_LODS = {"9", "10", "13"}
+_MODEL_SPLIT_ROADWAY_LODS = {"11"}
+
+
+def _material_enum_items_for_object(obj, *, none_value: str, missing_object_desc: str, missing_material_desc: str, slot_desc_prefix: str):
+    items = []
+
+    if obj is None or obj.type != "MESH":
+        return [(none_value, missing_object_desc, missing_object_desc)]
+
+    seen = set()
+    for slot_idx, slot in enumerate(obj.material_slots, start=1):
+        mat = slot.material
+        if mat is None:
+            continue
+
+        key = mat.name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+
+        image_names = []
+        if mat.use_nodes and mat.node_tree:
+            for node in mat.node_tree.nodes:
+                if node.type == "TEX_IMAGE" and getattr(node, "image", None):
+                    image_names.append(node.image.name)
+
+        desc = f"{slot_desc_prefix} from slot {slot_idx}"
+        if image_names:
+            uniq_images = sorted(set(image_names), key=lambda x: x.lower())
+            desc = f"{desc} | Images: {', '.join(uniq_images[:3])}"
+            if len(uniq_images) > 3:
+                desc += f" (+{len(uniq_images) - 3} more)"
+
+        items.append((mat.name, mat.name, desc))
+
+    if not items:
+        items = [(none_value, "<no materials>", missing_material_desc)]
+
+    return items
 
 
 def get_roadway_material_enum_items(self, context):
     del self
 
-    items = []
     cs = getattr(getattr(context, "scene", None), "cray_collider_settings", None)
     obj = getattr(cs, "roadway_object", None) if cs else None
-
-    if obj is None or obj.type != "MESH":
-        items = [(_ROADWAY_MATERIAL_NONE, "<no roadway object>", "Assign a Roadway Object to list its materials")]
-    else:
-        seen = set()
-        for slot_idx, slot in enumerate(obj.material_slots, start=1):
-            mat = slot.material
-            if mat is None:
-                continue
-
-            key = mat.name.lower()
-            if key in seen:
-                continue
-            seen.add(key)
-
-            image_names = []
-            if mat.use_nodes and mat.node_tree:
-                for node in mat.node_tree.nodes:
-                    if node.type == "TEX_IMAGE" and getattr(node, "image", None):
-                        image_names.append(node.image.name)
-
-            desc = f"Roadway material from slot {slot_idx}"
-            if image_names:
-                uniq_images = sorted(set(image_names), key=lambda x: x.lower())
-                desc = f"{desc} | Images: {', '.join(uniq_images[:3])}"
-                if len(uniq_images) > 3:
-                    desc += f" (+{len(uniq_images) - 3} more)"
-
-            items.append((mat.name, mat.name, desc))
-
-        if not items:
-            items = [(_ROADWAY_MATERIAL_NONE, "<no materials>", "Selected Roadway Object has no assigned materials")]
+    items = _material_enum_items_for_object(
+        obj,
+        none_value=_ROADWAY_MATERIAL_NONE,
+        missing_object_desc="<no roadway object>",
+        missing_material_desc="Selected Roadway Object has no assigned materials",
+        slot_desc_prefix="Roadway material",
+    )
 
     global _ROADWAY_MATERIAL_ENUM_CACHE
     _ROADWAY_MATERIAL_ENUM_CACHE = items
     return _ROADWAY_MATERIAL_ENUM_CACHE
 
 
+def get_fire_geometry_material_enum_items(self, context):
+    del self
+
+    obj = _resolve_fire_geometry_object_for_material(context)
+    items = _material_enum_items_for_object(
+        obj,
+        none_value=_FIRE_GEOMETRY_MATERIAL_NONE,
+        missing_object_desc="<no fire geometry object>",
+        missing_material_desc="Selected Fire Geometry object has no assigned materials",
+        slot_desc_prefix="Fire Geometry material",
+    )
+
+    global _FIRE_GEOMETRY_MATERIAL_ENUM_CACHE
+    _FIRE_GEOMETRY_MATERIAL_ENUM_CACHE = items
+    return _FIRE_GEOMETRY_MATERIAL_ENUM_CACHE
+
+
 def _on_collider_target_lod_changed(self, context):
+    global _COLLIDER_LOD_SYNCING_FROM_OBJECT
+    if _COLLIDER_LOD_SYNCING_FROM_OBJECT:
+        return
+
     cs = self
     if context is None:
         return
@@ -1088,7 +1184,110 @@ def _on_collider_target_lod_changed(self, context):
         _set_collider_lod_a3ob_props(target_obj, lod_token)
         _apply_collider_visual_style(target_obj)
         _enable_collider_object_color_preview(context)
+        if lod_token == _FIRE_GEOMETRY_LOD_TOKEN:
+            setattr(cs, "fire_geometry_object", target_obj)
+            _sync_fire_geometry_material_selection(context)
         _set_collider_settings_object(context, "geometry_object", target_obj)
+    except Exception:
+        pass
+
+
+def _actual_collider_lod_token_from_object(obj) -> str:
+    if obj is None or getattr(obj, "type", None) != "MESH":
+        return ""
+
+    if not hasattr(obj, "a3ob_properties_object"):
+        return ""
+
+    try:
+        props = obj.a3ob_properties_object
+        if not bool(getattr(props, "is_a3_lod", False)):
+            return ""
+        return str(getattr(props, "lod", "") or "").strip()
+    except Exception:
+        return ""
+
+
+def _collider_lod_token_from_object(obj, *, allow_name_fallback: bool = True) -> str:
+    lod_token = _actual_collider_lod_token_from_object(obj)
+    if lod_token in _COLLIDER_LOD_NAMES:
+        return lod_token
+
+    if not allow_name_fallback or obj is None or getattr(obj, "type", None) != "MESH":
+        return ""
+
+    logical_name = _logical_collection_name(getattr(obj, "name", "") or "")
+    for lod_token, lod_name in _COLLIDER_LOD_NAMES.items():
+        if logical_name == _logical_collection_name(lod_name):
+            return str(lod_token)
+
+    return ""
+
+
+def _resolve_fire_geometry_object_for_material(context):
+    cs = getattr(getattr(context, "scene", None), "cray_collider_settings", None)
+    if cs is None:
+        return None
+
+    candidates = (
+        getattr(cs, "fire_geometry_object", None),
+        getattr(cs, "geometry_object", None),
+    )
+    for obj in candidates:
+        if obj is None or getattr(obj, "type", None) != "MESH":
+            continue
+        if _collider_lod_token_from_object(obj, allow_name_fallback=True) == _FIRE_GEOMETRY_LOD_TOKEN:
+            try:
+                cs.fire_geometry_object = obj
+            except Exception:
+                pass
+            return obj
+
+    return None
+
+
+def _object_name_startswith_lod(obj, lod_token: str) -> bool:
+    if obj is None or getattr(obj, "type", None) != "MESH":
+        return False
+
+    expected = _logical_collection_name(_collider_lod_name(lod_token))
+    actual = _logical_collection_name(getattr(obj, "name", "") or "")
+    return bool(expected and actual.startswith(expected))
+
+
+def _poll_fire_geometry_object(self, obj):
+    del self
+    return _object_name_startswith_lod(obj, _FIRE_GEOMETRY_LOD_TOKEN)
+
+
+def _poll_roadway_object(self, obj):
+    del self
+    return _object_name_startswith_lod(obj, _ROADWAY_LOD_TOKEN)
+
+
+def _on_collider_geometry_object_changed(self, context):
+    if context is None:
+        return
+
+    target_obj = getattr(self, "geometry_object", None)
+    lod_token = _collider_lod_token_from_object(target_obj, allow_name_fallback=True)
+    if lod_token not in _COLLIDER_LOD_NAMES:
+        return
+
+    try:
+        if str(getattr(self, "target_lod", "") or "") != lod_token:
+            global _COLLIDER_LOD_SYNCING_FROM_OBJECT
+            _COLLIDER_LOD_SYNCING_FROM_OBJECT = True
+            try:
+                self.target_lod = lod_token
+            finally:
+                _COLLIDER_LOD_SYNCING_FROM_OBJECT = False
+        else:
+            _apply_collider_visual_style(target_obj)
+            _enable_collider_object_color_preview(context)
+        if lod_token == _FIRE_GEOMETRY_LOD_TOKEN:
+            self.fire_geometry_object = target_obj
+            _sync_fire_geometry_material_selection(context)
     except Exception:
         pass
 
@@ -1103,6 +1302,7 @@ class CRAY_PG_ColliderSettings(PropertyGroup):
         name="Target LOD Object",
         description="Geometry LOD mesh that receives generated colliders",
         type=bpy.types.Object,
+        update=_on_collider_geometry_object_changed,
     )
     target_lod: EnumProperty(
         name="Target LOD",
@@ -1150,10 +1350,22 @@ class CRAY_PG_ColliderSettings(PropertyGroup):
         description="Show extra build buttons that are not on hotkeys",
         default=False,
     )
+    fire_geometry_object: PointerProperty(
+        name="Fire Geometry Object",
+        description="Fire Geometry LOD mesh stored in Geometries collection",
+        type=bpy.types.Object,
+        poll=_poll_fire_geometry_object,
+    )
+    fire_geometry_material: EnumProperty(
+        name="Fire Geometry Material",
+        description="Current material on the Fire Geometry object",
+        items=get_fire_geometry_material_enum_items,
+    )
     roadway_object: PointerProperty(
         name="Roadway Object",
         description="Roadway LOD mesh stored in Misc collection",
         type=bpy.types.Object,
+        poll=_poll_roadway_object,
     )
     roadway_material: EnumProperty(
         name="Roadway Material",
@@ -2649,21 +2861,12 @@ def _is_collider_lod_mesh_object(obj, lod_token=None) -> bool:
         return False
 
     expected = str(lod_token) if lod_token is not None else None
-    if expected is not None and obj.name == _collider_lod_name(expected):
-        return True
-    if expected is None and obj.name in _COLLIDER_LOD_NAMES.values():
-        return True
-
-    if not hasattr(obj, "a3ob_properties_object"):
-        return False
-
-    try:
-        value = str(getattr(obj.a3ob_properties_object, "lod", ""))
-    except Exception:
+    value = _actual_collider_lod_token_from_object(obj)
+    if not value:
         return False
 
     if expected is None:
-        return value in _COLLIDER_LOD_NAMES
+        return value in _COLLIDER_KNOWN_LOD_NAMES
     return value == expected
 
 
@@ -2687,24 +2890,34 @@ def _is_auto_reusable_collider_target(obj, lod_token=None) -> bool:
     if _is_collider_lod_mesh_object(obj, lod_token=lod_token):
         return True
 
-    return _object_in_logical_collection(obj, _COLLIDER_COLLECTION_NAME)
+    if lod_token is None:
+        return False
+
+    expected_name = _logical_collection_name(_collider_lod_name(lod_token))
+    return (
+        _object_in_logical_collection(obj, _COLLIDER_COLLECTION_NAME)
+        and _logical_collection_name(getattr(obj, "name", "") or "") == expected_name
+    )
 
 
 def _pick_collider_lod_object(context, source_obj, lod_token):
     expected_name = _collider_lod_name(lod_token)
 
-    if source_obj is not None:
-        for col in source_obj.users_collection:
-            obj = col.objects.get(expected_name)
-            if _is_auto_reusable_collider_target(obj, lod_token=lod_token):
-                return obj
+    parent = _preferred_collider_parent_collection(context, source_obj)
+    collider_collection = _find_named_child_collection(
+        parent,
+        _COLLIDER_COLLECTION_NAME,
+        aliases=_COLLIDER_COLLECTION_ALIASES,
+    )
+    if collider_collection is None:
+        return None
 
-    obj = bpy.data.objects.get(expected_name)
-    if _is_auto_reusable_collider_target(obj, lod_token=lod_token):
-        return obj
+    direct = collider_collection.objects.get(expected_name)
+    if _is_auto_reusable_collider_target(direct, lod_token=lod_token):
+        return direct
 
-    for obj in context.scene.objects:
-        if _is_collider_lod_mesh_object(obj, lod_token=lod_token):
+    for obj in collider_collection.objects:
+        if _is_auto_reusable_collider_target(obj, lod_token=lod_token):
             return obj
 
     return None
@@ -2780,13 +2993,7 @@ def _ensure_named_child_collection(parent_collection, collection_name, color_tag
     if parent_collection is None:
         return None
 
-    target = parent_collection.children.get(collection_name)
-    logical_names = _logical_collection_names(collection_name, aliases)
-    if target is None:
-        for child in parent_collection.children:
-            if _logical_collection_name(child.name) in logical_names:
-                target = child
-                break
+    target = _find_named_child_collection(parent_collection, collection_name, aliases=aliases)
     if target is None:
         target = bpy.data.collections.new(collection_name)
         parent_collection.children.link(target)
@@ -2802,6 +3009,20 @@ def _ensure_named_child_collection(parent_collection, collection_name, color_tag
         except Exception:
             pass
 
+    return target
+
+
+def _find_named_child_collection(parent_collection, collection_name, aliases=()):
+    if parent_collection is None:
+        return None
+
+    target = parent_collection.children.get(collection_name)
+    logical_names = _logical_collection_names(collection_name, aliases)
+    if target is None:
+        for child in parent_collection.children:
+            if _logical_collection_name(child.name) in logical_names:
+                target = child
+                break
     return target
 
 
@@ -2942,14 +3163,14 @@ def _set_collider_settings_object(context, attr_name, obj):
     _tag_redraw_all_areas(context)
 
 
-def _sync_roadway_material_selection(context, preferred_name=""):
+def _sync_material_selection(context, material_attr: str, items_fn, none_value: str, preferred_name=""):
     cs = getattr(getattr(context, "scene", None), "cray_collider_settings", None)
     if cs is None:
         return
 
-    items = get_roadway_material_enum_items(None, context)
-    valid_values = [item[0] for item in items if item and item[0] != _ROADWAY_MATERIAL_NONE]
-    current = (getattr(cs, "roadway_material", "") or "").strip()
+    items = items_fn(None, context)
+    valid_values = [item[0] for item in items if item and item[0] != none_value]
+    current = (getattr(cs, material_attr, "") or "").strip()
     preferred_name = (preferred_name or "").strip()
 
     if preferred_name and preferred_name in valid_values:
@@ -2959,29 +3180,44 @@ def _sync_roadway_material_selection(context, preferred_name=""):
     elif valid_values:
         chosen = valid_values[0]
     else:
-        chosen = _ROADWAY_MATERIAL_NONE
+        chosen = none_value
 
     try:
-        cs.roadway_material = chosen
+        setattr(cs, material_attr, chosen)
     except Exception:
         pass
 
     _tag_redraw_all_areas(context)
 
 
-def _get_selected_roadway_material(context):
-    cs = getattr(getattr(context, "scene", None), "cray_collider_settings", None)
-    if cs is None:
+def _sync_roadway_material_selection(context, preferred_name=""):
+    _sync_material_selection(
+        context,
+        "roadway_material",
+        get_roadway_material_enum_items,
+        _ROADWAY_MATERIAL_NONE,
+        preferred_name,
+    )
+
+
+def _sync_fire_geometry_material_selection(context, preferred_name=""):
+    _sync_material_selection(
+        context,
+        "fire_geometry_material",
+        get_fire_geometry_material_enum_items,
+        _FIRE_GEOMETRY_MATERIAL_NONE,
+        preferred_name,
+    )
+
+
+def _get_selected_material_from_object(obj, selected_name: str, *, create_name: str = ""):
+    if obj is None or obj.type != "MESH":
         return None
 
-    roadway_obj = getattr(cs, "roadway_object", None)
-    if roadway_obj is None or roadway_obj.type != "MESH":
-        return None
-
-    selected_name = (getattr(cs, "roadway_material", "") or "").strip()
+    selected_name = (selected_name or "").strip()
     fallback_mat = None
 
-    for slot in roadway_obj.material_slots:
+    for slot in obj.material_slots:
         mat = slot.material
         if mat is None:
             continue
@@ -2990,7 +3226,32 @@ def _get_selected_roadway_material(context):
         if selected_name and mat.name == selected_name:
             return mat
 
-    return fallback_mat
+    if fallback_mat is not None or not create_name:
+        return fallback_mat
+
+    mat = bpy.data.materials.new(create_name)
+    obj.data.materials.append(mat)
+    return mat
+
+
+def _get_selected_roadway_material(context):
+    cs = getattr(getattr(context, "scene", None), "cray_collider_settings", None)
+    if cs is None:
+        return None
+
+    roadway_obj = getattr(cs, "roadway_object", None)
+    selected_name = getattr(cs, "roadway_material", "") or ""
+    return _get_selected_material_from_object(roadway_obj, selected_name)
+
+
+def _get_selected_fire_geometry_material(context, *, create_name: str = ""):
+    cs = getattr(getattr(context, "scene", None), "cray_collider_settings", None)
+    if cs is None:
+        return None
+
+    fire_obj = _resolve_fire_geometry_object_for_material(context)
+    selected_name = getattr(cs, "fire_geometry_material", "") or ""
+    return _get_selected_material_from_object(fire_obj, selected_name, create_name=create_name)
 
 
 def _apply_collider_visual_style(target_obj):
@@ -3011,18 +3272,44 @@ def _apply_object_visual_style(target_obj, color):
         pass
 
 
+def _is_existing_roadway_target(obj) -> bool:
+    if obj is None or getattr(obj, "type", None) != "MESH":
+        return False
+    if _is_collider_lod_mesh_object(obj, lod_token=_ROADWAY_LOD_TOKEN):
+        return True
+    return _logical_collection_name(getattr(obj, "name", "") or "") == _logical_collection_name(_collider_lod_name(_ROADWAY_LOD_TOKEN))
+
+
+def _pick_roadway_lod_object(context, source_obj):
+    parent = _preferred_collider_parent_collection(context, source_obj)
+    misc_collection = _find_named_child_collection(parent, _MISC_COLLECTION_NAME)
+    if misc_collection is None:
+        return None
+
+    expected_name = _collider_lod_name(_ROADWAY_LOD_TOKEN)
+    direct = misc_collection.objects.get(expected_name)
+    if _is_existing_roadway_target(direct):
+        return direct
+
+    for obj in misc_collection.objects:
+        if _is_existing_roadway_target(obj):
+            return obj
+
+    return None
+
+
 def _ensure_roadway_lod_object(context, source_obj, preferred_obj=None):
-    if preferred_obj is not None and preferred_obj.type == "MESH":
+    misc_collection = _ensure_misc_collection(context, source_obj)
+    if misc_collection is None:
+        misc_collection = context.scene.collection
+
+    if (
+        _is_existing_roadway_target(preferred_obj)
+        and _collection_directly_contains_object(misc_collection, preferred_obj)
+    ):
         target_obj = preferred_obj
     else:
-        target_obj = _pick_named_lod_object(
-            context,
-            source_obj,
-            _ROADWAY_LOD_TOKEN,
-            _collider_lod_name(_ROADWAY_LOD_TOKEN),
-        )
-
-    misc_collection = _ensure_misc_collection(context, source_obj)
+        target_obj = _pick_roadway_lod_object(context, source_obj)
 
     if target_obj is None:
         obj_name = _collider_lod_name(_ROADWAY_LOD_TOKEN)
@@ -3031,13 +3318,10 @@ def _ensure_roadway_lod_object(context, source_obj, preferred_obj=None):
         misc_collection.objects.link(target_obj)
         if source_obj is not None:
             target_obj.matrix_world = source_obj.matrix_world.copy()
-    else:
-        _move_object_to_collection(target_obj, misc_collection)
 
     _set_collider_lod_a3ob_props(target_obj, _ROADWAY_LOD_TOKEN)
     _apply_object_visual_style(target_obj, _ROADWAY_OBJECT_COLOR)
     _enable_collider_object_color_preview(context)
-    return target_obj
     try:
         target_obj.show_all_edges = True
     except Exception:
@@ -3046,6 +3330,7 @@ def _ensure_roadway_lod_object(context, source_obj, preferred_obj=None):
         target_obj.show_name = True
     except Exception:
         pass
+    return target_obj
 
 
 def _enable_collider_object_color_preview(context):
@@ -3064,13 +3349,26 @@ def _enable_collider_object_color_preview(context):
         pass
 
 
+def _is_existing_collider_target_for_lod(obj, lod_token) -> bool:
+    if obj is None or getattr(obj, "type", None) != "MESH":
+        return False
+    if _is_collider_lod_mesh_object(obj, lod_token=lod_token):
+        return True
+    expected_name = _logical_collection_name(_collider_lod_name(lod_token))
+    return _logical_collection_name(getattr(obj, "name", "") or "") == expected_name
+
 def _ensure_collider_lod_object(context, source_obj, lod_token, preferred_obj=None):
-    if preferred_obj is not None and preferred_obj.type == "MESH":
+    collider_collection = _ensure_collider_collection(context, source_obj)
+    if collider_collection is None:
+        collider_collection = context.scene.collection
+
+    if (
+        _is_existing_collider_target_for_lod(preferred_obj, lod_token)
+        and _collection_directly_contains_object(collider_collection, preferred_obj)
+    ):
         target_obj = preferred_obj
     else:
         target_obj = _pick_collider_lod_object(context, source_obj, lod_token)
-
-    collider_collection = _ensure_collider_collection(context, source_obj)
 
     if target_obj is None:
         obj_name = _collider_lod_name(lod_token)
@@ -3079,8 +3377,6 @@ def _ensure_collider_lod_object(context, source_obj, lod_token, preferred_obj=No
         collider_collection.objects.link(target_obj)
         if source_obj is not None:
             target_obj.matrix_world = source_obj.matrix_world.copy()
-    else:
-        _move_object_to_collection(target_obj, collider_collection)
 
     _set_collider_lod_a3ob_props(target_obj, lod_token)
     _apply_collider_visual_style(target_obj)
@@ -4518,6 +4814,81 @@ class CRAY_OT_OpenRoadwayMaterialFolder(Operator):
         return {"FINISHED"}
 
 
+class CRAY_OT_OpenFireGeometryRvmatFolder(Operator):
+    """Pick a penetration .rvmat and assign it to the selected Fire Geometry material"""
+
+    bl_idname = "cray.open_fire_geometry_rvmat_folder"
+    bl_label = "Choose Fire Geometry RVMAT Path"
+    bl_options = {"REGISTER", "UNDO"}
+
+    filepath: StringProperty(
+        name="RVMAT File",
+        description="Choose an .rvmat file for the selected Fire Geometry material",
+        subtype="FILE_PATH",
+    )
+    filter_glob: StringProperty(default="*.rvmat", options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        del event
+
+        fire_obj = _resolve_fire_geometry_object_for_material(context)
+        if fire_obj is None or getattr(fire_obj, "type", None) != "MESH":
+            self.report({"ERROR"}, "Create or assign a Fire Geometry object first")
+            return {"CANCELLED"}
+
+        default_dir = _FIRE_GEOMETRY_RVMAT_FOLDER if os.path.isdir(_FIRE_GEOMETRY_RVMAT_FOLDER) else ""
+        if not default_dir:
+            blend_dir = bpy.path.abspath("//")
+            if blend_dir and os.path.isdir(blend_dir):
+                default_dir = blend_dir
+            else:
+                default_dir = os.getcwd()
+
+        self.filepath = os.path.join(default_dir, "")
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        fire_obj = _resolve_fire_geometry_object_for_material(context)
+        if fire_obj is None or getattr(fire_obj, "type", None) != "MESH":
+            self.report({"ERROR"}, "Fire Geometry Object must be a mesh")
+            return {"CANCELLED"}
+
+        try:
+            filepath = os.path.abspath(bpy.path.abspath(self.filepath or ""))
+        except Exception as e:
+            self.report({"ERROR"}, f"Could not resolve RVMAT path: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+
+        if not filepath or not os.path.isfile(filepath):
+            self.report({"ERROR"}, "Choose an existing .rvmat file")
+            return {"CANCELLED"}
+        if os.path.splitext(filepath)[1].lower() != ".rvmat":
+            self.report({"ERROR"}, "Unsupported file type. Choose .rvmat")
+            return {"CANCELLED"}
+
+        material_name = _basename_no_ext(filepath) or "FireGeometryMaterial"
+        mat = _get_selected_fire_geometry_material(context, create_name=material_name)
+        if mat is None:
+            self.report({"ERROR"}, "Could not create or select a Fire Geometry material")
+            return {"CANCELLED"}
+
+        try:
+            _set_a3ob_material_paths(mat, None, _norm_path(filepath))
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        try:
+            mat.name = material_name
+        except Exception:
+            pass
+
+        _sync_fire_geometry_material_selection(context, mat.name)
+        self.report({"INFO"}, f"Assigned Fire Geometry .rvmat: {mat.name}")
+        return {"FINISHED"}
+
+
 class CRAY_OT_SelectIsolatedVertices(Operator):
     """Select all isolated vertices that are not used by any edge or polygon"""
 
@@ -5105,6 +5476,9 @@ class CRAY_OT_EnsureColliderLOD(Operator):
             preferred_obj=cs.geometry_object,
         )
         _set_collider_settings_object(context, "geometry_object", target_obj)
+        if str(getattr(cs, "target_lod", "") or "") == _FIRE_GEOMETRY_LOD_TOKEN:
+            _set_collider_settings_object(context, "fire_geometry_object", target_obj)
+            _sync_fire_geometry_material_selection(context)
         try:
             context.view_layer.update()
         except Exception:
@@ -5488,20 +5862,120 @@ def _is_helper_object_name(name: str) -> bool:
 def _link_object_to_collection(obj, collection):
     if obj is None or collection is None:
         return
-    if collection.objects.get(obj.name) is None:
+    if not _collection_directly_contains_object(collection, obj):
         collection.objects.link(obj)
 
-def _move_object_to_collection(obj, target_collection):
+def _collection_directly_contains_object(collection, obj):
+    if collection is None or obj is None:
+        return False
+    try:
+        obj_ptr = obj.as_pointer()
+    except Exception:
+        obj_ptr = None
+    for item in getattr(collection, "objects", []):
+        if item == obj:
+            return True
+        if obj_ptr is not None:
+            try:
+                if item.as_pointer() == obj_ptr:
+                    return True
+            except Exception:
+                pass
+    return False
+
+def _same_id_data(left, right):
+    if left is None or right is None:
+        return False
+    if left == right:
+        return True
+    try:
+        return left.as_pointer() == right.as_pointer()
+    except Exception:
+        return False
+
+def _unlink_object_from_collection_tree(obj, root_collection, keep_collection=None):
+    if obj is None or root_collection is None:
+        return 0
+
+    removed = 0
+    for col in _iter_collection_tree(root_collection):
+        if _same_id_data(col, keep_collection):
+            continue
+        if not _collection_directly_contains_object(col, obj):
+            continue
+        try:
+            col.objects.unlink(obj)
+            removed += 1
+        except Exception:
+            pass
+    return removed
+
+def _direct_object_collection_names_under_root(root_collection, obj):
+    if root_collection is None or obj is None:
+        return []
+    names = []
+    for col in _iter_collection_tree(root_collection):
+        if _collection_directly_contains_object(col, obj):
+            names.append(getattr(col, "name", "") or "<unnamed>")
+    return names
+
+def _move_object_to_collection(obj, target_collection, unlink_roots=None):
     if obj is None or target_collection is None:
         return
     _link_object_to_collection(obj, target_collection)
-    for col in list(obj.users_collection):
-        if col == target_collection:
+
+    unlink_cols = []
+    seen = set()
+    unlink_root_list = ()
+
+    def _add_unlink_col(col):
+        if col is None:
+            return
+        try:
+            ptr = col.as_pointer()
+        except Exception:
+            ptr = id(col)
+        if ptr in seen:
+            return
+        seen.add(ptr)
+        unlink_cols.append(col)
+
+    for col in list(getattr(obj, "users_collection", [])):
+        _add_unlink_col(col)
+
+    if unlink_roots is not None:
+        unlink_root_list = unlink_roots if isinstance(unlink_roots, (tuple, list, set)) else (unlink_roots,)
+        for root in unlink_root_list:
+            if root is None:
+                continue
+            for col in _iter_collection_tree(root):
+                if _collection_directly_contains_object(col, obj):
+                    _add_unlink_col(col)
+
+    try:
+        target_ptr = target_collection.as_pointer()
+    except Exception:
+        target_ptr = None
+
+    for col in unlink_cols:
+        same_as_target = (col == target_collection)
+        if not same_as_target and target_ptr is not None:
+            try:
+                same_as_target = (col.as_pointer() == target_ptr)
+            except Exception:
+                same_as_target = False
+        if same_as_target:
             continue
         try:
             col.objects.unlink(obj)
         except Exception:
             pass
+
+    for root in unlink_root_list:
+        _unlink_object_from_collection_tree(obj, root, keep_collection=target_collection)
+
+    if not _collection_directly_contains_object(target_collection, obj):
+        _link_object_to_collection(obj, target_collection)
 
 def _is_export_helper_empty_name(name: str) -> bool:
     n = (name or "").strip().lower()
@@ -7303,7 +7777,7 @@ def _looks_like_split_part_collection_name(name: str) -> bool:
     n = (name or "").strip()
     if not n:
         return False
-    return re.search(r"_\d+\.p3d$", n, flags=re.IGNORECASE) is not None
+    return re.search(r"_(?:p)?\d+\.p3d$", n, flags=re.IGNORECASE) is not None
 
 def _build_ie_import_basename_map(settings):
     mapping = {}
@@ -7654,34 +8128,50 @@ def _format_split_part_collection_name(source_root_name: str, part_number: int) 
     if not base_name:
         base_name = "part"
 
-    suffix = f"_{int(part_number):02d}"
+    suffix = f"_p{int(part_number):02d}"
     stem, ext = os.path.splitext(base_name)
     if ext.lower() == ".p3d":
         return f"{stem}{suffix}{ext}"
     return f"{base_name}{suffix}.p3d"
 
+def _split_part_collection_number(source_root_name: str, collection_name: str):
+    base_name = _strip_blender_numeric_suffix((source_root_name or "").strip())
+    if not base_name:
+        return None
+
+    stem, ext = os.path.splitext(base_name)
+    base_stem = stem if ext.lower() == ".p3d" else base_name
+    if not base_stem:
+        return None
+
+    pattern = r"^" + re.escape(base_stem) + r"_p(\d+)\.p3d$"
+    match = re.match(pattern, _strip_blender_numeric_suffix(collection_name or ""), flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
+
+def _next_split_part_collection_number(source_root) -> int:
+    highest = 0
+    if source_root is not None:
+        for child in getattr(source_root, "children", []):
+            number = _split_part_collection_number(getattr(source_root, "name", ""), getattr(child, "name", ""))
+            if number is not None:
+                highest = max(highest, number)
+    return highest + 1
+
 def _ensure_split_part_root_collection(context, source_root, part_number: int):
-    scene_root = getattr(getattr(context, "scene", None), "collection", None)
-    parent = _find_parent_collection(scene_root, source_root) if scene_root is not None else None
-    if parent is None:
-        parent = scene_root if scene_root is not None else source_root
+    parent = source_root
     if parent is None:
         return None
 
     part_name = _format_split_part_collection_name(getattr(source_root, "name", ""), part_number)
     target = parent.children.get(part_name)
     if target is None:
-        existing = bpy.data.collections.get(part_name)
-        if existing is not None:
-            target = existing
-            try:
-                if all(ch != target for ch in parent.children):
-                    parent.children.link(target)
-            except Exception:
-                pass
-        else:
-            target = bpy.data.collections.new(part_name)
-            parent.children.link(target)
+        target = bpy.data.collections.new(part_name)
+        parent.children.link(target)
 
     try:
         source_color = getattr(source_root, "color_tag", None)
@@ -7755,6 +8245,350 @@ def _ensure_named_split_model_root_collection(context, source_root, model_name: 
     )
     _set_ie_source_path_tag(target, split_source_path)
     return target
+
+def _model_split_context_objects(context):
+    selected = [obj for obj in getattr(context, "selected_objects", []) if obj is not None]
+    if selected:
+        return selected
+    active = getattr(getattr(context, "view_layer", None), "objects", None)
+    active_obj = getattr(active, "active", None) if active is not None else None
+    return [active_obj] if active_obj is not None else []
+
+def _model_split_single_source_root_from_context(context):
+    objects = _model_split_context_objects(context)
+    roots = {}
+    missing = []
+    for obj in objects:
+        root = _find_p3d_root_collection_for_object(context, obj)
+        if root is None:
+            missing.append(getattr(obj, "name", "<unnamed>"))
+            continue
+        roots[root.as_pointer()] = root
+
+    if missing:
+        preview = ", ".join(missing[:5])
+        if len(missing) > 5:
+            preview += ", ..."
+        return None, f"Selected/active objects are not inside a .p3d root collection: {preview}"
+    if not roots:
+        return None, "Select or activate an object inside the source .p3d root collection first"
+    if len(roots) != 1:
+        root_names = ", ".join(sorted({root.name for root in roots.values()}, key=lambda x: x.lower()))
+        return None, f"Use objects from exactly one source .p3d root collection (found: {root_names})"
+    return next(iter(roots.values())), ""
+
+def _find_p3d_root_collection_for_collection(context, collection, *, require_p3d: bool = False):
+    if collection is None:
+        return None
+
+    scene_root = getattr(getattr(context, "scene", None), "collection", None)
+    if scene_root is None:
+        if require_p3d and not _looks_like_p3d_collection_name(getattr(collection, "name", "") or ""):
+            return None
+        return collection
+
+    try:
+        path = _find_collection_path(scene_root, collection.as_pointer())
+    except Exception:
+        path = None
+
+    if not path:
+        if require_p3d and not _looks_like_p3d_collection_name(getattr(collection, "name", "") or ""):
+            return None
+        return collection
+
+    best = None
+    for col in path:
+        if _looks_like_p3d_collection_name(getattr(col, "name", "") or ""):
+            best = col
+    if best is not None:
+        return best
+    return None if require_p3d else collection
+
+def _object_is_directly_or_indirectly_in_collection(root_collection, obj) -> bool:
+    if root_collection is None or obj is None:
+        return False
+    for col in getattr(obj, "users_collection", []):
+        try:
+            if _find_collection_path(root_collection, col.as_pointer()):
+                return True
+        except Exception:
+            pass
+    return False
+
+def _model_split_target_category_spec(category_token: str):
+    token = (category_token or "RESOLUTION").strip().upper()
+    return _MODEL_SPLIT_TARGET_CATEGORY_SPECS.get(token) or _MODEL_SPLIT_TARGET_CATEGORY_SPECS["RESOLUTION"]
+
+def _model_split_target_category_label(category_token: str) -> str:
+    token = (category_token or "RESOLUTION").strip().upper()
+    for item in _MODEL_SPLIT_TARGET_CATEGORY_ITEMS:
+        if item[0] == token:
+            return item[1]
+    return "Resolution"
+
+def _model_split_category_for_lod_token(lod_token: str) -> str:
+    token = str(lod_token or "").strip()
+    if token in _MODEL_SPLIT_GEOMETRY_LODS:
+        return "GEOMETRIES"
+    if token in _MODEL_SPLIT_POINT_CLOUD_LODS:
+        return "POINT_CLOUDS"
+    if token in _MODEL_SPLIT_ROADWAY_LODS:
+        return "ROADWAY"
+    return "RESOLUTION"
+
+def _model_split_category_for_object(obj) -> str:
+    if obj is not None and hasattr(obj, "a3ob_properties_object"):
+        try:
+            props = obj.a3ob_properties_object
+            if bool(getattr(props, "is_a3_lod", False)):
+                return _model_split_category_for_lod_token(getattr(props, "lod", ""))
+        except Exception:
+            pass
+
+    name = _logical_collection_name(getattr(obj, "name", "") if obj is not None else "")
+    if "roadway" in name:
+        return "ROADWAY"
+    if "memory" in name or "point" in name:
+        return "POINT_CLOUDS"
+    if "geometry" in name:
+        return "GEOMETRIES"
+    return "RESOLUTION"
+
+def _ensure_model_split_target_category_collection(target_root, category_token: str):
+    if target_root is None:
+        return None
+
+    spec = _model_split_target_category_spec(category_token)
+    collection = _ensure_named_child_collection(
+        target_root,
+        spec["collection"],
+        color_tag=spec.get("color"),
+        aliases=spec.get("aliases", ()),
+    )
+    _clear_ie_source_path_tag(collection)
+    return collection
+
+def _set_model_split_target_lod_a3ob_props(obj, category_token: str):
+    if obj is None or obj.type != "MESH" or not hasattr(obj, "a3ob_properties_object"):
+        return
+
+    spec = _model_split_target_category_spec(category_token)
+    lod_token = str(spec.get("lod", "0"))
+    try:
+        props = obj.a3ob_properties_object
+        current_is_lod = bool(getattr(props, "is_a3_lod", False))
+        current_lod = str(getattr(props, "lod", "") or "")
+        current_resolution = getattr(props, "resolution", 1)
+        lod_token = current_lod if current_is_lod and current_lod else str(spec.get("lod", "0"))
+        props.lod = lod_token
+        if current_is_lod:
+            pass
+        elif lod_token == "0" and current_lod == "0":
+            try:
+                props.resolution = max(0, int(current_resolution))
+            except Exception:
+                props.resolution = 1
+        else:
+            props.resolution = 1
+        if not current_is_lod:
+            props.resolution_float = float(getattr(props, "resolution", 1) or 1)
+        props.is_a3_lod = True
+        _remove_a3ob_named_property(props, "autocenter")
+        lod_name = props.get_name() if hasattr(props, "get_name") else _collider_lod_name(lod_token)
+        if lod_name:
+            obj.name = lod_name
+            if obj.data is not None:
+                obj.data.name = lod_name
+    except Exception:
+        pass
+
+    if lod_token == "6":
+        _apply_collider_visual_style(obj)
+    elif lod_token == _ROADWAY_LOD_TOKEN:
+        _apply_object_visual_style(obj, _ROADWAY_OBJECT_COLOR)
+
+def _collect_model_split_selected_mesh_objects(context):
+    selected = [
+        obj for obj in getattr(context, "selected_objects", [])
+        if obj is not None and getattr(obj, "type", None) == "MESH"
+    ]
+    if selected:
+        return selected
+
+    active_objects = getattr(getattr(context, "view_layer", None), "objects", None)
+    active_obj = getattr(active_objects, "active", None) if active_objects is not None else None
+    if active_obj is not None and getattr(active_obj, "type", None) == "MESH":
+        return [active_obj]
+
+    return []
+
+def _model_split_single_source_root_for_objects(context, objects):
+    roots = {}
+    missing = []
+    for obj in objects or []:
+        root = _find_p3d_root_collection_for_object(context, obj)
+        if root is None:
+            missing.append(getattr(obj, "name", "<unnamed>"))
+            continue
+        roots[root.as_pointer()] = root
+
+    if missing:
+        preview = ", ".join(missing[:5])
+        if len(missing) > 5:
+            preview += ", ..."
+        raise RuntimeError(f"Selected objects are not inside a .p3d root collection: {preview}")
+    if not roots:
+        raise RuntimeError("Select mesh objects inside one .p3d root collection")
+    if len(roots) != 1:
+        root_names = ", ".join(sorted({root.name for root in roots.values()}, key=lambda x: x.lower()))
+        raise RuntimeError(f"Select mesh objects from exactly one .p3d root collection (found: {root_names})")
+    return next(iter(roots.values()))
+
+def _resolve_model_split_source_root(context, settings, objects):
+    picked = getattr(settings, "named_source_collection", None)
+    source_root = _find_p3d_root_collection_for_collection(context, picked, require_p3d=True) if picked is not None else None
+    if picked is not None and source_root is None:
+        raise RuntimeError("Source Model must be a .p3d root collection or one of its child collections")
+    if source_root is None:
+        source_root = _model_split_single_source_root_for_objects(context, objects)
+
+    outside = [
+        getattr(obj, "name", "<unnamed>")
+        for obj in objects or []
+        if not _object_is_directly_or_indirectly_in_collection(source_root, obj)
+    ]
+    if outside:
+        preview = ", ".join(outside[:5])
+        if len(outside) > 5:
+            preview += ", ..."
+        raise RuntimeError(f"Selected objects are not inside source collection {source_root.name}: {preview}")
+
+    try:
+        settings.named_source_collection = source_root
+    except Exception:
+        pass
+    return source_root
+
+def _separate_edit_selection_for_model_split(context, settings, copy_selection: bool = False):
+    edit_obj = getattr(context, "edit_object", None)
+    if edit_obj is None or getattr(edit_obj, "type", None) != "MESH":
+        raise RuntimeError("Enter Edit Mode on a mesh and select the part to separate")
+
+    source_root = _resolve_model_split_source_root(context, settings, [edit_obj])
+
+    try:
+        before_ptrs = {obj.as_pointer() for obj in bpy.data.objects}
+    except Exception:
+        before_ptrs = set()
+
+    if copy_selection:
+        try:
+            bpy.ops.mesh.duplicate()
+        except Exception as e:
+            raise RuntimeError(f"Duplicate selected mesh part failed: {_fmt_exc(e)}")
+
+    try:
+        bpy.ops.mesh.separate(type="SELECTED")
+    except Exception as e:
+        raise RuntimeError(f"Separate selected mesh part failed: {_fmt_exc(e)}")
+
+    try:
+        bpy.ops.object.mode_set(mode="OBJECT")
+    except Exception:
+        pass
+
+    created = []
+    for obj in bpy.data.objects:
+        if getattr(obj, "type", None) != "MESH":
+            continue
+        try:
+            if obj.as_pointer() in before_ptrs:
+                continue
+        except Exception:
+            continue
+        created.append(obj)
+
+    if not created:
+        created = [
+            obj for obj in getattr(context, "selected_objects", [])
+            if obj is not None and getattr(obj, "type", None) == "MESH" and obj != edit_obj
+        ]
+
+    if not created:
+        raise RuntimeError("Select faces/edges/vertices before separating")
+
+    return source_root, created, True
+
+def _model_split_source_and_objects_for_transfer(context, settings, copy_selection: bool = False):
+    mode = str(getattr(context, "mode", "") or "").upper()
+    if mode in {"EDIT_MESH", "EDIT"}:
+        return _separate_edit_selection_for_model_split(context, settings, copy_selection=copy_selection)
+
+    selected = _collect_model_split_selected_mesh_objects(context)
+    if not selected:
+        raise RuntimeError("Select a mesh object or selected geometry in Edit Mode")
+
+    source_root = _resolve_model_split_source_root(context, settings, selected)
+    return source_root, selected, False
+
+def _resolve_model_split_target_part_root(context, settings, source_root, *, force_new: bool = False):
+    target_root = None
+    target_container = None
+    picked = getattr(settings, "named_target_collection", None)
+    if picked is not None:
+        target_container = _find_p3d_root_collection_for_collection(context, picked, require_p3d=True)
+        if target_container is None:
+            raise RuntimeError("Target Model must be a .p3d root collection or one of its child collections")
+    if target_container is None:
+        target_container = source_root
+
+    if force_new and target_container is not None and _looks_like_split_part_collection_name(getattr(target_container, "name", "") or ""):
+        scene_root = getattr(getattr(context, "scene", None), "collection", None)
+        parent = _find_parent_collection(scene_root, target_container) if scene_root is not None else None
+        if parent is not None and _looks_like_p3d_collection_name(getattr(parent, "name", "") or ""):
+            target_container = parent
+
+    use_existing_part = bool(
+        target_container is not None and
+        _looks_like_split_part_collection_name(getattr(target_container, "name", "") or "")
+    )
+
+    if force_new or not use_existing_part:
+        part_number = _next_split_part_collection_number(target_container)
+        target_root = _ensure_split_part_root_collection(context, target_container, part_number)
+        if target_root is None:
+            raise RuntimeError("Could not create destination part collection")
+    else:
+        target_root = target_container
+
+    try:
+        settings.named_target_collection = target_container
+    except Exception:
+        pass
+    try:
+        settings.part_number = _next_split_part_collection_number(target_container)
+    except Exception:
+        pass
+
+    return target_root
+
+def _add_model_split_part_to_planner(context, target_root):
+    planner_path = _resolve_collection_source_path(target_root)
+    if not planner_path and _looks_like_split_part_collection_name(getattr(target_root, "name", "") or ""):
+        scene_root = getattr(getattr(context, "scene", None), "collection", None)
+        parent = _find_parent_collection(scene_root, target_root) if scene_root is not None else None
+        if parent is not None:
+            planner_path = _derive_split_export_source_path(parent, getattr(target_root, "name", "") or "")
+            if planner_path:
+                _set_ie_source_path_tag(target_root, planner_path)
+    if not planner_path:
+        return False, ""
+    try:
+        added = _planner_add_import_file(context.scene.cray_ie_settings, planner_path)
+    except Exception:
+        added = False
+    return added, planner_path
 
 def _flatten_named_split_legacy_visuals_collection(dest_root):
     if dest_root is None:
@@ -8459,225 +9293,111 @@ class CRAY_OT_IE_ImportBatch(Operator):
             self.report({"INFO"}, msg + (f" via {used_op}" if used_op else ""))
         return {"FINISHED"}
 
-class CRAY_OT_ModelSplitDuplicateToPart(Operator):
-    bl_idname = "cray.model_split_duplicate_to_part"
-    bl_label = "Create Part Collection From Selected"
+class CRAY_OT_ModelSplitTransferSelectedToTargetCategory(Operator):
+    bl_idname = "cray.model_split_transfer_to_target_category"
+    bl_label = "Move/Copy Selected To Target Category"
     bl_options = {"REGISTER", "UNDO"}
+
+    transfer_mode: EnumProperty(
+        name="Action",
+        items=(
+            ("MOVE", "Move", "Move selected mesh objects into the target part model"),
+            ("COPY", "Copy", "Copy selected mesh objects into the target part model"),
+        ),
+        default="MOVE",
+    )
 
     def execute(self, context):
         st = context.scene.cray_model_split_settings
-        selected = [obj for obj in context.selected_objects if obj is not None]
-        if not selected:
-            self.report({"ERROR"}, "Select the separated objects you want to turn into a new model part")
+        requested_mode = str(getattr(self, "transfer_mode", "MOVE") or "MOVE").upper()
+        if requested_mode != "COPY":
+            requested_mode = "MOVE"
+
+        try:
+            source_root, selected, separated_from_edit = _model_split_source_and_objects_for_transfer(
+                context,
+                st,
+                copy_selection=(requested_mode == "COPY"),
+            )
+            target_root = _resolve_model_split_target_part_root(context, st, source_root, force_new=False)
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
 
-        missing_root = []
-        roots = {}
-        for obj in selected:
-            root = _find_p3d_root_collection_for_object(context, obj)
-            if root is None:
-                missing_root.append(obj.name)
-                continue
-            roots[root.as_pointer()] = root
+        effective_mode = requested_mode
+        if separated_from_edit:
+            effective_mode = "MOVE"
 
-        if missing_root:
-            preview = ", ".join(missing_root[:5])
-            if len(missing_root) > 5:
-                preview += ", ..."
-            self.report({"ERROR"}, f"Selected objects are not inside a .p3d root collection: {preview}")
-            return {"CANCELLED"}
-
-        if len(roots) != 1:
-            root_names = ", ".join(sorted({root.name for root in roots.values()}, key=lambda x: x.lower()))
-            self.report({"ERROR"}, f"Select objects from exactly one .p3d root collection (found: {root_names})")
-            return {"CANCELLED"}
-
-        source_root = next(iter(roots.values()))
-        dest_root = _ensure_split_part_root_collection(context, source_root, st.part_number)
-        if dest_root is None:
-            self.report({"ERROR"}, "Could not create destination part collection")
-            return {"CANCELLED"}
-
-        copies_by_source = {}
-        created = []
-        failed = []
-
-        for src_obj in selected:
-            source_path = _best_object_collection_path_under_root(source_root, src_obj)
-            if not source_path:
-                failed.append(f"{src_obj.name} -> collection path under {source_root.name} not found")
-                continue
-
-            dest_leaf = _ensure_split_collection_path(dest_root, source_path)
-            if dest_leaf is None:
-                failed.append(f"{src_obj.name} -> failed to create destination collection path")
-                continue
-
-            dup_obj = _duplicate_object_for_split(src_obj)
-            if dup_obj is None:
-                failed.append(f"{src_obj.name} -> failed to duplicate object")
-                continue
-
-            try:
-                dest_leaf.objects.link(dup_obj)
-                copies_by_source[src_obj] = dup_obj
-                created.append(dup_obj)
-            except Exception as e:
-                failed.append(f"{src_obj.name} -> {_fmt_exc(e)}")
-                try:
-                    if bpy.data.objects.get(dup_obj.name) is not None and dup_obj.users == 0:
-                        bpy.data.objects.remove(dup_obj)
-                except Exception:
-                    pass
-
-        _rewire_split_copy_object_refs(copies_by_source)
-        _focus_created_split_objects(context, dest_root, created)
-
-        if failed:
-            print("=== Model Split: Failures ===")
-            for item in failed:
-                print(item)
-
-        if not created:
-            self.report({"ERROR"}, "No part objects were created")
-            return {"CANCELLED"}
-
-        msg = f"Created {len(created)} object copy/copies in {dest_root.name}"
-        if failed:
-            self.report({"WARNING"}, msg + f", failed {len(failed)} (see System Console)")
-        else:
-            self.report({"INFO"}, msg)
-        return {"FINISHED"}
-
-class CRAY_OT_ModelSplitDuplicateToNamedModel(Operator):
-    bl_idname = "cray.model_split_duplicate_to_named_model"
-    bl_label = "Create Named Standalone Model"
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        st = context.scene.cray_model_split_settings
-        selected = [obj for obj in context.selected_objects if obj is not None]
-        if not selected:
-            self.report({"ERROR"}, "Select the separated objects you want to turn into a standalone model")
-            return {"CANCELLED"}
-
-        raw_model_name = (getattr(st, "named_model_name", "") or "").strip()
-        if not raw_model_name:
-            self.report({"ERROR"}, "Enter a new model name first")
-            return {"CANCELLED"}
-
-        if st.named_export_mode == "CUSTOM_DIR":
-            export_dir = bpy.path.abspath(getattr(st, "named_export_directory", "") or "")
-            if not export_dir:
-                self.report({"ERROR"}, "Choose an export folder for the new standalone model")
-                return {"CANCELLED"}
-            try:
-                os.makedirs(export_dir, exist_ok=True)
-            except Exception as e:
-                self.report({"ERROR"}, f"Failed to create export folder: {_fmt_exc(e)}")
-                return {"CANCELLED"}
-
-        missing_root = []
-        roots = {}
-        for obj in selected:
-            root = _find_p3d_root_collection_for_object(context, obj)
-            if root is None:
-                missing_root.append(obj.name)
-                continue
-            roots[root.as_pointer()] = root
-
-        if missing_root:
-            preview = ", ".join(missing_root[:5])
-            if len(missing_root) > 5:
-                preview += ", ..."
-            self.report({"ERROR"}, f"Selected objects are not inside a .p3d root collection: {preview}")
-            return {"CANCELLED"}
-
-        if len(roots) != 1:
-            root_names = ", ".join(sorted({root.name for root in roots.values()}, key=lambda x: x.lower()))
-            self.report({"ERROR"}, f"Select objects from exactly one .p3d root collection (found: {root_names})")
-            return {"CANCELLED"}
-
-        source_root = next(iter(roots.values()))
-        dest_root = _ensure_named_split_model_root_collection(
-            context,
-            source_root,
-            raw_model_name,
-            st.named_export_mode,
-            st.named_export_directory,
-        )
-        if dest_root is None:
-            self.report({"ERROR"}, "Could not create destination standalone model collection")
-            return {"CANCELLED"}
-
-        _flatten_named_split_legacy_visuals_collection(dest_root)
-
-        transfer_mode = str(getattr(st, "named_transfer_mode", "MOVE") or "MOVE").upper()
-
-        created = []
-        failed = []
-        copies_by_source = {}
-
-        if transfer_mode == "MOVE":
+        if effective_mode == "MOVE":
             _prepare_moved_objects_for_named_split(selected)
 
+        created = []
+        failed = []
+        copies_by_source = {}
+        used_categories = set()
+
         for src_obj in selected:
-            source_path = _best_object_collection_path_under_root(source_root, src_obj)
-            if not source_path:
-                failed.append(f"{src_obj.name} -> collection path under {source_root.name} not found")
-                continue
-
-            dest_leaf = _ensure_split_collection_path(dest_root, source_path)
-            if dest_leaf is None:
-                failed.append(f"{src_obj.name} -> failed to create destination collection path")
-                continue
-
             dup_obj = None
             try:
-                if transfer_mode == "COPY":
+                category_token = _model_split_category_for_object(src_obj)
+                dest_leaf = _ensure_model_split_target_category_collection(target_root, category_token)
+                if dest_leaf is None:
+                    failed.append(f"{src_obj.name} -> failed to create A3OB category collection")
+                    continue
+
+                if effective_mode == "COPY":
                     dup_obj = _duplicate_object_for_split(src_obj)
                     if dup_obj is None:
                         failed.append(f"{src_obj.name} -> failed to duplicate object")
                         continue
+                    _set_model_split_target_lod_a3ob_props(dup_obj, category_token)
                     dest_leaf.objects.link(dup_obj)
                     copies_by_source[src_obj] = dup_obj
+                    used_categories.add(_model_split_target_category_label(category_token))
                     created.append(dup_obj)
                 else:
-                    _move_object_to_collection(src_obj, dest_leaf)
+                    _move_object_to_collection(src_obj, dest_leaf, unlink_roots=source_root)
+                    _set_model_split_target_lod_a3ob_props(src_obj, category_token)
+                    used_categories.add(_model_split_target_category_label(category_token))
                     created.append(src_obj)
+                    if not _same_id_data(source_root, target_root):
+                        lingering = _direct_object_collection_names_under_root(source_root, src_obj)
+                        if lingering:
+                            preview = ", ".join(lingering[:5])
+                            if len(lingering) > 5:
+                                preview += ", ..."
+                            failed.append(f"{src_obj.name} -> moved but still linked in source collection(s): {preview}")
             except Exception as e:
                 failed.append(f"{src_obj.name} -> {_fmt_exc(e)}")
-                if transfer_mode == "COPY":
+                if effective_mode == "COPY":
                     try:
                         if dup_obj is not None and bpy.data.objects.get(dup_obj.name) is not None and dup_obj.users == 0:
                             bpy.data.objects.remove(dup_obj)
                     except Exception:
                         pass
 
-        if transfer_mode == "COPY":
+        if effective_mode == "COPY":
             _rewire_split_copy_object_refs(copies_by_source)
 
-        planner_added = False
-        planner_path = _resolve_collection_source_path(dest_root)
-        if planner_path:
-            try:
-                planner_added = _planner_add_import_file(context.scene.cray_ie_settings, planner_path)
-            except Exception:
-                planner_added = False
-
-        _focus_created_split_objects(context, dest_root, created)
+        _focus_created_split_objects(context, target_root, created)
+        planner_added, planner_path = _add_model_split_part_to_planner(context, target_root)
 
         if failed:
-            print("=== Model Split Named Model: Failures ===")
+            print("=== Model Split Target Category: Failures ===")
             for item in failed:
                 print(item)
 
         if not created:
-            self.report({"ERROR"}, "No standalone model objects were created")
+            self.report({"ERROR"}, "No mesh objects were moved or copied")
             return {"CANCELLED"}
 
-        action_word = "Copied" if transfer_mode == "COPY" else "Moved"
-        msg = f"{action_word} {len(created)} object(s) into {dest_root.name} with preserved collection paths"
+        action_word = "Copied" if requested_mode == "COPY" else "Moved"
+        if separated_from_edit and requested_mode == "MOVE":
+            action_word = "Separated and moved"
+        elif separated_from_edit and requested_mode == "COPY":
+            action_word = "Copied selected geometry"
+        category_label = ", ".join(sorted(used_categories, key=str.lower)) if used_categories else "A3OB category"
+        msg = f"{action_word} {len(created)} object(s) to {target_root.name} > {category_label}"
         if planner_path:
             msg += ", added to Import/Export list" if planner_added else ", already in Import/Export list"
         if failed:
@@ -10647,6 +11367,15 @@ class CRAY_PT_ColliderPanel(Panel):
 
         layout.separator()
 
+        fire = layout.box()
+        fire.label(text="Geometries / Fire Geometry", icon="MESH_ICOSPHERE")
+        fire.prop(cs, "fire_geometry_object", text="Fire Geometry")
+        row = fire.row(align=True)
+        row.prop(cs, "fire_geometry_material", text="Material")
+        row.operator("cray.open_fire_geometry_rvmat_folder", text="", icon="FILE_FOLDER")
+
+        layout.separator()
+
         roadway = layout.box()
         roadway.label(text="Misc / Roadway", icon="MESH_PLANE")
         roadway.prop(cs, "roadway_object")
@@ -10800,23 +11529,14 @@ class CRAY_PT_ModelSplitPanel(Panel):
         st = context.scene.cray_model_split_settings
 
         box = layout.box()
-        box.label(text="Separate -> Part Model", icon="OUTLINER_COLLECTION")
-        box.prop(st, "part_number")
-        box.label(text="Select separated objects from one .p3d root", icon="INFO")
-        box.label(text="Original collection stays unchanged", icon="INFO")
-        box.operator("cray.model_split_duplicate_to_part", icon="DUPLICATE")
-
-        named_box = layout.box()
-        named_box.label(text="Separate -> Named Standalone Model", icon="EXPORT")
-        named_box.prop(st, "named_model_name")
-        named_box.prop(st, "named_transfer_mode")
-        named_box.prop(st, "named_export_mode")
-        row = named_box.row()
-        row.enabled = (st.named_export_mode == "CUSTOM_DIR")
-        row.prop(st, "named_export_directory")
-        named_box.label(text="Preserves original paths like Visuals / Geometries / Misc / Point clouds", icon="INFO")
-        named_box.label(text="Saved export path works with Import/Export -> Back to source", icon="INFO")
-        named_box.operator("cray.model_split_duplicate_to_named_model", icon="DUPLICATE")
+        box.label(text="Part Transfer", icon="OUTLINER_COLLECTION")
+        box.prop(st, "named_source_collection", text="Source Model")
+        box.prop(st, "named_target_collection", text="Target Model")
+        row = box.row(align=True)
+        copy_op = row.operator("cray.model_split_transfer_to_target_category", text="Copy", icon="DUPLICATE")
+        copy_op.transfer_mode = "COPY"
+        move_op = row.operator("cray.model_split_transfer_to_target_category", text="Move", icon="EXPORT")
+        move_op.transfer_mode = "MOVE"
 
 class CRAY_PT_TextureReplacePanel(Panel):
     bl_idname = "VIEW3D_PT_cray_texreplace"
@@ -10878,6 +11598,7 @@ classes = (
     CRAY_OT_CopySelectedFacesToRoadway,
     CRAY_OT_WeldRoadwayVertices,
     CRAY_OT_OpenRoadwayMaterialFolder,
+    CRAY_OT_OpenFireGeometryRvmatFolder,
     CRAY_OT_OpenFixListFile,
     CRAY_OT_SelectFixListComponentsOnActiveLOD,
     CRAY_OT_DeleteSelectedComponentsKeepVertices,
@@ -10911,8 +11632,7 @@ classes = (
     CRAY_OT_IE_RemoveFile,
     CRAY_OT_IE_ClearFiles,
     CRAY_OT_IE_ImportBatch,
-    CRAY_OT_ModelSplitDuplicateToPart,
-    CRAY_OT_ModelSplitDuplicateToNamedModel,
+    CRAY_OT_ModelSplitTransferSelectedToTargetCategory,
     CRAY_OT_ConvertSelectedToProxies,
     CRAY_OT_FixShadingByPipeline,
     CRAY_OT_RepairA3OBSelections,
