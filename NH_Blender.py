@@ -1,7 +1,7 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Daryl and Enisam",
-    "version": (0, 4, 0),
+    "version": (0, 4, 9, 1),
     "blender": (5, 1, 0),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "Scatter Arma3 Proxy objects using DayZ clutter config + Texture Replace (.paa/.rvmat) + Replace from DB via A3OB",
@@ -24,6 +24,7 @@ import re
 import shutil
 import importlib
 import json
+import sys
 from contextlib import contextmanager
 import uuid
 
@@ -100,6 +101,8 @@ _PERSISTED_UI_SETTINGS = {
         "recalc_normals",
         "show_hotkey_button_fallbacks",
         "show_advanced_build_buttons",
+        "show_fire_geometry_tools",
+        "show_roadway_tools",
         "roadway_weld_distance",
     ),
     "cray_texreplace_settings": (
@@ -107,6 +110,7 @@ _PERSISTED_UI_SETTINGS = {
         "fix_mesh_join_batch",
         "fix_mesh_center_to_origin",
         "fix_list_path",
+        "export_warn_loose_vertices",
         "split_planar_ngon_vertex_count",
         "split_planar_ngon_angle_tolerance",
         "split_planar_ngon_plane_tolerance",
@@ -1055,7 +1059,11 @@ _FIRE_GEOMETRY_MATERIAL_NONE = "__NONE__"
 _FIRE_GEOMETRY_MATERIAL_ENUM_CACHE = [
     (_FIRE_GEOMETRY_MATERIAL_NONE, "<no materials>", "Selected Fire Geometry object has no assigned materials")
 ]
+_MATERIAL_ADD_NEW = "__ADD_NEW__"
+_COLLIDER_MATERIAL_SELECTION_SYNCING = False
 _COLLIDER_LOD_SYNCING_FROM_OBJECT = False
+_GEOMETRY_LOD_TOKEN = "6"
+_GEOMETRY_LOD_DEFAULT_TOTAL_MASS = 1000.0
 _MODEL_SPLIT_TARGET_CATEGORY_SPECS = {
     "RESOLUTION": {
         "collection": _VISUALS_COLLECTION_NAME,
@@ -1096,6 +1104,9 @@ def _material_enum_items_for_object(obj, *, none_value: str, missing_object_desc
     if obj is None or obj.type != "MESH":
         return [(none_value, missing_object_desc, missing_object_desc)]
 
+    items.append((_MATERIAL_ADD_NEW, "Добавить новый", f"Create and assign a new {slot_desc_prefix.lower()}"))
+    material_count = 0
+
     seen = set()
     for slot_idx, slot in enumerate(obj.material_slots, start=1):
         mat = slot.material
@@ -1121,9 +1132,10 @@ def _material_enum_items_for_object(obj, *, none_value: str, missing_object_desc
                 desc += f" (+{len(uniq_images) - 3} more)"
 
         items.append((mat.name, mat.name, desc))
+        material_count += 1
 
-    if not items:
-        items = [(none_value, "<no materials>", missing_material_desc)]
+    if material_count == 0:
+        items.append((none_value, "<no materials>", missing_material_desc))
 
     return items
 
@@ -1190,6 +1202,139 @@ def _on_collider_target_lod_changed(self, context):
         _set_collider_settings_object(context, "geometry_object", target_obj)
     except Exception:
         pass
+
+
+def _unique_material_name(base_name: str) -> str:
+    base = (base_name or "Material").strip() or "Material"
+    if bpy.data.materials.get(base) is None:
+        return base
+    idx = 1
+    while True:
+        candidate = f"{base}.{idx:03d}"
+        if bpy.data.materials.get(candidate) is None:
+            return candidate
+        idx += 1
+
+
+def _ensure_material_slot(obj, mat):
+    if obj is None or getattr(obj, "type", None) != "MESH" or mat is None or obj.data is None:
+        return -1
+    for idx, existing in enumerate(obj.data.materials):
+        if existing == mat:
+            return idx
+    obj.data.materials.append(mat)
+    return len(obj.data.materials) - 1
+
+
+def _assign_material_to_target_selection(obj, mat) -> bool:
+    slot_idx = _ensure_material_slot(obj, mat)
+    if slot_idx < 0:
+        return False
+
+    assigned = False
+    if obj.mode == "EDIT":
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.faces.ensure_lookup_table()
+        selected_faces = [face for face in bm.faces if face.select]
+        if selected_faces:
+            for face in selected_faces:
+                face.material_index = slot_idx
+            bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+            assigned = True
+
+    if not assigned:
+        for poly in obj.data.polygons:
+            poly.material_index = slot_idx
+        assigned = len(obj.data.polygons) > 0
+
+    return assigned
+
+
+def _selected_material_assignment_objects(context, object_attr: str):
+    if object_attr == "fire_geometry_object":
+        predicate = lambda obj: _poll_fire_geometry_object(None, obj)
+    elif object_attr == "roadway_object":
+        predicate = lambda obj: _poll_roadway_object(None, obj)
+    else:
+        predicate = lambda obj: obj is not None and getattr(obj, "type", None) == "MESH"
+
+    objects = []
+    seen = set()
+    for obj in getattr(context, "selected_objects", []):
+        if not predicate(obj):
+            continue
+        try:
+            ptr = obj.as_pointer()
+        except Exception:
+            ptr = id(obj)
+        if ptr in seen:
+            continue
+        seen.add(ptr)
+        objects.append(obj)
+    return objects
+
+
+def _create_and_assign_target_material(context, *, object_attr: str, material_attr: str, default_name: str, sync_fn):
+    global _COLLIDER_MATERIAL_SELECTION_SYNCING
+
+    cs = getattr(getattr(context, "scene", None), "cray_collider_settings", None)
+    if cs is None:
+        return None
+
+    target_obj = getattr(cs, object_attr, None)
+    if object_attr == "fire_geometry_object":
+        target_obj = _resolve_fire_geometry_object_for_material(context)
+    if target_obj is None or getattr(target_obj, "type", None) != "MESH":
+        _COLLIDER_MATERIAL_SELECTION_SYNCING = True
+        try:
+            setattr(cs, material_attr, _FIRE_GEOMETRY_MATERIAL_NONE if object_attr == "fire_geometry_object" else _ROADWAY_MATERIAL_NONE)
+        finally:
+            _COLLIDER_MATERIAL_SELECTION_SYNCING = False
+        return None
+
+    mat = bpy.data.materials.new(_unique_material_name(default_name))
+    assignment_objects = _selected_material_assignment_objects(context, object_attr)
+    if not assignment_objects:
+        assignment_objects = [target_obj]
+
+    target_in_assignment = False
+    for obj in assignment_objects:
+        if obj == target_obj:
+            target_in_assignment = True
+        _assign_material_to_target_selection(obj, mat)
+    if not target_in_assignment:
+        _ensure_material_slot(target_obj, mat)
+
+    sync_fn(context, mat.name)
+    return mat
+
+
+def _on_roadway_material_changed(self, context):
+    if _COLLIDER_MATERIAL_SELECTION_SYNCING:
+        return
+    if (getattr(self, "roadway_material", "") or "") != _MATERIAL_ADD_NEW:
+        return
+    _create_and_assign_target_material(
+        context,
+        object_attr="roadway_object",
+        material_attr="roadway_material",
+        default_name="RoadwayMaterial",
+        sync_fn=_sync_roadway_material_selection,
+    )
+
+
+def _on_fire_geometry_material_changed(self, context):
+    if _COLLIDER_MATERIAL_SELECTION_SYNCING:
+        return
+    if (getattr(self, "fire_geometry_material", "") or "") != _MATERIAL_ADD_NEW:
+        return
+    _create_and_assign_target_material(
+        context,
+        object_attr="fire_geometry_object",
+        material_attr="fire_geometry_material",
+        default_name="FireGeometryMaterial",
+        sync_fn=_sync_fire_geometry_material_selection,
+    )
 
 
 def _actual_collider_lod_token_from_object(obj) -> str:
@@ -1263,6 +1408,17 @@ def _poll_fire_geometry_object(self, obj):
 def _poll_roadway_object(self, obj):
     del self
     return _object_name_startswith_lod(obj, _ROADWAY_LOD_TOKEN)
+
+
+def _active_or_selected_mesh_object(context):
+    active = getattr(getattr(context, "view_layer", None), "objects", None)
+    active_obj = getattr(active, "active", None) if active is not None else None
+    if active_obj is not None and getattr(active_obj, "type", None) == "MESH":
+        return active_obj
+    for obj in getattr(context, "selected_objects", []):
+        if obj is not None and getattr(obj, "type", None) == "MESH":
+            return obj
+    return None
 
 
 def _on_collider_geometry_object_changed(self, context):
@@ -1350,6 +1506,16 @@ class CRAY_PG_ColliderSettings(PropertyGroup):
         description="Show extra build buttons that are not on hotkeys",
         default=False,
     )
+    show_fire_geometry_tools: BoolProperty(
+        name="Show Fire Geometry Tools",
+        description="Show Fire Geometry material tools",
+        default=True,
+    )
+    show_roadway_tools: BoolProperty(
+        name="Show Roadway Tools",
+        description="Show Roadway material and weld tools",
+        default=True,
+    )
     fire_geometry_object: PointerProperty(
         name="Fire Geometry Object",
         description="Fire Geometry LOD mesh stored in Geometries collection",
@@ -1360,6 +1526,7 @@ class CRAY_PG_ColliderSettings(PropertyGroup):
         name="Fire Geometry Material",
         description="Current material on the Fire Geometry object",
         items=get_fire_geometry_material_enum_items,
+        update=_on_fire_geometry_material_changed,
     )
     roadway_object: PointerProperty(
         name="Roadway Object",
@@ -1371,6 +1538,7 @@ class CRAY_PG_ColliderSettings(PropertyGroup):
         name="Roadway Material",
         description="Current material on the Roadway object",
         items=get_roadway_material_enum_items,
+        update=_on_roadway_material_changed,
     )
     roadway_weld_distance: FloatProperty(
         name="Roadway Weld Distance",
@@ -1687,35 +1855,94 @@ def _temporary_disable_a3ob_lod_validation(enabled: bool):
         yield False
         return
 
-    export_mod = _import_first_available_module(
-        (
-            "bl_ext.user_default.Arma3ObjectBuilder.io.export_p3d",
-            "Arma3ObjectBuilder.io.export_p3d",
-        )
-    )
-    if export_mod is None:
-        yield False
-        return
+    export_mod = _get_a3ob_export_p3d_module()
+    validator_mod = _get_a3ob_validator_module()
+    candidate_classes = []
 
-    validator_cls = getattr(export_mod, "Validator", None)
-    original_validate = getattr(validator_cls, "validate_lod", None) if validator_cls else None
-    if validator_cls is None or not callable(original_validate):
+    for mod in (export_mod, validator_mod):
+        cls = getattr(mod, "Validator", None) if mod is not None else None
+        if cls is not None:
+            candidate_classes.append(cls)
+
+    for module_name, mod in list(sys.modules.items()):
+        if not module_name.endswith(".utilities.validator") and not module_name.endswith(".io.export_p3d"):
+            continue
+        cls = getattr(mod, "Validator", None)
+        if cls is not None:
+            candidate_classes.append(cls)
+
+    patched_validators = []
+    seen_classes = set()
+    for validator_cls in candidate_classes:
+        try:
+            key = id(validator_cls)
+        except Exception:
+            key = None
+        if key is not None and key in seen_classes:
+            continue
+        if key is not None:
+            seen_classes.add(key)
+        original_validate = getattr(validator_cls, "validate_lod", None)
+        if callable(original_validate):
+            patched_validators.append((validator_cls, original_validate))
+
+    patched_proxy_checks = []
+    for mod in (export_mod,):
+        original_validate_proxies = getattr(mod, "validate_proxies", None) if mod is not None else None
+        if callable(original_validate_proxies):
+            patched_proxy_checks.append((mod, original_validate_proxies))
+
+    if not patched_validators and not patched_proxy_checks:
         yield False
         return
 
     def _always_valid(self, obj, lod, lazy=False, warns_errs=True, relative_paths=False):
         return True
 
-    validator_cls.validate_lod = _always_valid
+    def _always_valid_proxies(operator, proxy_objects):
+        return True
+
+    for validator_cls, _original_validate in patched_validators:
+        validator_cls.validate_lod = _always_valid
+    for mod, _original_validate_proxies in patched_proxy_checks:
+        mod.validate_proxies = _always_valid_proxies
+
     try:
         yield True
     finally:
-        validator_cls.validate_lod = original_validate
+        for validator_cls, original_validate in patched_validators:
+            validator_cls.validate_lod = original_validate
+        for mod, original_validate_proxies in patched_proxy_checks:
+            mod.validate_proxies = original_validate_proxies
 
 
 def _call_export_with_optional_relaxed_validation(force_all_lods: bool, **kwargs):
-    with _temporary_disable_a3ob_lod_validation(force_all_lods):
+    with _temporary_disable_a3ob_lod_validation(force_all_lods) as relaxed:
+        if force_all_lods:
+            print("=== Batch Export Collections: Force export all LODs ===")
+            print(
+                "A3OB validation/proxy guards bypassed: "
+                f"{'yes' if relaxed else 'no (A3OB modules were not found)'}"
+            )
         return _call_first_available(_A3OB_EXPORT_CANDIDATES, **kwargs)
+
+
+def _get_a3ob_export_p3d_module():
+    return _import_first_available_module(
+        (
+            "bl_ext.user_default.Arma3ObjectBuilder.io.export_p3d",
+            "Arma3ObjectBuilder.io.export_p3d",
+        )
+    )
+
+
+def _get_a3ob_validator_module():
+    return _import_first_available_module(
+        (
+            "bl_ext.user_default.Arma3ObjectBuilder.utilities.validator",
+            "Arma3ObjectBuilder.utilities.validator",
+        )
+    )
 
 
 def _get_a3ob_data_p3d_module():
@@ -1934,6 +2161,101 @@ def _iter_a3ob_export_meshes_for_lod_root(root_obj):
         meshes.append(child)
     return meshes
 
+
+def _geometry_lod_root_objects(export_objects):
+    roots = []
+    seen = set()
+    for obj in export_objects or []:
+        if not _is_a3ob_lod_root_object(obj):
+            continue
+        try:
+            lod_token = str(getattr(obj.a3ob_properties_object, "lod", "") or "").strip()
+        except Exception:
+            continue
+        if lod_token != _GEOMETRY_LOD_TOKEN:
+            continue
+        try:
+            ptr = obj.as_pointer()
+        except Exception:
+            ptr = id(obj)
+        if ptr in seen:
+            continue
+        seen.add(ptr)
+        roots.append(obj)
+    return roots
+
+
+def _read_mesh_mass_values(obj):
+    if obj is None or getattr(obj, "type", None) != "MESH" or obj.data is None:
+        return []
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(obj.data)
+        layer = bm.verts.layers.float.get("a3ob_mass")
+        if layer is None:
+            return [0.0 for _vert in bm.verts]
+        return [float(vert[layer]) for vert in bm.verts]
+    finally:
+        bm.free()
+
+
+def _write_mesh_mass_uniform(obj, value_per_vertex: float):
+    if obj is None or getattr(obj, "type", None) != "MESH" or obj.data is None:
+        return 0
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(obj.data)
+        bm.verts.ensure_lookup_table()
+        layer = bm.verts.layers.float.get("a3ob_mass")
+        if layer is None:
+            layer = bm.verts.layers.float.new("a3ob_mass")
+        for vert in bm.verts:
+            vert[layer] = value_per_vertex
+        changed = len(bm.verts)
+        bm.to_mesh(obj.data)
+        obj.data.update()
+        return changed
+    finally:
+        bm.free()
+
+
+def _prepare_geometry_lod_mass_for_export(export_objects):
+    prepared = []
+    for root_obj in _geometry_lod_root_objects(export_objects):
+        meshes = list(_iter_a3ob_export_meshes_for_lod_root(root_obj))
+        if not meshes:
+            continue
+
+        values_by_obj = []
+        total_verts = 0
+        total_mass = 0.0
+        has_missing_mass = False
+        for mesh_obj in meshes:
+            values = _read_mesh_mass_values(mesh_obj)
+            if not values:
+                continue
+            values_by_obj.append((mesh_obj, values))
+            total_verts += len(values)
+            total_mass += math.fsum(values)
+            if any(value <= 1e-7 for value in values):
+                has_missing_mass = True
+
+        if total_verts <= 0:
+            continue
+        if total_mass > 1e-7 and not has_missing_mass:
+            continue
+
+        target_total_mass = total_mass if total_mass > 1e-7 else _GEOMETRY_LOD_DEFAULT_TOTAL_MASS
+        value_per_vertex = target_total_mass / total_verts
+        changed_verts = 0
+        for mesh_obj, _values in values_by_obj:
+            changed_verts += _write_mesh_mass_uniform(mesh_obj, value_per_vertex)
+        if changed_verts:
+            prepared.append((root_obj.name, changed_verts, target_total_mass))
+
+    return prepared
+
+
 def _mesh_ngon_stats(mesh_obj):
     if mesh_obj is None or mesh_obj.type != "MESH" or mesh_obj.data is None:
         return 0, 0
@@ -1948,6 +2270,208 @@ def _mesh_ngon_stats(mesh_obj):
         if side_count > max_sides:
             max_sides = side_count
     return ngon_count, max_sides
+
+
+def _mesh_isolated_vertex_count(mesh_obj):
+    return len(_mesh_isolated_vertex_indices(mesh_obj))
+
+
+def _mesh_isolated_vertex_indices(mesh_obj):
+    if mesh_obj is None or mesh_obj.type != "MESH" or mesh_obj.data is None:
+        return []
+
+    mesh = mesh_obj.data
+    if not getattr(mesh, "vertices", None):
+        return []
+
+    used_vertex_indices = set()
+    for edge in getattr(mesh, "edges", []):
+        try:
+            used_vertex_indices.update(edge.vertices)
+        except Exception:
+            pass
+    for poly in getattr(mesh, "polygons", []):
+        try:
+            used_vertex_indices.update(poly.vertices)
+        except Exception:
+            pass
+
+    return [vert.index for vert in mesh.vertices if vert.index not in used_vertex_indices]
+
+
+def _is_point_cloud_export_lod(root_obj, lod_token: str, lod_name: str) -> bool:
+    if lod_token in _MODEL_SPLIT_POINT_CLOUD_LODS:
+        return True
+
+    logical_names = {
+        _logical_collection_name(_MEMORY_COLLECTION_NAME),
+        _logical_collection_name(_MemoryLodManager.OBJECT_NAME),
+    }
+    return _logical_collection_name(lod_name) in logical_names or _logical_collection_name(root_obj.name) in logical_names
+
+
+def _collect_export_loose_vertex_warnings(root_collection, export_objects):
+    warnings = []
+    seen_lod_roots = set()
+
+    for obj in export_objects:
+        if not _is_a3ob_lod_root_object(obj):
+            continue
+        try:
+            root_ptr = obj.as_pointer()
+        except Exception:
+            root_ptr = None
+        if root_ptr in seen_lod_roots:
+            continue
+        if root_ptr is not None:
+            seen_lod_roots.add(root_ptr)
+
+        try:
+            lod_token = str(getattr(obj.a3ob_properties_object, "lod", "") or "").strip()
+        except Exception:
+            lod_token = ""
+
+        try:
+            lod_name = str(obj.a3ob_properties_object.get_name())
+        except Exception:
+            lod_name = obj.name
+
+        if _is_point_cloud_export_lod(obj, lod_token, lod_name):
+            continue
+
+        for mesh_obj in _iter_a3ob_export_meshes_for_lod_root(obj):
+            isolated_indices = _mesh_isolated_vertex_indices(mesh_obj)
+            isolated_count = len(isolated_indices)
+            if isolated_count <= 0:
+                continue
+            _, actual_parts = _actual_top_level_collection_key_under_root(root_collection, mesh_obj)
+            warnings.append(
+                {
+                    "lod_object_name": obj.name,
+                    "lod_name": lod_name,
+                    "mesh_object_name": mesh_obj.name,
+                    "mesh_object": mesh_obj,
+                    "isolated_count": isolated_count,
+                    "isolated_indices": isolated_indices,
+                    "actual_branch": actual_parts,
+                }
+            )
+
+    warnings.sort(
+        key=lambda rec: (
+            rec["lod_name"],
+            rec["mesh_object_name"],
+        )
+    )
+    return warnings
+
+
+def _report_export_loose_vertex_warnings_in_console(collection_name: str, filepath: str, warnings):
+    if not warnings:
+        return
+
+    print("=== Batch Export Collections: Loose vertices warning ===")
+    print(f"Collection: {collection_name}")
+    print(f"File: {filepath}")
+    print(
+        "WARNING: Export continued, but these LODs contain isolated vertices with no edges or faces. "
+        "Only Point clouds > Memory is allowed to keep loose points."
+    )
+    for item in warnings:
+        actual_branch = " > ".join(item["actual_branch"])
+        indices = list(item.get("isolated_indices", []) or [])
+        index_preview = ", ".join(str(idx) for idx in indices[:20])
+        if len(indices) > 20:
+            index_preview += ", ..."
+        if not index_preview:
+            index_preview = "<not available>"
+        print(
+            f" - LOD: {item['lod_name']} | root: {item['lod_object_name']} | "
+            f"mesh: {item['mesh_object_name']} | loose vertices: {item['isolated_count']} | "
+            f"branch: {actual_branch} | indices: {index_preview}"
+        )
+
+
+def _loose_vertices_outside_memory_root_collections(context):
+    scene = getattr(context, "scene", None)
+    if scene is None or getattr(scene, "collection", None) is None:
+        return []
+
+    active_obj = getattr(context, "active_object", None)
+    active_root = _find_p3d_root_collection_for_object(context, active_obj)
+    if active_root is not None:
+        return [active_root]
+
+    roots = []
+    seen = set()
+
+    for obj in getattr(context, "selected_objects", []) or []:
+        root = _find_p3d_root_collection_for_object(context, obj)
+        if root is None:
+            continue
+        try:
+            ptr = root.as_pointer()
+        except Exception:
+            ptr = id(root)
+        if ptr in seen:
+            continue
+        seen.add(ptr)
+        roots.append(root)
+
+    if roots:
+        return roots
+
+    p3d_roots = list(_iter_p3d_root_collections(scene))
+    if p3d_roots:
+        return [root for root in p3d_roots if _collection_has_any_mesh(root)]
+
+    return [col for col in scene.collection.children if _collection_has_any_mesh(col)]
+
+
+def _collect_loose_vertices_outside_memory_records(context):
+    records = []
+    seen = set()
+
+    for root_collection in _loose_vertices_outside_memory_root_collections(context):
+        objects = _collect_collection_objects_recursive(root_collection)
+        warnings = _collect_export_loose_vertex_warnings(root_collection, objects)
+        for item in warnings:
+            mesh_obj = item.get("mesh_object")
+            if mesh_obj is None:
+                mesh_obj = bpy.data.objects.get(item.get("mesh_object_name", ""))
+            if mesh_obj is None or mesh_obj.type != "MESH" or mesh_obj.data is None:
+                continue
+
+            isolated_indices = list(item.get("isolated_indices", []) or [])
+            if not isolated_indices:
+                isolated_indices = _mesh_isolated_vertex_indices(mesh_obj)
+            if not isolated_indices:
+                continue
+
+            try:
+                key = (root_collection.as_pointer(), mesh_obj.as_pointer())
+            except Exception:
+                key = (id(root_collection), id(mesh_obj))
+            if key in seen:
+                continue
+            seen.add(key)
+
+            rec = dict(item)
+            rec["root_collection"] = root_collection
+            rec["mesh_object"] = mesh_obj
+            rec["isolated_indices"] = isolated_indices
+            rec["isolated_count"] = len(isolated_indices)
+            records.append(rec)
+
+    records.sort(
+        key=lambda rec: (
+            getattr(rec.get("root_collection"), "name", ""),
+            rec.get("lod_name", ""),
+            rec.get("mesh_object_name", ""),
+        )
+    )
+    return records
+
 
 def _collect_export_ngon_issues(root_collection, export_objects):
     issues = []
@@ -2053,6 +2577,513 @@ def _report_missing_lods_in_console(collection_name: str, filepath: str, expecte
         objs = ", ".join(rec["objects"])
         print(f" - {rec['lod_name']} | signature: {rec['signature']:.6e} | object(s): {objs}")
     return missing_keys
+
+
+def _format_lod_signature_preview(keys, entries, limit=8):
+    if not keys:
+        return "<none>"
+    parts = []
+    for key in list(keys)[:limit]:
+        rec = entries.get(key, {})
+        lod_name = str(rec.get("lod_name", "") or "").strip()
+        signature = rec.get("signature", None)
+        if signature is None:
+            text = key
+        else:
+            text = f"{float(signature):.6e}"
+        if lod_name:
+            text = f"{lod_name} ({text})"
+        parts.append(text)
+    if len(keys) > limit:
+        parts.append("...")
+    return ", ".join(parts)
+
+
+def _read_lod_entries_if_possible(filepath: str):
+    try:
+        return _read_exported_lod_entries(filepath), ""
+    except Exception as e:
+        return None, _fmt_exc(e)
+
+
+def _should_create_export_backup(filepath: str, expected_entries):
+    backup_path = filepath + ".bak"
+    if not os.path.isfile(filepath):
+        return False, "target file does not exist", []
+
+    target_entries, target_err = _read_lod_entries_if_possible(filepath)
+    if target_entries is None:
+        return False, f"could not verify existing target LODs: {target_err}", []
+
+    missing_expected = []
+    if expected_entries:
+        missing_expected = sorted(
+            set(expected_entries.keys()) - set(target_entries.keys()),
+            key=lambda k: expected_entries[k]["signature"],
+        )
+        if missing_expected:
+            return (
+                False,
+                (
+                    "existing target already misses "
+                    f"{len(missing_expected)}/{len(expected_entries)} expected LOD signature(s)"
+                ),
+                missing_expected,
+            )
+
+    if os.path.isfile(backup_path):
+        backup_entries, backup_err = _read_lod_entries_if_possible(backup_path)
+        if backup_entries is not None and len(target_entries) < len(backup_entries):
+            return (
+                False,
+                (
+                    "existing target has fewer LOD signatures "
+                    f"({len(target_entries)}) than current backup ({len(backup_entries)})"
+                ),
+                [],
+            )
+        if backup_entries is None:
+            print("=== Batch Export Collections: Backup verification warning ===")
+            print(f"Backup: {backup_path}")
+            print(f"WARNING: Existing .bak could not be checked: {backup_err}")
+
+    return True, f"verified existing target with {len(target_entries)} LOD signature(s)", []
+
+
+def _pending_export_backup_path(filepath: str) -> str:
+    return filepath + ".bak.pending"
+
+
+def _stage_export_backup(filepath: str):
+    if not os.path.isfile(filepath):
+        return "", "target file does not exist"
+
+    pending_path = _pending_export_backup_path(filepath)
+    try:
+        if os.path.exists(pending_path):
+            os.remove(pending_path)
+        shutil.copy2(filepath, pending_path)
+    except Exception as e:
+        return "", _fmt_exc(e)
+    return pending_path, ""
+
+
+def _lod_entries_missing_expected(entries, expected_entries):
+    if not expected_entries:
+        return []
+    if entries is None:
+        return list(expected_entries.keys())
+    return sorted(
+        set(expected_entries.keys()) - set(entries.keys()),
+        key=lambda k: expected_entries[k]["signature"],
+    )
+
+
+def _promote_pending_export_backup(pending_path: str, backup_path: str):
+    if not pending_path or not os.path.isfile(pending_path):
+        raise RuntimeError("pending backup file is missing")
+    shutil.copy2(pending_path, backup_path)
+    try:
+        os.remove(pending_path)
+    except Exception:
+        pass
+
+
+def _discard_pending_export_backup(pending_path: str):
+    if not pending_path:
+        return
+    try:
+        if os.path.exists(pending_path):
+            os.remove(pending_path)
+    except Exception:
+        pass
+
+
+def _finalize_export_backup(filepath: str, pending_path: str, expected_entries, export_complete: bool):
+    backup_path = filepath + ".bak"
+    if not pending_path:
+        return "none", "no backup was staged", []
+
+    pending_entries, pending_err = _read_lod_entries_if_possible(pending_path)
+    if pending_entries is None:
+        _discard_pending_export_backup(pending_path)
+        return "skipped", f"could not verify staged backup: {pending_err}", []
+
+    pending_missing = _lod_entries_missing_expected(pending_entries, expected_entries)
+    backup_entries = None
+    backup_err = ""
+    if os.path.isfile(backup_path):
+        backup_entries, backup_err = _read_lod_entries_if_possible(backup_path)
+
+    backup_has_more_lods = (
+        backup_entries is not None
+        and len(backup_entries) > len(pending_entries)
+    )
+
+    if export_complete:
+        if backup_has_more_lods:
+            _discard_pending_export_backup(pending_path)
+            return (
+                "preserved",
+                (
+                    "existing .bak has more LOD signatures "
+                    f"({len(backup_entries)}) than pre-export target ({len(pending_entries)})"
+                ),
+                [],
+            )
+        _promote_pending_export_backup(pending_path, backup_path)
+        if pending_missing:
+            return (
+                "updated",
+                (
+                    "export completed with more expected LODs than the pre-export target; "
+                    "saved the replaced target as .bak"
+                ),
+                pending_missing,
+            )
+        return "updated", f"saved pre-export target with {len(pending_entries)} LOD signature(s)", []
+
+    if pending_missing:
+        _discard_pending_export_backup(pending_path)
+        if backup_entries is not None:
+            return (
+                "preserved",
+                (
+                    "export was partial and the pre-export target was also missing "
+                    f"{len(pending_missing)}/{len(expected_entries)} expected LOD signature(s); "
+                    "kept existing .bak"
+                ),
+                pending_missing,
+            )
+        return (
+            "skipped",
+            (
+                "export was partial and the pre-export target was also missing "
+                f"{len(pending_missing)}/{len(expected_entries)} expected LOD signature(s)"
+            ),
+            pending_missing,
+        )
+
+    if backup_has_more_lods:
+        _discard_pending_export_backup(pending_path)
+        return (
+            "preserved",
+            (
+                "export was partial; kept existing .bak because it has more LOD signatures "
+                f"({len(backup_entries)}) than pre-export target ({len(pending_entries)})"
+            ),
+            [],
+        )
+
+    if backup_entries is None and backup_err:
+        print("=== Batch Export Collections: Backup verification warning ===")
+        print(f"Backup: {backup_path}")
+        print(f"WARNING: Existing .bak could not be checked: {backup_err}")
+
+    _promote_pending_export_backup(pending_path, backup_path)
+    return (
+        "updated",
+        (
+            "export was partial, but the pre-export target had all expected LOD signatures; "
+            "saved it as .bak"
+        ),
+        [],
+    )
+
+
+def _report_export_backup_skipped_in_console(collection_name: str, filepath: str, reason: str, missing_keys, expected_entries):
+    print("=== Batch Export Collections: Backup skipped ===")
+    print(f"Collection: {collection_name}")
+    print(f"File: {filepath}")
+    print(f"Backup: {filepath}.bak")
+    print(f"WARNING: Existing target was not copied to .bak: {reason}")
+    if missing_keys:
+        print(
+            "Missing in existing target: "
+            f"{_format_lod_signature_preview(missing_keys, expected_entries)}"
+        )
+
+
+def _report_export_backup_preserved_in_console(collection_name: str, filepath: str, reason: str, missing_keys, expected_entries):
+    print("=== Batch Export Collections: Backup preserved ===")
+    print(f"Collection: {collection_name}")
+    print(f"File: {filepath}")
+    print(f"Backup: {filepath}.bak")
+    print(f"INFO: Existing .bak was kept: {reason}")
+    if missing_keys:
+        print(
+            "Missing in pre-export target: "
+            f"{_format_lod_signature_preview(missing_keys, expected_entries)}"
+        )
+
+
+def _report_export_backup_updated_in_console(collection_name: str, filepath: str, reason: str, missing_keys, expected_entries):
+    if not reason or not missing_keys:
+        return
+    print("=== Batch Export Collections: Backup updated ===")
+    print(f"Collection: {collection_name}")
+    print(f"File: {filepath}")
+    print(f"Backup: {filepath}.bak")
+    print(f"INFO: {reason}")
+    print(
+        "Missing in pre-export target: "
+        f"{_format_lod_signature_preview(missing_keys, expected_entries)}"
+    )
+
+
+class _A3OBValidationCaptureLogger:
+    def __init__(self, depth=0):
+        self.depth = depth
+        self.lines = []
+
+    def start_subproc(self, message=""):
+        if message:
+            self.step(message)
+        self.depth += 1
+
+    def end_subproc(self, showtime=False):
+        self.depth = max(0, self.depth - 1)
+
+    def step(self, message):
+        self.lines.append(f"{'  ' * self.depth}{message}")
+
+
+def _is_ascii_text(value) -> bool:
+    try:
+        str(value or "").encode("ascii")
+        return True
+    except Exception:
+        return False
+
+
+def _collect_a3ob_proxy_validation_diagnostics(operator, proxy_objects):
+    lines = []
+    for proxy in proxy_objects or []:
+        original_name = ""
+        try:
+            original_name = str(proxy.get("a3ob_original_object", "") or "")
+        except Exception:
+            original_name = ""
+        display_name = original_name or getattr(proxy, "name", "<unnamed proxy>")
+
+        issues = []
+        mesh = getattr(proxy, "data", None)
+        poly_count = len(getattr(mesh, "polygons", []) or []) if mesh is not None else 0
+        vert_count = len(getattr(mesh, "vertices", []) or []) if mesh is not None else 0
+        first_face_verts = 0
+        if mesh is not None and poly_count > 0:
+            try:
+                first_face_verts = len(mesh.polygons[0].vertices)
+            except Exception:
+                first_face_verts = 0
+        if poly_count != 1 or first_face_verts != 3:
+            issues.append(
+                "geometry must be exactly one triangular face "
+                f"(verts={vert_count}, faces={poly_count}, first_face_verts={first_face_verts})"
+            )
+
+        proxy_props = getattr(proxy, "a3ob_properties_object_proxy", None)
+        if proxy_props is None:
+            issues.append("missing A3OB proxy properties")
+        else:
+            try:
+                proxy_path, _proxy_selection = proxy_props.to_placeholder(operator.relative_paths)
+            except Exception as e:
+                issues.append(f"proxy path read failed: {_fmt_exc(e)}")
+            else:
+                if not _is_ascii_text(proxy_path):
+                    issues.append(f"proxy path has non-ASCII characters: {proxy_path}")
+
+        bad_groups = [
+            group.name for group in getattr(proxy, "vertex_groups", [])
+            if not _is_ascii_text(getattr(group, "name", ""))
+        ]
+        if bad_groups:
+            preview = ", ".join(bad_groups[:5])
+            if len(bad_groups) > 5:
+                preview += ", ..."
+            issues.append(f"vertex group name has non-ASCII characters: {preview}")
+
+        for slot_idx, slot in enumerate(getattr(proxy, "material_slots", []) or []):
+            mat = getattr(slot, "material", None)
+            if mat is None:
+                continue
+            mat_props = getattr(mat, "a3ob_properties_material", None)
+            if mat_props is None:
+                issues.append(f"material slot {slot_idx} '{mat.name}' is missing A3OB material properties")
+                continue
+            try:
+                texture, material = mat_props.to_p3d(operator.relative_paths)
+            except Exception as e:
+                issues.append(f"material slot {slot_idx} '{mat.name}' read failed: {_fmt_exc(e)}")
+                continue
+            if not _is_ascii_text(texture) or not _is_ascii_text(material):
+                issues.append(
+                    f"material slot {slot_idx} '{mat.name}' has non-ASCII path: "
+                    f"texture='{texture}', material='{material}'"
+                )
+
+        if issues:
+            for issue in issues:
+                lines.append(f"Proxy '{display_name}': {issue}")
+        else:
+            lines.append(f"Proxy '{display_name}': passed detailed proxy checks")
+
+    return lines
+
+
+def _make_a3ob_export_diagnostic_operator(force_all_lods: bool):
+    operator = type("_NH_A3OBExportDiagnosticOperator", (), {})()
+    operator.filepath = ""
+    operator.use_selection = True
+    operator.visible_only = False
+    operator.relative_paths = True
+    operator.preserve_normals = True
+    operator.validate_meshes = False
+    operator.apply_transforms = True
+    operator.apply_modifiers = True
+    operator.sort_sections = True
+    operator.lod_collisions = "IGNORE" if force_all_lods else "SKIP"
+    operator.validate_lods = False
+    operator.validate_lods_warning_errors = False
+    operator.generate_components = True
+    operator.force_lowercase = True
+    operator.renumber_components = False
+    operator.translate_selections = False
+    return operator
+
+
+def _collect_a3ob_lod_export_diagnostics(context, source_obj, force_all_lods: bool):
+    if source_obj is None or getattr(source_obj, "type", None) != "MESH":
+        return ["ERROR: source LOD object is not a mesh"]
+
+    export_mod = _get_a3ob_export_p3d_module()
+    validator_mod = _get_a3ob_validator_module()
+    validator_cls = getattr(export_mod, "Validator", None) if export_mod is not None else None
+    if validator_cls is None and validator_mod is not None:
+        validator_cls = getattr(validator_mod, "Validator", None)
+
+    required_names = (
+        "create_temp_collection",
+        "cleanup_temp_collection",
+        "duplicate_object",
+        "get_sub_objects",
+        "merge_sub_objects",
+        "validate_proxies",
+        "temporary_component",
+    )
+    if export_mod is None or validator_cls is None or any(getattr(export_mod, name, None) is None for name in required_names):
+        return ["ERROR: A3OB export diagnostics are unavailable (module API not found)"]
+
+    temp_collection = None
+    lines = []
+    operator = _make_a3ob_export_diagnostic_operator(force_all_lods)
+    try:
+        temp_collection = export_mod.create_temp_collection(context)
+        if getattr(source_obj, "mode", "OBJECT") != "OBJECT":
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception:
+                pass
+
+        main_obj = export_mod.duplicate_object(source_obj, temp_collection)
+        sub_objects, proxy_objects = export_mod.get_sub_objects(source_obj, temp_collection)
+        lines.append(
+            "Preprocess: "
+            f"children={len(getattr(source_obj, 'children', []) or [])}, "
+            f"sub-objects={len(sub_objects)}, proxies={len(proxy_objects)}"
+        )
+
+        proxy_valid = bool(export_mod.validate_proxies(operator, proxy_objects))
+        if not proxy_valid:
+            lines.append(
+                "ERROR: proxy validation failed "
+                "(proxy must be one triangle and use ASCII paths/materials/groups)"
+            )
+            lines.extend(_collect_a3ob_proxy_validation_diagnostics(operator, proxy_objects))
+
+        export_mod.merge_sub_objects(operator, main_obj, sub_objects)
+        mesh = getattr(main_obj, "data", None)
+        if mesh is not None:
+            lines.append(
+                "Merged mesh: "
+                f"verts={len(getattr(mesh, 'vertices', []))}, "
+                f"edges={len(getattr(mesh, 'edges', []))}, "
+                f"faces={len(getattr(mesh, 'polygons', []))}, "
+                f"materials={len(getattr(main_obj, 'material_slots', []))}, "
+                f"uv_layers={len(getattr(mesh, 'uv_layers', []))}"
+            )
+
+        logger = _A3OBValidationCaptureLogger()
+        validator = validator_cls(logger)
+        lod_token = str(getattr(main_obj.a3ob_properties_object, "lod", "") or "")
+        with export_mod.temporary_component(operator, main_obj):
+            validation_valid = bool(
+                validator.validate_lod(
+                    main_obj,
+                    lod_token,
+                    False,
+                    False,
+                    True,
+                )
+            )
+
+        interesting_lines = [
+            line for line in logger.lines
+            if "ERROR:" in line or "WARNING:" in line or "Validation " in line
+        ]
+        lines.extend(interesting_lines or logger.lines[-8:])
+
+        if proxy_valid and validation_valid:
+            lines.append(
+                "A3OB generic validation passed after merge; if this LOD is still missing, "
+                "the skip likely happened after validation (duplicate signature or writer-side failure)."
+            )
+        return lines
+    except Exception as e:
+        return [f"ERROR: diagnostic failed: {_fmt_exc(e)}"]
+    finally:
+        if temp_collection is not None:
+            try:
+                export_mod.cleanup_temp_collection(temp_collection)
+            except Exception:
+                pass
+
+
+def _report_missing_lod_diagnostics_in_console(
+    context,
+    collection_name: str,
+    filepath: str,
+    missing_keys,
+    expected_entries,
+    export_objects,
+    force_all_lods: bool,
+):
+    if not missing_keys:
+        return
+
+    by_name = {}
+    for obj in export_objects or []:
+        name = getattr(obj, "name", "")
+        if name:
+            by_name.setdefault(name, obj)
+
+    print("=== Batch Export Collections: Missing LOD diagnostics ===")
+    print(f"Collection: {collection_name}")
+    print(f"File: {filepath}")
+    print(f"Force export all LODs: {'ON' if force_all_lods else 'OFF'}")
+    for key in missing_keys:
+        rec = expected_entries.get(key, {})
+        print(f"LOD: {rec.get('lod_name', key)} | signature: {rec.get('signature', 0.0):.6e}")
+        for obj_name in rec.get("objects", []):
+            obj = by_name.get(obj_name) or bpy.data.objects.get(obj_name)
+            print(f"Object: {obj_name}")
+            diagnostic_lines = _collect_a3ob_lod_export_diagnostics(context, obj, force_all_lods)
+            for line in diagnostic_lines[:40]:
+                print(f" - {line}")
+            if len(diagnostic_lines) > 40:
+                print(f" - ... {len(diagnostic_lines) - 40} more diagnostic line(s)")
+
 
 def _is_memory_lod_mesh_object(obj) -> bool:
     return _MemoryLodManager.is_memory_lod_mesh_object(obj)
@@ -3164,12 +4195,18 @@ def _set_collider_settings_object(context, attr_name, obj):
 
 
 def _sync_material_selection(context, material_attr: str, items_fn, none_value: str, preferred_name=""):
+    global _COLLIDER_MATERIAL_SELECTION_SYNCING
+
     cs = getattr(getattr(context, "scene", None), "cray_collider_settings", None)
     if cs is None:
         return
 
     items = items_fn(None, context)
-    valid_values = [item[0] for item in items if item and item[0] != none_value]
+    valid_values = [
+        item[0]
+        for item in items
+        if item and item[0] not in {none_value, _MATERIAL_ADD_NEW}
+    ]
     current = (getattr(cs, material_attr, "") or "").strip()
     preferred_name = (preferred_name or "").strip()
 
@@ -3182,10 +4219,14 @@ def _sync_material_selection(context, material_attr: str, items_fn, none_value: 
     else:
         chosen = none_value
 
+    _COLLIDER_MATERIAL_SELECTION_SYNCING = True
     try:
-        setattr(cs, material_attr, chosen)
-    except Exception:
-        pass
+        try:
+            setattr(cs, material_attr, chosen)
+        except Exception:
+            pass
+    finally:
+        _COLLIDER_MATERIAL_SELECTION_SYNCING = False
 
     _tag_redraw_all_areas(context)
 
@@ -4619,6 +5660,75 @@ class CRAY_OT_ColliderHotkeysInfo(Operator):
         return {"FINISHED"}
 
 
+class CRAY_OT_SetColliderTargetFromActive(Operator):
+    """Use the active selected mesh as the current target object"""
+
+    bl_idname = "cray.set_collider_target_from_active"
+    bl_label = "Use Active Mesh"
+    bl_options = {"REGISTER", "UNDO"}
+
+    target_attr: EnumProperty(
+        name="Target",
+        items=(
+            ("GEOMETRY", "Target LOD Object", "Set the main Geometry Collider target"),
+            ("FIRE", "Fire Geometry", "Set the Fire Geometry target"),
+            ("ROADWAY", "Roadway", "Set the Roadway target"),
+        ),
+        default="GEOMETRY",
+        options={"HIDDEN"},
+    )
+
+    @classmethod
+    def description(cls, context, properties):
+        del context
+        label = {
+            "GEOMETRY": "Target LOD Object",
+            "FIRE": "Fire Geometry",
+            "ROADWAY": "Roadway",
+        }.get(getattr(properties, "target_attr", "GEOMETRY"), "target")
+        return f"Use the active selected mesh as {label}"
+
+    def execute(self, context):
+        cs = context.scene.cray_collider_settings
+        obj = _active_or_selected_mesh_object(context)
+        if obj is None:
+            self.report({"ERROR"}, "Select a mesh object first")
+            return {"CANCELLED"}
+
+        target_attr = str(getattr(self, "target_attr", "GEOMETRY") or "GEOMETRY").upper()
+        if target_attr == "FIRE":
+            if not _poll_fire_geometry_object(None, obj):
+                self.report({"ERROR"}, "Active mesh name must start with 'Fire Geometry'")
+                return {"CANCELLED"}
+            _set_collider_settings_object(context, "fire_geometry_object", obj)
+            _set_collider_settings_object(context, "geometry_object", obj)
+            try:
+                cs.target_lod = _FIRE_GEOMETRY_LOD_TOKEN
+            except Exception:
+                pass
+            _sync_fire_geometry_material_selection(context)
+        elif target_attr == "ROADWAY":
+            if not _poll_roadway_object(None, obj):
+                self.report({"ERROR"}, "Active mesh name must start with 'Roadway'")
+                return {"CANCELLED"}
+            _set_collider_settings_object(context, "roadway_object", obj)
+            _sync_roadway_material_selection(context)
+        else:
+            _set_collider_settings_object(context, "geometry_object", obj)
+            lod_token = _collider_lod_token_from_object(obj, allow_name_fallback=True)
+            if lod_token in _COLLIDER_LOD_NAMES:
+                try:
+                    cs.target_lod = lod_token
+                except Exception:
+                    pass
+            if lod_token == _FIRE_GEOMETRY_LOD_TOKEN:
+                _set_collider_settings_object(context, "fire_geometry_object", obj)
+                _sync_fire_geometry_material_selection(context)
+
+        self.report({"INFO"}, f"Target set to {obj.name}")
+        return {"FINISHED"}
+
+
 class CRAY_OT_EnsureRoadwayLOD(Operator):
     """Create or find the Roadway LOD mesh inside Misc collection"""
 
@@ -4932,6 +6042,94 @@ class CRAY_OT_SelectIsolatedVertices(Operator):
         bm.select_flush_mode()
         bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
         self.report({"INFO"}, f"Selected {len(isolated_verts)} isolated vertex/vertices")
+        return {"FINISHED"}
+
+
+class CRAY_OT_SelectLooseVerticesOutsideMemory(Operator):
+    """Find non-Memory LOD loose vertices and select them on the first matching mesh"""
+
+    bl_idname = "cray.select_loose_vertices_outside_memory"
+    bl_label = "Select Loose Vertices Outside Memory"
+    bl_description = (
+        "Find isolated vertices in exportable LODs outside Point clouds > Memory, "
+        "then select the first matching mesh in Edit Mode"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        try:
+            records = _collect_loose_vertices_outside_memory_records(context)
+        except Exception as e:
+            self.report({"ERROR"}, f"Loose vertex scan failed: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+
+        if not records:
+            self.report({"INFO"}, "No loose vertices outside Memory found")
+            return {"FINISHED"}
+
+        total_vertices = sum(int(rec.get("isolated_count", 0) or 0) for rec in records)
+        print("=== Select Loose Vertices Outside Memory ===")
+        print(f"Found {total_vertices} loose vertex/vertices in {len(records)} mesh object(s).")
+        for rec in records:
+            root_collection = rec.get("root_collection")
+            root_name = getattr(root_collection, "name", "<unknown>")
+            actual_branch = " > ".join(rec.get("actual_branch", ()) or ())
+            indices = list(rec.get("isolated_indices", []) or [])
+            index_preview = ", ".join(str(idx) for idx in indices[:20])
+            if len(indices) > 20:
+                index_preview += ", ..."
+            print(
+                f" - {root_name} | LOD: {rec.get('lod_name', '')} | "
+                f"mesh: {rec.get('mesh_object_name', '')} | loose vertices: {len(indices)} | "
+                f"branch: {actual_branch} | indices: {index_preview}"
+            )
+
+        target = records[0]
+        target_obj = target.get("mesh_object")
+        target_root = target.get("root_collection")
+        target_indices = list(target.get("isolated_indices", []) or [])
+        if target_obj is None or target_obj.type != "MESH" or target_obj.data is None or not target_indices:
+            self.report({"ERROR"}, "Loose vertex target is no longer available")
+            return {"CANCELLED"}
+
+        try:
+            if target_root is not None:
+                _ensure_collection_visible_in_view_layer(context, target_root)
+            _activate_object_vertex_edit(context, target_obj)
+            try:
+                bpy.ops.mesh.reveal(select=False)
+            except Exception:
+                pass
+
+            context.tool_settings.mesh_select_mode = (True, False, False)
+            bm = bmesh.from_edit_mesh(target_obj.data)
+            bm.verts.ensure_lookup_table()
+            target_index_set = set(target_indices)
+            selected_count = 0
+
+            for face in bm.faces:
+                face.select = False
+            for edge in bm.edges:
+                edge.select = False
+            for vert in bm.verts:
+                is_target = vert.index in target_index_set
+                vert.select = is_target
+                if is_target:
+                    selected_count += 1
+
+            bm.select_flush_mode()
+            bmesh.update_edit_mesh(target_obj.data, loop_triangles=False, destructive=False)
+            _tag_redraw_all_areas(context)
+        except Exception as e:
+            self.report({"ERROR"}, f"Failed to select loose vertices: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+
+        msg = f"Selected {selected_count} loose vertex/vertices on {target_obj.name}"
+        if len(records) > 1:
+            msg += f"; {len(records) - 1} more mesh object(s) listed in System Console"
+            self.report({"WARNING"}, msg)
+        else:
+            self.report({"INFO"}, msg)
         return {"FINISHED"}
 
 
@@ -5998,6 +7196,191 @@ def _ensure_target_collection(context, mesh_obj):
         scene_root.children.link(target)
     return target
 
+def _ensure_default_scene_collection(context):
+    scene_root = getattr(getattr(context, "scene", None), "collection", None)
+    if scene_root is None:
+        return None
+
+    target = scene_root.children.get(_ROOT_COLLECTION_NAME)
+    if target is None:
+        target = bpy.data.collections.new(_ROOT_COLLECTION_NAME)
+        scene_root.children.link(target)
+    return target
+
+def _sanitize_repair_p3d_collection_name(value: str) -> str:
+    raw = os.path.basename((value or "").replace("\\", "/")).strip()
+    raw = _strip_blender_numeric_suffix(raw)
+    if raw.lower().endswith(".blend"):
+        raw = raw[:-6]
+    raw = _INVALID_FILENAME_CHARS_RE.sub("_", raw)
+    raw = re.sub(r"\s+", " ", raw).strip(" .")
+    if not raw:
+        return ""
+    if not raw.lower().endswith(".p3d"):
+        raw += ".p3d"
+    return raw
+
+def _is_repair_generic_collection_name(name: str) -> bool:
+    logical = _logical_collection_name(_strip_blender_numeric_suffix(name or ""))
+    if not logical:
+        return True
+    generic_names = {
+        _logical_collection_name(_ROOT_COLLECTION_NAME),
+        _logical_collection_name(_VISUALS_COLLECTION_NAME),
+        _logical_collection_name(_COLLIDER_COLLECTION_NAME),
+        _logical_collection_name(_MEMORY_COLLECTION_NAME),
+        _logical_collection_name(_MISC_COLLECTION_NAME),
+        "geometry",
+        "memory",
+    }
+    return logical in generic_names or _is_helper_object_name(logical)
+
+def _is_repair_lod_like_object_name(name: str) -> bool:
+    logical = _logical_collection_name(_strip_blender_numeric_suffix(name or ""))
+    if not logical:
+        return True
+    if logical.startswith("resolution"):
+        return True
+    known = {_logical_collection_name(value) for value in _COLLIDER_KNOWN_LOD_NAMES.values()}
+    known.add(_logical_collection_name(_MemoryLodManager.OBJECT_NAME))
+    return logical in known
+
+def _repair_scope_source_path(scope_objs):
+    for obj in scope_objs or []:
+        if obj is None:
+            continue
+        try:
+            src = obj.get(_IE_SOURCE_PATH_KEY)
+        except Exception:
+            src = ""
+        if isinstance(src, str) and src.strip():
+            return _norm_path(bpy.path.abspath(src))
+
+        for col in getattr(obj, "users_collection", []):
+            try:
+                src = col.get(_IE_SOURCE_PATH_KEY)
+            except Exception:
+                src = ""
+            if isinstance(src, str) and src.strip():
+                return _norm_path(bpy.path.abspath(src))
+    return ""
+
+def _repair_top_collection_candidate(context, scope_objs):
+    scene_root = getattr(getattr(context, "scene", None), "collection", None)
+    if scene_root is None:
+        return ""
+
+    for obj in scope_objs or []:
+        if obj is None:
+            continue
+        for col in getattr(obj, "users_collection", []):
+            try:
+                path = _find_collection_path(scene_root, col.as_pointer())
+            except Exception:
+                path = None
+            if not path or len(path) < 2:
+                continue
+
+            candidate = None
+            if _logical_collection_name(getattr(path[1], "name", "")) == _logical_collection_name(_ROOT_COLLECTION_NAME):
+                if len(path) >= 3:
+                    candidate = path[2]
+            else:
+                candidate = path[1]
+            if candidate is None:
+                continue
+
+            name = getattr(candidate, "name", "") or ""
+            if _looks_like_p3d_collection_name(name) or not _is_repair_generic_collection_name(name):
+                return name
+    return ""
+
+def _derive_repair_p3d_collection_name(context, target_obj, scope_objs):
+    source_path = _repair_scope_source_path(scope_objs)
+    from_source = _sanitize_repair_p3d_collection_name(source_path)
+    if from_source:
+        return from_source, source_path
+
+    from_collection = _sanitize_repair_p3d_collection_name(_repair_top_collection_candidate(context, scope_objs))
+    if from_collection:
+        return from_collection, ""
+
+    blend_path = getattr(bpy.data, "filepath", "") or ""
+    from_blend = _sanitize_repair_p3d_collection_name(blend_path)
+    if from_blend and _normalize_p3d_lookup_key(from_blend) not in {"untitled", "startup"}:
+        return from_blend, ""
+
+    obj_name = getattr(target_obj, "name", "") or ""
+    if obj_name and not _is_repair_lod_like_object_name(obj_name):
+        from_object = _sanitize_repair_p3d_collection_name(obj_name)
+        if from_object:
+            return from_object, ""
+
+    return "fixed_model.p3d", ""
+
+def _ensure_repair_p3d_root_collection(context, target_obj, scope_objs):
+    existing_root = _find_p3d_root_collection_for_object(context, target_obj)
+    if existing_root is not None:
+        return existing_root, _resolve_collection_source_path(existing_root)
+
+    root_name, source_path = _derive_repair_p3d_collection_name(context, target_obj, scope_objs)
+    parent = _ensure_default_scene_collection(context)
+    if parent is None:
+        raise RuntimeError("Scene collection is not available")
+
+    target = parent.children.get(root_name)
+    if target is None:
+        target = bpy.data.collections.new(root_name)
+        parent.children.link(target)
+
+    if source_path:
+        _set_ie_source_path_tag(target, source_path)
+    return target, source_path
+
+def _set_resolution0_a3ob_lod_props(obj):
+    if obj is None or obj.type != "MESH":
+        raise RuntimeError("Repair result must be a mesh")
+    if not hasattr(obj, "a3ob_properties_object"):
+        raise RuntimeError("A3OB object properties are missing. Enable Arma 3 Object Builder first.")
+
+    props = obj.a3ob_properties_object
+    props.lod = "0"
+    props.resolution = 0
+    props.resolution_float = 0.0
+    props.is_a3_lod = True
+    _remove_a3ob_named_property(props, "autocenter")
+
+    try:
+        lod_name = props.get_name()
+    except Exception:
+        lod_name = "Resolution 0"
+    lod_name = lod_name or "Resolution 0"
+    obj.name = lod_name
+    if obj.data is not None:
+        obj.data.name = lod_name
+    return lod_name
+
+def _remove_empty_subcollections(collection):
+    if collection is None:
+        return 0
+
+    removed = 0
+    for child in list(collection.children):
+        removed += _remove_empty_subcollections(child)
+        if len(child.objects) > 0 or len(child.children) > 0:
+            continue
+        try:
+            collection.children.unlink(child)
+        except Exception:
+            continue
+        if len(child.users) == 0:
+            try:
+                bpy.data.collections.remove(child)
+            except Exception:
+                pass
+        removed += 1
+    return removed
+
 def _collect_fix_scope(context, target_obj):
     ordered = []
     seen = set()
@@ -6031,6 +7414,45 @@ def _collect_fix_scope(context, target_obj):
     if root == target_obj:
         return ordered, "target-descendants"
     return ordered, "root-branch"
+
+def _collect_repair_a3ob_scope(context, target_obj):
+    selected = [obj for obj in getattr(context, "selected_objects", []) if obj is not None]
+    if len(selected) > 1:
+        return _collect_fix_scope(context, target_obj)
+
+    p3d_root = _find_p3d_root_collection_for_object(context, target_obj)
+    if p3d_root is not None:
+        objects = _collect_collection_objects_recursive(p3d_root)
+        if objects:
+            return objects, ".p3d root collection"
+
+    scene_root = getattr(getattr(context, "scene", None), "collection", None)
+    for col in getattr(target_obj, "users_collection", []):
+        if scene_root is not None:
+            try:
+                path = _find_collection_path(scene_root, col.as_pointer())
+            except Exception:
+                path = None
+            if path and len(path) >= 2:
+                candidate = col
+                if (
+                    _logical_collection_name(getattr(path[1], "name", ""))
+                    == _logical_collection_name(_ROOT_COLLECTION_NAME)
+                    and len(path) >= 3
+                ):
+                    candidate = path[2]
+                elif len(path) >= 2:
+                    candidate = path[1]
+
+                objects = _collect_collection_objects_recursive(candidate)
+                if objects:
+                    return objects, f"collection: {candidate.name}"
+
+        objects = _collect_collection_objects_recursive(col)
+        if objects:
+            return objects, f"collection: {col.name}"
+
+    return _collect_fix_scope(context, target_obj)
 
 def _pick_primary_mesh(scope_objs, preferred_obj):
     meshes = [o for o in scope_objs if o.type == "MESH" and o.data is not None]
@@ -7306,6 +8728,14 @@ class CRAY_PG_TexReplaceSettings(PropertyGroup):
     fix_mesh_center_to_origin: BoolProperty(
         name="Center Fixed Mesh To (0,0,0)",
         description="After Fix Mesh, move merged object's bounds center to world origin",
+        default=True,
+    )
+    export_warn_loose_vertices: BoolProperty(
+        name="Warn Loose Vertices On Export",
+        description=(
+            "During batch export, warn if any LOD except Point clouds > Memory contains isolated "
+            "vertices with no edges or faces. Export continues so the model is still written."
+        ),
         default=True,
     )
     split_planar_ngon_vertex_count: IntProperty(
@@ -9082,13 +10512,31 @@ class CRAY_PG_IEPlannerSettings(PropertyGroup):
         ),
     )
 
+class CRAY_OT_IEFilePathTooltip(Operator):
+    bl_idname = "cray.ie_file_path_tooltip"
+    bl_label = "Import File"
+    bl_options = {"INTERNAL"}
+
+    filepath: StringProperty(options={"HIDDEN"})
+
+    @classmethod
+    def description(cls, context, properties):
+        del context
+        return _norm_path(getattr(properties, "filepath", "") or "")
+
+    def execute(self, context):
+        del context
+        return {"FINISHED"}
+
+
 class CRAY_UL_IEFiles(UIList):
     bl_idname = "CRAY_UL_ie_files"
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
-        row = layout.row(align=True)
-        row.label(text=os.path.basename(item.path) or "<empty>", icon="FILE")
-        row.label(text=_norm_path(item.path))
+        del context, data, icon, active_data, active_propname, index
+        filepath = _norm_path(item.path)
+        label = os.path.basename(filepath) or "<empty>"
+        layout.label(text=label, icon="FILE")
 
 class CRAY_OT_IE_AddFiles(Operator):
     bl_idname = "cray.ie_add_files"
@@ -10052,89 +11500,6 @@ class CRAY_OT_ConvertSelectedToProxies(Operator):
         return {"FINISHED"}
 
 
-class CRAY_OT_FixShadingByPipeline(Operator):
-    bl_idname = "cray.fix_shading_by_pipeline"
-    bl_label = "Fix Shading (Merge + Smooth)"
-    bl_description = (
-        "Merge the selected mesh objects if needed, clear split normals, recalculate normals, "
-        "and apply Shade Smooth"
-    )
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        active_before = context.view_layer.objects.active
-        selected_meshes = [obj for obj in context.selected_objects if obj and obj.type == "MESH"]
-        if active_before is not None and active_before.type == "MESH" and active_before not in selected_meshes:
-            selected_meshes.insert(0, active_before)
-
-        if not selected_meshes:
-            self.report({"ERROR"}, "Select at least one mesh object")
-            return {"CANCELLED"}
-
-        if context.mode != "OBJECT":
-            try:
-                bpy.ops.object.mode_set(mode="OBJECT")
-            except Exception as e:
-                self.report({"ERROR"}, f"Failed to switch to Object Mode: {_fmt_exc(e)}")
-                return {"CANCELLED"}
-
-        active_mesh = active_before if active_before in selected_meshes else selected_meshes[0]
-        _deselect_all_in_view_layer(context)
-        for obj in selected_meshes:
-            try:
-                obj.hide_set(False)
-            except Exception:
-                pass
-            try:
-                obj.hide_viewport = False
-            except Exception:
-                pass
-            try:
-                obj.select_set(True)
-            except Exception:
-                pass
-        try:
-            context.view_layer.objects.active = active_mesh
-        except Exception:
-            pass
-
-        joined_count = len(selected_meshes)
-        if joined_count > 1:
-            try:
-                bpy.ops.object.join()
-            except Exception as e:
-                self.report({"ERROR"}, f"Failed to join selected meshes: {_fmt_exc(e)}")
-                return {"CANCELLED"}
-            active_mesh = context.view_layer.objects.active
-        else:
-            active_mesh = active_mesh or context.view_layer.objects.active
-
-        if active_mesh is None or active_mesh.type != "MESH":
-            self.report({"ERROR"}, "Active object must be a mesh after merge")
-            return {"CANCELLED"}
-
-        try:
-            bpy.ops.mesh.customdata_custom_splitnormals_clear()
-        except Exception:
-            pass
-
-        try:
-            bpy.ops.object.mode_set(mode="EDIT")
-            bpy.ops.mesh.select_mode(type="FACE")
-            bpy.ops.mesh.select_all(action="SELECT")
-            bpy.ops.mesh.normals_make_consistent(inside=False)
-            bpy.ops.mesh.faces_shade_smooth()
-        except Exception as e:
-            self.report({"ERROR"}, f"Failed to run base shading pipeline: {_fmt_exc(e)}")
-            return {"CANCELLED"}
-
-        self.report(
-            {"INFO"},
-            f"Shading fix done on '{active_mesh.name}': joined {joined_count}, Shade Smooth applied",
-        )
-        return {"FINISHED"}
-
-
 def _repair_invalid_a3ob_selection_links(obj):
     if obj is None or obj.type != "MESH" or obj.data is None:
         raise RuntimeError("Target object must be a mesh")
@@ -10676,26 +12041,132 @@ class CRAY_OT_DeleteSelectedComponentsKeepVertices(Operator):
         return {"FINISHED"}
 
 
-class CRAY_OT_RepairA3OBSelections(Operator):
-    bl_idname = "cray.repair_a3ob_selections"
-    bl_label = "Repair Invalid A3OB Selections"
+def _is_proxy_object_name(name: str) -> bool:
+    return (name or "").strip().lower().startswith("proxy:")
+
+
+def _is_a3ob_proxy_object(obj) -> bool:
+    if obj is None or getattr(obj, "type", None) != "MESH":
+        return False
+    if _is_proxy_object_name(getattr(obj, "name", "")):
+        return True
+    try:
+        return bool(getattr(obj.a3ob_properties_object_proxy, "is_a3_proxy", False))
+    except Exception:
+        return False
+
+
+def _fix_proxy_triangle_mesh(obj):
+    if obj is None or getattr(obj, "type", None) != "MESH" or obj.data is None:
+        return None, "not a mesh"
+
+    old_mesh = obj.data
+    verts_count = len(old_mesh.vertices)
+    faces_count = len(old_mesh.polygons)
+    if verts_count != 3:
+        return None, "not 3 verts"
+    if faces_count == 1 and len(old_mesh.polygons[0].vertices) == 3:
+        return None, "already ok"
+
+    local_coords = [old_mesh.vertices[i].co.copy() for i in range(3)]
+    old_materials = [mat for mat in old_mesh.materials]
+    material_index = 0
+    use_smooth = False
+    if faces_count > 0:
+        try:
+            material_index = int(old_mesh.polygons[0].material_index)
+            use_smooth = bool(old_mesh.polygons[0].use_smooth)
+        except Exception:
+            material_index = 0
+
+    new_mesh = bpy.data.meshes.new(old_mesh.name)
+    new_mesh.from_pydata(local_coords, [], [(0, 1, 2)])
+    new_mesh.update()
+    for mat in old_materials:
+        new_mesh.materials.append(mat)
+    if new_mesh.polygons:
+        new_mesh.polygons[0].material_index = max(0, min(material_index, max(0, len(old_materials) - 1)))
+        new_mesh.polygons[0].use_smooth = use_smooth
+    obj.data = new_mesh
+    return {
+        "name": obj.name,
+        "old_verts": verts_count,
+        "old_faces": faces_count,
+    }, ""
+
+
+class CRAY_OT_FixProxyTriangleMeshes(Operator):
+    bl_idname = "cray.fix_proxy_triangle_meshes"
+    bl_label = "Fix Proxy Triangles"
     bl_description = (
-        "Scan selected mesh objects and rebuild broken A3OB vertex-group links, removing invalid or zero-weight references"
+        "Fix A3OB proxy mesh objects that have exactly 3 vertices but not exactly one triangular face"
     )
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
-        active_before = context.view_layer.objects.active
-        selected_meshes = [
-            obj for obj in context.selected_objects
-            if obj is not None and obj.type == "MESH" and obj.data is not None
-        ]
-        if active_before is not None and active_before.type == "MESH" and active_before not in selected_meshes:
-            selected_meshes.insert(0, active_before)
+        del context
+        fixed = []
+        skipped = []
 
-        if not selected_meshes:
+        for obj in bpy.data.objects:
+            if not _is_a3ob_proxy_object(obj):
+                continue
+            result, reason = _fix_proxy_triangle_mesh(obj)
+            if result is not None:
+                fixed.append(result)
+            else:
+                mesh = getattr(obj, "data", None)
+                verts_count = len(getattr(mesh, "vertices", []) or []) if mesh is not None else 0
+                faces_count = len(getattr(mesh, "polygons", []) or []) if mesh is not None else 0
+                skipped.append(
+                    {
+                        "name": obj.name,
+                        "verts": verts_count,
+                        "faces": faces_count,
+                        "reason": reason,
+                    }
+                )
+
+        print("")
+        print("=== Proxy triangle fixer ===")
+        print(f"Fixed: {len(fixed)}")
+        for rec in fixed:
+            print(
+                f"FIXED: {rec['name']} | old verts={rec['old_verts']}, "
+                f"old faces={rec['old_faces']} -> new verts=3, new faces=1"
+            )
+
+        print("")
+        print(f"Skipped: {len(skipped)}")
+        for rec in skipped:
+            print(
+                f"SKIP: {rec['name']} | verts={rec['verts']}, "
+                f"faces={rec['faces']} | {rec['reason']}"
+            )
+
+        if fixed:
+            self.report({"INFO"}, f"Fixed {len(fixed)} proxy triangle mesh(es) (see System Console)")
+        else:
+            self.report({"INFO"}, "No proxy triangle meshes needed fixing")
+        return {"FINISHED"}
+
+
+class CRAY_OT_RepairA3OBSelections(Operator):
+    bl_idname = "cray.repair_a3ob_selections"
+    bl_label = "Repair Invalid A3OB Selections"
+    bl_description = (
+        "Join the selected/broken A3OB meshes into one Resolution 0 LOD, rebuild broken vertex-group links, "
+        "and place the result under Collection > model.p3d"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        ts = context.scene.cray_texreplace_settings
+        target_obj, src = _resolve_fix_target_object(context, ts.picked_object)
+        if target_obj is None:
             self.report({"ERROR"}, "Select at least one mesh object")
             return {"CANCELLED"}
+        ts.picked_object = target_obj
 
         if context.mode != "OBJECT":
             try:
@@ -10704,54 +12175,135 @@ class CRAY_OT_RepairA3OBSelections(Operator):
                 self.report({"ERROR"}, f"Failed to switch to Object Mode: {_fmt_exc(e)}")
                 return {"CANCELLED"}
 
-        total_invalid = 0
-        total_zero = 0
-        total_verts = 0
-        touched_objects = 0
-        rebuilt_groups = 0
-        reindexed_objects = 0
-        failed = []
+        scope_objs, scope_src = _collect_repair_a3ob_scope(context, target_obj)
+        if not scope_objs:
+            scope_objs = [target_obj]
 
-        for obj in selected_meshes:
+        try:
+            target_root, source_path = _ensure_repair_p3d_root_collection(context, target_obj, scope_objs)
+        except Exception as e:
+            self.report({"ERROR"}, f"Failed to prepare .p3d collection: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+
+        scope_names = []
+        for obj in scope_objs:
             try:
-                stats = _repair_invalid_a3ob_selection_links(obj)
-            except Exception as e:
-                failed.append(f"{obj.name}: {_fmt_exc(e)}")
+                name = obj.name
+            except ReferenceError:
                 continue
+            if name and name not in scope_names:
+                scope_names.append(name)
 
-            total_invalid += stats["invalid_refs_removed"]
-            total_zero += stats["zero_refs_removed"]
-            total_verts += stats["verts_touched"]
-            rebuilt_groups += stats["groups_rebuilt"]
-            if stats["reindexed_groups"]:
-                reindexed_objects += 1
-            if stats["verts_touched"] > 0:
-                touched_objects += 1
+        all_mesh_candidates = [
+            obj for obj in (bpy.data.objects.get(name) for name in scope_names)
+            if obj is not None and obj.type == "MESH" and obj.data is not None and len(obj.data.vertices) > 0
+        ]
+        mesh_candidates = [obj for obj in all_mesh_candidates if not _is_helper_object_name(obj.name)]
+        if not mesh_candidates:
+            mesh_candidates = all_mesh_candidates
+        if not mesh_candidates:
+            self.report({"ERROR"}, "No mesh object in selected repair scope")
+            return {"CANCELLED"}
 
-        if failed:
-            print("=== Repair Invalid A3OB Selections: Failed ===")
-            for item in failed:
-                print(item)
+        def _mesh_repair_size(obj):
+            if obj is None or obj.data is None:
+                return 0
+            return len(obj.data.polygons) * 1000 + len(obj.data.vertices)
 
-        if total_invalid == 0 and total_zero == 0 and rebuilt_groups == 0:
-            msg = f"No invalid A3OB selection links found on {len(selected_meshes)} mesh object(s)"
-            if failed:
-                self.report({"WARNING"}, msg + f", failed: {len(failed)} (see System Console)")
-            else:
-                self.report({"INFO"}, msg)
-            return {"FINISHED"}
+        if target_obj in mesh_candidates and not _is_helper_object_name(target_obj.name):
+            anchor_mesh = target_obj
+            anchor_src = "target"
+        else:
+            anchor_mesh = max(mesh_candidates, key=_mesh_repair_size)
+            anchor_src = "largest-mesh"
+        active_mesh_name = anchor_mesh.name
+
+        try:
+            merged_obj, joined_count, join_passes = _join_meshes_in_batches(
+                context=context,
+                anchor_obj=anchor_mesh,
+                mesh_names=[obj.name for obj in mesh_candidates],
+                batch_size=ts.fix_mesh_join_batch,
+            )
+        except Exception as e:
+            self.report({"ERROR"}, f"Join failed: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+
+        live_scope_names = []
+        for name in scope_names:
+            live = bpy.data.objects.get(name)
+            if live is None or live == merged_obj:
+                continue
+            live_scope_names.append((_obj_depth(live), name))
+        live_scope_names.sort(key=lambda item: item[0], reverse=True)
+
+        deleted_scope = 0
+        for idx, (_, name) in enumerate(live_scope_names, start=1):
+            live = bpy.data.objects.get(name)
+            if live is None or live == merged_obj:
+                continue
+            try:
+                bpy.data.objects.remove(live, do_unlink=True)
+                deleted_scope += 1
+            except Exception:
+                pass
+            if idx % 50 == 0:
+                _ui_yield()
+
+        try:
+            lod_name = _set_resolution0_a3ob_lod_props(merged_obj)
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        try:
+            mesh_world = merged_obj.matrix_world.copy()
+            merged_obj.parent = None
+            merged_obj.matrix_world = mesh_world
+        except Exception:
+            pass
+
+        _move_object_to_collection(merged_obj, target_root, unlink_roots=context.scene.collection)
+        removed_empty_cols = _remove_empty_subcollections(target_root)
+
+        deleted_helpers, deleted_helper_cols, remaining_helpers = _remove_helper_named_objects(
+            scene=context.scene,
+            keep_obj=merged_obj,
+        )
+
+        try:
+            stats = _repair_invalid_a3ob_selection_links(merged_obj)
+        except Exception as e:
+            self.report({"ERROR"}, f"A3OB selection repair failed: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+
+        _ensure_collection_visible_in_view_layer(context, target_root)
+        _deselect_all_in_view_layer(context)
+        try:
+            merged_obj.select_set(True)
+            context.view_layer.objects.active = merged_obj
+        except Exception:
+            pass
 
         msg = (
-            f"Repaired A3OB selections on {touched_objects} object(s): "
-            f"removed {total_invalid} invalid refs and {total_zero} zero-weight refs "
-            f"across {total_verts} vertex/vertices, rebuilt {rebuilt_groups} groups"
+            f"Repaired '{target_root.name}/{lod_name}': joined {joined_count}, "
+            f"removed objects {deleted_scope + deleted_helpers}, "
+            f"removed empty collections {removed_empty_cols + deleted_helper_cols}, "
+            f"invalid refs {stats['invalid_refs_removed']}, zero refs {stats['zero_refs_removed']}, "
+            f"rebuilt groups {stats['groups_rebuilt']}"
         )
-        if reindexed_objects > 0:
-            msg += f", reindexed groups on {reindexed_objects} object(s)"
-        if failed:
-            self.report({"WARNING"}, msg + f", failed: {len(failed)} (see System Console)")
-        else:
-            self.report({"INFO"}, msg)
+        extras = [
+            f"src: {src}",
+            f"scope: {scope_src}",
+            f"anchor: {active_mesh_name}",
+            f"anchor_src: {anchor_src}",
+            f"join_passes: {join_passes}",
+        ]
+        if source_path:
+            extras.append(f"source_path: {source_path}")
+        if remaining_helpers:
+            extras.append(f"remaining_helpers: {len(remaining_helpers)}")
+        self.report({"INFO"}, msg + f", {', '.join(extras)}")
         return {"FINISHED"}
 
 
@@ -10912,6 +12464,8 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
 
     def execute(self, context):
         st = context.scene.cray_ie_settings
+        tex_settings = context.scene.cray_texreplace_settings
+        warn_loose_vertices = bool(getattr(tex_settings, "export_warn_loose_vertices", True))
         has_export = any(_op_handle(op) is not None for op, _ in _A3OB_EXPORT_CANDIDATES)
         if not has_export:
             self.report({"ERROR"}, "Arma 3 Object Builder export operators not found")
@@ -10975,6 +12529,9 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
         backups = 0
         failed = []
         partial_lod_exports = []
+        loose_vertex_warnings = []
+        backup_skipped = []
+        backup_preserved = []
         used_op = None
         used_targets = set()
 
@@ -11001,17 +12558,24 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
             resolution_conflicts = _collect_resolution_lod_index_conflicts(col, objects)
             if resolution_conflicts:
                 _report_resolution_lod_index_conflicts_in_console(col.name, filepath, resolution_conflicts)
-                failed.append(
-                    f"{col.name} -> duplicate Resolution LOD index in one logical collection path "
-                    f"(see System Console)"
+                if not bool(st.export_force_all_lods):
+                    failed.append(
+                        f"{col.name} -> duplicate Resolution LOD index in one logical collection path "
+                        f"(see System Console)"
+                    )
+                    continue
+                print(
+                    "WARNING: Force export all LODs is ON, continuing despite duplicate "
+                    "Resolution LOD index conflict(s)."
                 )
-                continue
 
             ngon_issues = _collect_export_ngon_issues(col, objects)
             if ngon_issues:
                 _report_export_ngon_issues_in_console(col.name, filepath, ngon_issues)
-                failed.append(f"{col.name} -> n-gon detected in exportable LOD mesh (see System Console)")
-                continue
+                if not bool(st.export_force_all_lods):
+                    failed.append(f"{col.name} -> n-gon detected in exportable LOD mesh (see System Console)")
+                    continue
+                print("WARNING: Force export all LODs is ON, continuing despite n-gon issue(s).")
 
             target_key = os.path.normcase(os.path.normpath(filepath))
             if st.export_mode == "SOURCE":
@@ -11027,14 +12591,6 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
                         target_key = os.path.normcase(os.path.normpath(filepath))
                         idx += 1
             used_targets.add(target_key)
-
-            if st.export_create_bak and os.path.isfile(filepath):
-                try:
-                    shutil.copy2(filepath, filepath + ".bak")
-                    backups += 1
-                except Exception as e:
-                    failed.append(f"{col.name} -> backup failed: {_fmt_exc(e)}")
-                    continue
 
             _ensure_collection_visible_in_view_layer(context, col)
             _deselect_all_in_view_layer(context)
@@ -11072,7 +12628,26 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
             except Exception:
                 pass
 
+            prepared_mass = _prepare_geometry_lod_mass_for_export(selectable)
+            if prepared_mass:
+                print("=== Batch Export Collections: Geometry LOD mass prepared ===")
+                for lod_name, vert_count, total_mass in prepared_mass:
+                    print(f"{col.name} / {lod_name}: {vert_count} vertex masses, total {total_mass:.3f}")
+
+            if warn_loose_vertices:
+                loose_warnings = _collect_export_loose_vertex_warnings(col, selectable)
+                if loose_warnings:
+                    _report_export_loose_vertex_warnings_in_console(col.name, filepath, loose_warnings)
+                    loose_vertex_warnings.append((col.name, filepath, len(loose_warnings)))
+
             expected_lod_entries = _collect_expected_lod_entries(selectable)
+
+            pending_backup_path = ""
+            if st.export_create_bak and os.path.isfile(filepath):
+                pending_backup_path, backup_stage_err = _stage_export_backup(filepath)
+                if backup_stage_err:
+                    failed.append(f"{col.name} -> backup stage failed: {backup_stage_err}")
+                    continue
 
             _, op_id, err = _call_export_with_optional_relaxed_validation(
                 force_all_lods=bool(st.export_force_all_lods),
@@ -11085,12 +12660,14 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
                 apply_transforms=True,
                 apply_modifiers=True,
                 sort_sections=True,
-                lod_collisions="SKIP",
+                lod_collisions="IGNORE" if bool(st.export_force_all_lods) else "SKIP",
                 validate_lods=False,
                 validate_lods_warning_errors=False,
                 generate_components=True,
                 force_lowercase=True,
             )
+            export_missing_keys = []
+            lod_post_check_failed = False
             if op_id:
                 used_op = op_id
                 exported += 1
@@ -11104,12 +12681,66 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
                             exported_entries=exported_lod_entries,
                         )
                         if missing_keys:
+                            export_missing_keys = list(missing_keys)
+                            _report_missing_lod_diagnostics_in_console(
+                                context=context,
+                                collection_name=col.name,
+                                filepath=filepath,
+                                missing_keys=missing_keys,
+                                expected_entries=expected_lod_entries,
+                                export_objects=selectable,
+                                force_all_lods=bool(st.export_force_all_lods),
+                            )
                             partial_lod_exports.append((col.name, filepath, len(missing_keys), len(expected_lod_entries)))
                     except Exception as e:
+                        lod_post_check_failed = True
                         print("=== Batch Export Collections: LOD post-check failed ===")
                         print(f"{col.name} -> {_fmt_exc(e)}")
             else:
                 failed.append(f"{col.name} -> {_fmt_exc(err) if err else 'export failed'}")
+
+            if pending_backup_path:
+                export_complete = bool(op_id) and not export_missing_keys and not lod_post_check_failed
+                try:
+                    backup_status, backup_reason, backup_missing_keys = _finalize_export_backup(
+                        filepath,
+                        pending_backup_path,
+                        expected_lod_entries,
+                        export_complete,
+                    )
+                except Exception as e:
+                    backup_status = "skipped"
+                    backup_reason = f"backup finalize failed: {_fmt_exc(e)}"
+                    backup_missing_keys = []
+                    _discard_pending_export_backup(pending_backup_path)
+
+                if backup_status == "updated":
+                    backups += 1
+                    _report_export_backup_updated_in_console(
+                        col.name,
+                        filepath,
+                        backup_reason,
+                        backup_missing_keys,
+                        expected_lod_entries,
+                    )
+                elif backup_status == "preserved":
+                    backup_preserved.append((col.name, filepath, backup_reason))
+                    _report_export_backup_preserved_in_console(
+                        col.name,
+                        filepath,
+                        backup_reason,
+                        backup_missing_keys,
+                        expected_lod_entries,
+                    )
+                elif backup_status == "skipped":
+                    backup_skipped.append((col.name, filepath, backup_reason))
+                    _report_export_backup_skipped_in_console(
+                        col.name,
+                        filepath,
+                        backup_reason,
+                        backup_missing_keys,
+                        expected_lod_entries,
+                    )
 
         _deselect_all_in_view_layer(context)
         for name in prev_selected_names:
@@ -11148,8 +12779,14 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
         )
         if partial_lod_exports:
             msg += f", partial LOD exports {len(partial_lod_exports)}"
+        if loose_vertex_warnings:
+            msg += f", loose vertex warnings {len(loose_vertex_warnings)}"
+        if backup_skipped:
+            msg += f", backups skipped {len(backup_skipped)}"
+        if backup_preserved:
+            msg += f", backups preserved {len(backup_preserved)}"
 
-        if failed or partial_lod_exports:
+        if failed or partial_lod_exports or loose_vertex_warnings or backup_skipped:
             self.report({"WARNING"}, msg + " (see System Console)")
         else:
             suffix = f" via {used_op}" if used_op else ""
@@ -11299,7 +12936,10 @@ class CRAY_PT_ColliderPanel(Panel):
         col.label(text="Target")
         col.label(text=f"Source: {active_source_name}", icon="MESH_DATA")
         col.prop(cs, "target_lod")
-        col.prop(cs, "geometry_object")
+        row = col.row(align=True)
+        row.prop(cs, "geometry_object")
+        op = row.operator("cray.set_collider_target_from_active", text="", icon="EYEDROPPER")
+        op.target_attr = "GEOMETRY"
         col.operator("cray.ensure_collider_lod", icon="OUTLINER_OB_MESH")
         col.prop(cs, "merge_distance")
         col.prop(cs, "recalc_normals")
@@ -11368,25 +13008,49 @@ class CRAY_PT_ColliderPanel(Panel):
         layout.separator()
 
         fire = layout.box()
-        fire.label(text="Geometries / Fire Geometry", icon="MESH_ICOSPHERE")
-        fire.prop(cs, "fire_geometry_object", text="Fire Geometry")
         row = fire.row(align=True)
-        row.prop(cs, "fire_geometry_material", text="Material")
-        row.operator("cray.open_fire_geometry_rvmat_folder", text="", icon="FILE_FOLDER")
+        row.label(text="Geometries / Fire Geometry", icon="MESH_ICOSPHERE")
+        row.prop(
+            cs,
+            "show_fire_geometry_tools",
+            text="",
+            emboss=False,
+            icon="TRIA_DOWN" if cs.show_fire_geometry_tools else "TRIA_RIGHT",
+        )
+        if cs.show_fire_geometry_tools:
+            row = fire.row(align=True)
+            row.prop(cs, "fire_geometry_object", text="Fire Geometry")
+            op = row.operator("cray.set_collider_target_from_active", text="", icon="EYEDROPPER")
+            op.target_attr = "FIRE"
+            row = fire.row(align=True)
+            row.prop(cs, "fire_geometry_material", text="Material")
+            row.operator("cray.open_fire_geometry_rvmat_folder", text="", icon="FILE_FOLDER")
 
         layout.separator()
 
         roadway = layout.box()
-        roadway.label(text="Misc / Roadway", icon="MESH_PLANE")
-        roadway.prop(cs, "roadway_object")
         row = roadway.row(align=True)
-        row.operator("cray.ensure_roadway_lod", icon="OUTLINER_OB_MESH")
-        row.operator("cray.copy_selected_faces_to_roadway", icon="FACESEL")
-        row = roadway.row(align=True)
-        row.prop(cs, "roadway_material", text="Material")
-        row.operator("cray.open_roadway_material_folder", text="", icon="FILE_FOLDER")
-        roadway.prop(cs, "roadway_weld_distance")
-        roadway.operator("cray.weld_roadway_vertices", icon="AUTOMERGE_ON")
+        row.label(text="Misc / Roadway", icon="MESH_PLANE")
+        row.prop(
+            cs,
+            "show_roadway_tools",
+            text="",
+            emboss=False,
+            icon="TRIA_DOWN" if cs.show_roadway_tools else "TRIA_RIGHT",
+        )
+        if cs.show_roadway_tools:
+            row = roadway.row(align=True)
+            row.prop(cs, "roadway_object")
+            op = row.operator("cray.set_collider_target_from_active", text="", icon="EYEDROPPER")
+            op.target_attr = "ROADWAY"
+            row = roadway.row(align=True)
+            row.operator("cray.ensure_roadway_lod", icon="OUTLINER_OB_MESH")
+            row.operator("cray.copy_selected_faces_to_roadway", icon="FACESEL")
+            row = roadway.row(align=True)
+            row.prop(cs, "roadway_material", text="Material")
+            row.operator("cray.open_roadway_material_folder", text="", icon="FILE_FOLDER")
+            roadway.prop(cs, "roadway_weld_distance")
+            roadway.operator("cray.weld_roadway_vertices", icon="AUTOMERGE_ON")
 
 class CRAY_PT_AssetProxyPanel(Panel):
     bl_idname = "VIEW3D_PT_cray_asset_proxy"
@@ -11430,9 +13094,13 @@ class CRAY_PT_FixesPanel(Panel):
         layout = self.layout
         ts = context.scene.cray_texreplace_settings
 
+        check_box = layout.box()
+        check_box.label(text="Export checks", icon="ERROR")
+        check_box.prop(ts, "export_warn_loose_vertices", text="Loose vertices outside Memory")
+        check_box.operator("cray.select_loose_vertices_outside_memory", icon="VERTEXSEL")
+
         box = layout.box()
         box.label(text="Shading/Geometry fixes", icon="MOD_SMOOTH")
-        box.operator("cray.fix_shading_by_pipeline", text="Fix Shading", icon="SHADING_RENDERED")
         box.operator("cray.repair_a3ob_selections", text="Repair Invalid A3OB Selections", icon="GROUP_VERTEX")
         box.separator()
         box.label(text="Hierarchy fix", icon="MOD_REMESH")
@@ -11452,6 +13120,7 @@ class CRAY_PT_FixesPanel(Panel):
             and context.active_object.type == "MESH"
         )
         cleanup_col.operator("cray.delete_selected_components_keep_vertices", icon="MESH_DATA")
+        box.operator("cray.fix_proxy_triangle_meshes", icon="CONSTRAINT")
         box.separator()
         box.label(text="Edit Mode planar search", icon="FACESEL")
         edit_col = box.column(align=True)
@@ -11481,16 +13150,15 @@ class CRAY_PT_ImportExportPlannerPanel(Panel):
 
         ibox = layout.box()
         ibox.label(text="Batch Import (Arma 3 Object Builder)", icon="IMPORT")
-        row = ibox.row(align=True)
-        row.operator("cray.ie_add_files", icon="ADD")
-        row.operator("cray.ie_remove_file", icon="REMOVE")
-        row.operator("cray.ie_clear_files", icon="TRASH")
-        ibox.separator()
         ibox.label(text="Quick Add From NH_Objects", icon="VIEWZOOM")
         ibox.prop(st, "quick_add_search_root")
         quick_row = ibox.row(align=True)
         quick_row.prop(st, "quick_add_p3d_name", text="")
-        quick_row.operator("cray.ie_add_by_name", text="Add By Name", icon="ADD")
+        quick_row.operator("cray.ie_add_by_name", text="", icon="ADD")
+        row = ibox.row(align=True)
+        row.operator("cray.ie_add_files", text="Add", icon="ADD")
+        row.operator("cray.ie_remove_file", icon="REMOVE")
+        row.operator("cray.ie_clear_files", icon="TRASH")
         ibox.template_list("CRAY_UL_ie_files", "", st, "import_files", st, "import_active_index", rows=6)
         ibox.operator("cray.ie_import_batch", icon="FILE_REFRESH")
         ibox.separator()
@@ -11594,6 +13262,7 @@ classes = (
     CRAY_OT_CopySelectedVertsToGeometry,
     CRAY_OT_HullLooseGeometryVerts,
     CRAY_OT_ColliderHotkeysInfo,
+    CRAY_OT_SetColliderTargetFromActive,
     CRAY_OT_EnsureRoadwayLOD,
     CRAY_OT_CopySelectedFacesToRoadway,
     CRAY_OT_WeldRoadwayVertices,
@@ -11602,7 +13271,9 @@ classes = (
     CRAY_OT_OpenFixListFile,
     CRAY_OT_SelectFixListComponentsOnActiveLOD,
     CRAY_OT_DeleteSelectedComponentsKeepVertices,
+    CRAY_OT_FixProxyTriangleMeshes,
     CRAY_OT_SelectIsolatedVertices,
+    CRAY_OT_SelectLooseVerticesOutsideMemory,
     CRAY_OT_SelectSplitPlanarNgons,
     CRAY_OT_SelectCoplanarPlateIslands,
     CRAY_OT_EnsureColliderLOD,
@@ -11623,6 +13294,7 @@ classes = (
     CRAY_PG_ModelSplitSettings,
     CRAY_PG_AssetLibrarySettings,
     CRAY_PG_AssetProxySettings,
+    CRAY_OT_IEFilePathTooltip,
     CRAY_UL_IEFiles,
     CRAY_OT_AssetLibraryBuildFromFolder,
     CRAY_OT_AssetLibraryBuildFromFiles,
@@ -11634,7 +13306,6 @@ classes = (
     CRAY_OT_IE_ImportBatch,
     CRAY_OT_ModelSplitTransferSelectedToTargetCategory,
     CRAY_OT_ConvertSelectedToProxies,
-    CRAY_OT_FixShadingByPipeline,
     CRAY_OT_RepairA3OBSelections,
     CRAY_OT_CreatePlainAxisPivot,
     CRAY_OT_ClearPlainAxisPivots,

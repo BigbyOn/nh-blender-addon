@@ -2,6 +2,37 @@
 
 Все заметные изменения проекта фиксируются в этом файле.
 
+## [0.4.9.1] - 2026-05-01
+
+### По сравнению с предыдущим changelog
+- Предыдущий блок `Unreleased` от `2026-04-25` добавлял ранние export-стопы для duplicate `Resolution LOD` и `n-gon`, чтобы A3OB не молча пропускал LOD. В `0.4.9.1` batch-export получил следующий слой защиты: проверяет результат после записи, диагностирует причину пропуска LOD и не даёт `.bak` перезаписаться уже частично сломанной моделью.
+- Предыдущий changelog описывал подготовку split/snap/fix workflows. В `0.4.9.1` основной фокус смещён на безопасный повторный экспорт, восстановление проблемных A3OB-моделей и удобство работы с `Geometry` / `Fire Geometry` / `Roadway`.
+
+### Добавлено
+- В batch-export добавлена проверка текущего `.p3d` перед созданием `.bak`: если существующий файл уже не содержит ожидаемые LOD-сигнатуры или имеет меньше LOD, чем текущий backup, новый `.bak` не создаётся и причина выводится в `System Console`.
+- Добавлена подробная диагностика `Missing LOD diagnostics`: для пропавшего LOD выводятся preprocess-данные, proxy-check, параметры merged mesh и ошибки A3OB validation.
+- Диагностика proxy-validation теперь показывает конкретный proxy-объект и причину отказа: не один треугольник, non-ASCII path/material/group или отсутствующие A3OB proxy/material properties.
+- Добавлены предупреждения и инструмент поиска loose vertices вне `Point clouds > Memory`: `Fixes -> Export checks -> Loose vertices outside Memory`.
+- В `Fixes` добавлена кнопка `Fix Proxy Triangles`, которая чинит A3OB proxy-меши с ровно 3 вершинами, но без одного корректного треугольного face; объект proxy не пересоздаётся, поэтому сохраняются parent, transform, A3OB proxy properties, custom properties, материалы и material index первого face.
+- Batch-export теперь автоматически готовит vertex mass для `Geometry` LOD, если масса отсутствует или часть вершин не имеет веса.
+- В `Geometry Collider` добавлены eyedropper-кнопки для быстрого назначения активного mesh как `Target LOD Object`, `Fire Geometry` или `Roadway`.
+- В списки материалов `Fire Geometry` и `Roadway` добавлен пункт `Добавить новый`, создающий материал и назначающий его на выделенные faces или весь target mesh.
+- Добавлены сворачиваемые секции `Geometries / Fire Geometry` и `Misc / Roadway`.
+
+### Изменено
+- Версия аддона поднята до `0.4.9.1`.
+- `Force export all LODs (skip validation)` теперь реально обходит A3OB `Validator.validate_lod` и proxy-validation, а также экспортирует с `lod_collisions="IGNORE"`.
+- При включённом `Force export all LODs` локальные pre-check предупреждения по duplicate `Resolution LOD` и `n-gon` больше не останавливают экспорт, а только пишутся в консоль.
+- `Repair Invalid A3OB Selections` теперь собирает выбранный repair scope в одну `Resolution 0` модель, переносит её в `.p3d` root-коллекцию, чистит пустые коллекции/helper-объекты и затем чинит A3OB selection links.
+- В `Fixes` блок export-проверок вынесен отдельно, а старый отдельный `Fix Shading` убран из панели.
+
+### Исправлено
+- Исправлена ситуация, когда `Force export all LODs` не помогал проблемному LOD, потому что patch применялся не к тому `Validator`, который реально использует A3OB exporter.
+- Batch-export теперь создаёт временный `.bak.pending` до записи и финализирует `.bak` только после post-check: полный экспорт может обновить backup даже если восстановил недостающие LOD, а partial export не перезаписывает более полезный существующий `.bak`.
+- Post-check missing LOD теперь показывает не только факт `Only exported X/Y`, но и конкретные объекты/сигнатуры вместе с диагностикой возможной причины.
+- В списке файлов `Import/Export planner` снова работает выбор строки через ЛКМ; кнопка tooltip больше не перехватывает клик выбора.
+- В `Import/Export planner` кнопки `Add` / `Remove` / `Clear` перенесены под quick-add строку, а `Add By Name` заменена компактной icon-only кнопкой с плюсом, чтобы поле имени модели было шире.
+
 ## [Unreleased] - 2026-04-25
 
 ### Добавлено

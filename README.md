@@ -4,9 +4,9 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 
 Расположение в Blender: `3D Viewport -> N Panel -> NH Plugin`
 
-Текущая релизная версия: **0.4.0**
+Текущая релизная версия: **0.4.9.1**
 
-Состояние ветки: помимо релиза `0.4.0`, в рабочем дереве уже есть новые изменения, описанные в [CHANGELOG.md](CHANGELOG.md) в секции `Unreleased`.
+Состояние ветки: актуальный релиз `0.4.9.1`; подробности изменений описаны в [CHANGELOG.md](CHANGELOG.md).
 
 ## Возможности
 
@@ -200,6 +200,7 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 
 Коротко по актуальному состоянию:
 
+- `0.4.9.1` (`2026-05-01`) — безопасные `.bak` при batch-export, диагностика missing LOD, рабочий `Force export all LODs`, loose-vertex export checks, auto mass для `Geometry` LOD, `Fix Proxy Triangles` и улучшения `Fire Geometry` / `Roadway` UI
 - `Unreleased` (`2026-04-25`) — component-fix `.txt` workflow, `Delete Faces/Edges Keep Verts`, поиск `Find Trash` / `Find Flat Plates`, quick-add импорта по имени из `NH_Objects`, named standalone model split, A/V target workflow для `Snap Points`, стабильная нумерация snap-точек `0/1` и дополнительные export-проверки на duplicate `Resolution LOD` и `n-gon`
 - `0.4.0` (`2026-04-12`) — ручной A/V workflow для `Snap Points`, автоматическое создание `Point clouds > Memory`, scatter по выделенным полигонам и `Slope Falloff`
 - `0.3.1` (`2026-04-07`) — `Import/Export planner`, `Model Split`, кеш texture preview и batch-export фильтр для split-part коллекций
