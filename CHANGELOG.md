@@ -2,6 +2,116 @@
 
 Все заметные изменения проекта фиксируются в этом файле.
 
+## [0.5.1.3] - 2026-05-18
+
+### Добавлено
+- `Export Missing Textures` переведён на modal/timer workflow, чтобы Blender мог обновлять UI во время экспорта.
+- В `Texture Replace -> Export Missing Textures from Sources` добавлен видимый прогресс экспорта:
+  - текущий номер операции;
+  - общее количество операций;
+  - процент выполнения;
+  - текущая текстура;
+  - текущее действие.
+- Добавлена кнопка `Cancel Export` для безопасной остановки текущего экспорта текстур.
+- Во время экспорта добавляется статус Blender workspace с текущим прогрессом `NH Texture Export`.
+- В отчёты экспорта добавлен признак частичной отмены, если экспорт был остановлен пользователем.
+- `Fix Mesh/Hierarchy` теперь после завершения автоматически выставляет итоговому mesh-объекту A3OB LOD Properties:
+  - `Is P3D LOD = ON`;
+  - `Type = Resolution`;
+  - `Resolution / Index = 0`.
+- После `Fix Mesh/Hierarchy` итоговый объект снова делается активным и выделенным, чтобы его LOD-свойства сразу были видны в `Object Data Properties`.
+
+### Изменено
+- `Export Missing Textures` больше не выполняет весь экспорт одним блокирующим `execute()`, а обрабатывает requests порциями через timer.
+- Во время активного экспорта обычная кнопка `Export Missing Textures` скрывается или блокируется, чтобы не запускать второй экспорт поверх первого.
+- `Texture Replace` сохраняет текущую логику Built-in Python DDS converter, RVMAT generation и TXT/JSON reports, но теперь даёт видимую обратную связь во время работы.
+- TXT-отчёт экспорта стал короче:
+  - `Skipped Existing` ограничен первыми 100 записями;
+  - `Missing Sources` ограничен первыми 100 записями;
+  - `Failed` ограничен первыми 100 записями;
+  - полный список остаётся в JSON-отчёте.
+
+### Исправлено
+- Исправлен отчёт экспорта: `.paa` больше не должны попадать в секции `Created Diffuse`, `Created NOHQ` и `Created SMDI`.
+- `Created Diffuse` теперь содержит только созданные diffuse `.png`.
+- `Created NOHQ` теперь содержит только созданные `_nohq.png`.
+- `Created SMDI` теперь содержит только созданные `_smdi.png`.
+- `Created PAA` теперь содержит только созданные `.paa`.
+- `Created RVMAT` теперь содержит только созданные `.rvmat`.
+- Добавлена защитная фильтрация списков перед записью TXT/JSON-отчёта.
+- Добавлен dedupe created-items по нормализованному output path.
+- Runtime-поле `texture_export_cancel_requested` не сохраняется в persisted UI state.
+
+### Проверено
+- `python -m py_compile` проходит для:
+  - `NH_Blender.py`;
+  - `NH_Blender/__init__.py`;
+  - `NH_Blender/tools/xray_tex_converter/dds_python.py`.
+- ZIP собирается через `build_addon_zip_v2.bat`.
+- Сохранён предыдущий фикс `Fix Mesh/Hierarchy` для A3OB LOD Properties.
+
+## [0.5.1.2] - 2026-05-18
+
+### Добавлено
+- Package-версия аддона `NH_Blender/` стала основным форматом установки.
+- В ZIP теперь включаются встроенные инструменты конвертации текстур:
+  - `NH_Blender/tools/xray_tex_converter/dds_python.py`;
+  - `NH_Blender/tools/xray_tex_converter/converter.js`.
+- Добавлен встроенный Python DDS-конвертер без pip-зависимостей.
+- Поддержаны DDS-форматы `DXT1`, `DXT3`, `DXT5`.
+- Добавлена конвертация `DDS -> PNG` без Node.js.
+- Добавлена генерация `_nohq` и `_smdi` из `_bump.dds`.
+- Добавлена генерация `.rvmat` самим аддоном.
+- Добавлены fallback `Stage1` / `Stage5` в RVMAT, если `_bump.dds` отсутствует или конвертация normal/specular не выполнена.
+- Добавлен экспорт недостающих текстур из source-папки в target-папку с сохранением структуры подпапок.
+- Добавлен итоговый отчёт экспорта:
+  - `_nh_texture_export_last_report.txt`;
+  - `_nh_texture_export_last_report.json`.
+- В отчёте появились отдельные секции `Created Diffuse`, `Created NOHQ`, `Created SMDI`, `Created PAA`, `Created RVMAT`, `Skipped Existing`, `Missing Sources`, `Failed`.
+- Добавлен краткий итог последнего экспорта прямо в UI.
+- Добавлена кнопка `Open Last Export Report`.
+- Добавлено принудительное сохранение и восстановление настроек `Texture Replace` через `nh_blender_ui_state.json`.
+- Добавлена миграция старых UI-настроек, чтобы старые значения `AUTO`, `_co`, `Convert PNG to PAA OFF` не перебивали новые дефолты.
+- Добавлены новые дефолты Texture Export:
+  - `Diffuse Suffix = none`;
+  - `Convert DDS to PNG = ON`;
+  - `Convert PNG to PAA = ON`;
+  - `DDS Backend = Built-in Python`;
+  - `Generate RVMAT = ON`;
+  - `Delete PNG after PAA = OFF`;
+  - `Only Missing = ON`;
+  - `Overwrite Existing = OFF`.
+- Добавлен package-aware поиск встроенных converter tools.
+- Добавлен build-скрипт `build_addon_zip_v2.bat`, который собирает package ZIP и проверяет содержимое архива.
+- `Component fixes from .txt` переведён в свернутый dropdown, закрытый по умолчанию.
+
+### Изменено
+- `Texture Replace` UI упрощён.
+- Удалены из UI технические кнопки диагностики экспорта, `Object Preview` и `DB Preview`.
+- `Replace Texture from DB` перенесён ближе к `Build From Folder`, потому что это один workflow.
+- DDS backend в обычном UI оставлен как `Built-in Python`.
+- Node.js больше не требуется для штатной конвертации DDS.
+- `Dry Run`, `Verbose Export Log`, `Write Export Log`, `Export Log File`, `Show Advanced Converter Tools` убраны из UI.
+- Экспорт текстур теперь всегда выполняет реальный экспорт согласно настройкам `Only Missing` / `Overwrite Existing`.
+- DB build/replace теперь игнорирует тестовые артефакты `*_test`, `*_node_test`, `*_package_test`, `*_backend_test`, `*_selftest`.
+- RVMAT generation больше не требует заранее существующий `.rvmat`.
+- Virtual missing paths больше не стирают старые поля A3OB пустым значением.
+
+### Исправлено
+- Исправлена ошибка регистрации experimental collider operators из-за `PointerProperty(type=bpy.types.Object)` внутри Operator.
+- Исправлена ошибка `_tex_export_should_write() missing 1 required positional argument: 'settings'`.
+- Исправлена проблема, когда Blender Image API не мог прочитать некоторые DDS, например `prop_14.dds`.
+- Исправлена проблема упаковки, из-за которой папка `tools/` не попадала рядом с установленным аддоном.
+- Исправлена логика записи expected missing paths: если текстуры нет, аддон пишет ожидаемый путь, а не стирает поле.
+- Исправлена логика `.rvmat` basename: `_co`, `_ca`, `_nohq`, `_smdi` и похожие суффиксы удаляются перед подбором базового имени.
+- Исправлена сборка ZIP: пути внутри архива записываются через `/`, а не через `\`.
+- Исправлена ошибка `re.PatternError: bad character range ’-Р at position 12` в `_texture_category_folder_from_base`.
+
+### Известные ограничения
+- `PNG -> PAA` по-прежнему требует внешний `ImageToPAA.exe` или `Pal2PacE.exe`.
+- `_nohq/_smdi` создаются только если найден исходный `_bump.dds`.
+- Если `_bump.dds` отсутствует, RVMAT использует fallback `Stage1` / `Stage5`.
+
 ## [0.4.9.1] - 2026-05-01
 
 ### По сравнению с предыдущим changelog
