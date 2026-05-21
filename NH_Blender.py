@@ -1,7 +1,7 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Daryl and Enisam",
-    "version": (0, 5, 1, 3),
+    "version": (0, 5, 2, 9),
     "blender": (5, 1, 1),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "All-in-one Blender toolkit for porting and preparing DayZ/Arma assets: fixes, textures, colliders, proxies, snap points, and P3D workflow helpers.",    
@@ -137,6 +137,7 @@ _PERSISTED_UI_SETTINGS = {
         "floor_contact",
         "minimum_size",
         "convex_detail",
+        "convex_max_triangles",
         "cylinder_segments",
         "pipe_segments",
         "pipe_inner_radius",
@@ -963,6 +964,30 @@ def get_surface_enum_items(self, context):
     return items
 
 
+def _repair_mojibake_text(text):
+    original = str(text or "")
+    if not original:
+        return original
+
+    def _score(value):
+        marker_count = sum(value.count(marker) for marker in ("Р", "С", "Ð", "Ñ", "�"))
+        cyrillic_count = sum(1 for ch in value if "\u0400" <= ch <= "\u04ff")
+        return marker_count * 4 - cyrillic_count
+
+    best = original
+    best_score = _score(original)
+    for encoding in ("cp1251", "latin1"):
+        try:
+            candidate = original.encode(encoding).decode("utf-8")
+        except Exception:
+            continue
+        candidate_score = _score(candidate)
+        if candidate and candidate_score < best_score:
+            best = candidate
+            best_score = candidate_score
+    return best
+
+
 # ------------------------------------------------------------------------
 #  Settings
 # ------------------------------------------------------------------------
@@ -1225,7 +1250,7 @@ def _material_enum_items_for_object(obj, *, none_value: str, missing_object_desc
     if obj is None or obj.type != "MESH":
         return [(none_value, missing_object_desc, missing_object_desc)]
 
-    items.append((_MATERIAL_ADD_NEW, "Р вЂќР С•Р В±Р В°Р Р†Р С‘РЎвЂљРЎРЉ Р Р…Р С•Р Р†РЎвЂ№Р в„–", f"Create and assign a new {slot_desc_prefix.lower()}"))
+    items = [(_MATERIAL_ADD_NEW, "Add New", f"Create and assign a new {slot_desc_prefix.lower()}")]
     material_count = 0
 
     seen = set()
@@ -1245,14 +1270,15 @@ def _material_enum_items_for_object(obj, *, none_value: str, missing_object_desc
                 if node.type == "TEX_IMAGE" and getattr(node, "image", None):
                     image_names.append(node.image.name)
 
+        label = _repair_mojibake_text(mat.name)
         desc = f"{slot_desc_prefix} from slot {slot_idx}"
         if image_names:
-            uniq_images = sorted(set(image_names), key=lambda x: x.lower())
+            uniq_images = sorted(set((_repair_mojibake_text(name) for name in image_names)), key=lambda x: x.lower())
             desc = f"{desc} | Images: {', '.join(uniq_images[:3])}"
             if len(uniq_images) > 3:
                 desc += f" (+{len(uniq_images) - 3} more)"
 
-        items.append((mat.name, mat.name, desc))
+        items.append((mat.name, label, desc))
         material_count += 1
 
     if material_count == 0:
@@ -1800,11 +1826,18 @@ class CRAY_PG_ColliderExpSettings(PropertyGroup):
         unit="LENGTH",
     )
     convex_detail: IntProperty(
-        name="Convex Detail",
+        name="Hull Detail",
         description="Simplification/detail level for experimental convex hull",
         default=16,
         min=4,
         max=128,
+    )
+    convex_max_triangles: IntProperty(
+        name="Max Hull Triangles",
+        description="Triangle budget used when simplifying experimental convex hulls",
+        default=64,
+        min=4,
+        max=2048,
     )
     cylinder_segments: IntProperty(
         name="Cylinder Segments",
@@ -7201,6 +7234,8 @@ _COLLIDER_EXP_TYPE_PROP = "nh_collider_exp_type"
 _COLLIDER_EXP_SOURCE_PROP = "nh_collider_exp_source"
 _COLLIDER_EXP_UUID_PROP = "nh_collider_exp_uuid"
 _COLLIDER_EXP_PARAMS_PROP = "nh_collider_exp_params"
+_COLLIDER_EXP_GUIDE_PROP = "nh_collider_exp_guide_type"
+_COLLIDER_EXP_GUIDE_SOURCE_PROP = "nh_collider_exp_guide_source"
 _COLLIDER_EXP_COMMON_PROPS = (
     "target_lod",
     "scale_x",
@@ -7215,6 +7250,9 @@ _COLLIDER_EXP_COMMON_PROPS = (
     "merge_distance",
     "recalc_normals",
 )
+_COLLIDER_EXP_PERSISTENT_OPERATOR_PROPS = {
+    "target_lod",
+}
 _COLLIDER_EXP_BOX_FACES = (
     (0, 3, 2, 1),
     (4, 5, 6, 7),
@@ -7263,6 +7301,8 @@ def _copy_collider_exp_settings_to_operator_exp(op, settings, prop_names=None):
     if op is None or settings is None:
         return
     for prop_name in prop_names or _COLLIDER_EXP_COMMON_PROPS:
+        if prop_name not in _COLLIDER_EXP_PERSISTENT_OPERATOR_PROPS:
+            continue
         if not hasattr(op, prop_name) or not hasattr(settings, prop_name):
             continue
         try:
@@ -7275,6 +7315,8 @@ def _write_collider_exp_operator_to_settings_exp(op, settings, prop_names=None):
     if op is None or settings is None:
         return
     for prop_name in prop_names or _COLLIDER_EXP_COMMON_PROPS:
+        if prop_name not in _COLLIDER_EXP_PERSISTENT_OPERATOR_PROPS:
+            continue
         if not hasattr(op, prop_name) or not hasattr(settings, prop_name):
             continue
         try:
@@ -7289,6 +7331,70 @@ def _assign_collider_exp_operator_props_exp(op, settings, prop_names=None):
 
 def _collider_exp_operator_props_exp(extra_props=()):
     return tuple(dict.fromkeys((*_COLLIDER_EXP_COMMON_PROPS, *extra_props)))
+
+
+def _draw_collider_exp_vector_props_exp(layout, op, prop_names, labels):
+    row = layout.row(align=True)
+    for prop_name, label in zip(prop_names, labels):
+        if hasattr(op, prop_name):
+            row.prop(op, prop_name, text=label)
+
+
+def _draw_collider_exp_common_operator_props_exp(layout, op):
+    layout.use_property_split = True
+    layout.use_property_decorate = False
+    if hasattr(op, "target_lod"):
+        layout.prop(op, "target_lod")
+
+    box = layout.box()
+    box.label(text="Common Transform", icon="EMPTY_ARROWS")
+    box.label(text="Scale")
+    _draw_collider_exp_vector_props_exp(
+        box,
+        op,
+        ("scale_x", "scale_y", "scale_z"),
+        ("X", "Y", "Z"),
+    )
+    if hasattr(op, "scale_multiplier"):
+        box.prop(op, "scale_multiplier")
+    box.label(text="Offset")
+    _draw_collider_exp_vector_props_exp(
+        box,
+        op,
+        ("offset_x", "offset_y", "offset_z"),
+        ("X", "Y", "Z"),
+    )
+    if hasattr(op, "minimum_size"):
+        box.prop(op, "minimum_size")
+    if hasattr(op, "floor_contact"):
+        box.prop(op, "floor_contact")
+    if hasattr(op, "merge_distance"):
+        box.prop(op, "merge_distance")
+    if hasattr(op, "recalc_normals"):
+        box.prop(op, "recalc_normals")
+
+
+def _draw_collider_exp_operator_panel_exp(layout, op, extra_props=(), *, extra_label="Shape"):
+    _draw_collider_exp_common_operator_props_exp(layout, op)
+    visible_props = [prop_name for prop_name in extra_props if hasattr(op, prop_name)]
+    if not visible_props:
+        return
+    box = layout.box()
+    box.label(text=extra_label, icon="MOD_REMESH")
+    for prop_name in visible_props:
+        box.prop(op, prop_name)
+
+
+def _draw_collider_exp_guide_conversion_panel_exp(layout, op):
+    layout.use_property_split = True
+    layout.use_property_decorate = False
+    if hasattr(op, "target_lod"):
+        layout.prop(op, "target_lod")
+    box = layout.box()
+    box.label(text="Guide Conversion", icon="MESH_CUBE")
+    for prop_name in ("minimum_size", "merge_distance", "recalc_normals"):
+        if hasattr(op, prop_name):
+            box.prop(op, prop_name)
 
 
 def _resolve_collider_exp_source_object_exp(context, preferred_obj=None):
@@ -7348,6 +7454,57 @@ def _ensure_collider_exp_target_object_exp(context, settings, source_obj, op=Non
     return target_obj
 
 
+def _collider_exp_guide_source_object_exp(context, guide_obj, settings=None):
+    if not _is_collider_exp_guide_object_exp(guide_obj):
+        return guide_obj
+
+    source_name = ""
+    try:
+        source_name = str(guide_obj.get(_COLLIDER_EXP_GUIDE_SOURCE_PROP, "") or "")
+    except Exception:
+        source_name = ""
+    if source_name:
+        obj = bpy.data.objects.get(source_name)
+        if _is_live_blender_object_exp(obj) and not _is_collider_exp_guide_object_exp(obj):
+            return obj
+
+    preferred_obj = getattr(settings, "source_object", None) if settings is not None else None
+    if _is_live_blender_object_exp(preferred_obj) and not _is_collider_exp_guide_object_exp(preferred_obj):
+        return preferred_obj
+
+    selected = [
+        obj for obj in getattr(context, "selected_objects", [])
+        if _is_live_blender_object_exp(obj)
+        and getattr(obj, "type", None) == "MESH"
+        and not _is_collider_exp_guide_object_exp(obj)
+    ]
+    return selected[0] if selected else None
+
+
+def _resolve_collider_exp_guide_creation_source_exp(context, settings):
+    source_obj = _resolve_collider_exp_source_object_exp(
+        context,
+        getattr(settings, "source_object", None) if settings is not None else None,
+    )
+    if _is_collider_exp_guide_object_exp(source_obj):
+        source_obj = _collider_exp_guide_source_object_exp(context, source_obj, settings)
+    return source_obj
+
+
+def _require_collider_exp_guide_source_exp(op, context, settings, guide_type):
+    source_obj = _resolve_collider_exp_source_object_exp(
+        context,
+        getattr(settings, "source_object", None) if settings is not None else None,
+    )
+    if not _is_collider_exp_guide_object_exp(source_obj, guide_type):
+        op.report({"ERROR"}, f"Select an NH {guide_type.title()} Guide first")
+        return None, None
+    target_source_obj = _collider_exp_guide_source_object_exp(context, source_obj, settings)
+    if target_source_obj is None:
+        target_source_obj = source_obj
+    return source_obj, target_source_obj
+
+
 def _collider_exp_vec_from_props_exp(op, prefix):
     return Vector((
         float(getattr(op, f"{prefix}_x", 0.0)),
@@ -7363,6 +7520,22 @@ def _collider_exp_scale_vec_exp(op):
         max(float(getattr(op, "scale_y", 1.0)), 0.001) * mult,
         max(float(getattr(op, "scale_z", 1.0)), 0.001) * mult,
     ))
+
+
+def _collider_exp_data_is_guide_exp(data, guide_type=""):
+    return _is_collider_exp_guide_object_exp(data.get("source_obj"), guide_type)
+
+
+def _collider_exp_shape_scale_vec_exp(data, op):
+    if _collider_exp_data_is_guide_exp(data):
+        return Vector((1.0, 1.0, 1.0))
+    return _collider_exp_scale_vec_exp(op)
+
+
+def _collider_exp_shape_offset_vec_exp(data, op):
+    if _collider_exp_data_is_guide_exp(data):
+        return Vector((0.0, 0.0, 0.0))
+    return _collider_exp_vec_from_props_exp(op, "offset")
 
 
 def _bounds_from_points_exp(points):
@@ -7657,6 +7830,58 @@ def _set_collider_exp_custom_props_exp(target_obj, exp_type, source_obj, params)
     target_obj[_COLLIDER_EXP_PARAMS_PROP] = params_text
 
 
+def _is_live_blender_object_exp(obj):
+    if obj is None:
+        return False
+    try:
+        obj_ptr = obj.as_pointer()
+        name = obj.name
+    except (ReferenceError, RuntimeError):
+        return False
+    except Exception:
+        return False
+    if not name or not obj_ptr:
+        return False
+    try:
+        live_obj = bpy.data.objects.get(name)
+        return live_obj is not None and live_obj.as_pointer() == obj_ptr
+    except (ReferenceError, RuntimeError):
+        return False
+    except Exception:
+        return False
+
+
+def _is_collider_exp_convex_hull_object_exp(obj):
+    if not _is_live_blender_object_exp(obj):
+        return False
+    if getattr(obj, "type", None) != "MESH":
+        return False
+    try:
+        return str(obj.get(_COLLIDER_EXP_TYPE_PROP, "") or "") == "CONVEX_HULL"
+    except Exception:
+        return False
+
+
+def _resolve_collider_exp_convex_hull_target_exp(context, settings):
+    active = getattr(getattr(context, "view_layer", None), "objects", None)
+    active_obj = getattr(active, "active", None) if active is not None else None
+    if _is_collider_exp_convex_hull_object_exp(active_obj):
+        return active_obj, "active"
+
+    target_obj = None
+    if settings is not None:
+        try:
+            target_obj = getattr(settings, "geometry_object", None)
+        except ReferenceError:
+            target_obj = None
+        except Exception:
+            target_obj = None
+    if _is_collider_exp_convex_hull_object_exp(target_obj):
+        return target_obj, "last"
+
+    return None, ""
+
+
 def _get_collider_exp_custom_params_exp(target_obj):
     if target_obj is None:
         raise RuntimeError("Target LOD Object is missing")
@@ -7673,6 +7898,32 @@ def _get_collider_exp_custom_params_exp(target_obj):
     if not isinstance(params, dict):
         raise RuntimeError("Experimental collider data is invalid")
     return params
+
+
+def _get_collider_exp_hull_rebuild_data_exp(target_obj):
+    try:
+        params = _get_collider_exp_custom_params_exp(target_obj)
+    except Exception:
+        params = {}
+
+    matrix_rows = params.get("matrix_world")
+    local_items = params.get("local_points", [])
+    if matrix_rows and local_items:
+        try:
+            matrix_world = _matrix_from_list_exp(matrix_rows)
+            local_points = _points_from_list_exp(local_items)
+            if len(local_points) >= 4:
+                return params, matrix_world, local_points, False
+        except Exception:
+            pass
+
+    if not _is_collider_exp_convex_hull_object_exp(target_obj):
+        raise RuntimeError("Selected object is not an experimental convex hull")
+    if target_obj.data is None or len(target_obj.data.vertices) < 4:
+        raise RuntimeError("Selected convex hull has fewer than 4 vertices")
+
+    local_points = [vert.co.copy() for vert in target_obj.data.vertices]
+    return params, target_obj.matrix_world.copy(), local_points, True
 
 
 def _delete_collider_exp_vertices_exp(target_obj, vertex_indices):
@@ -7698,6 +7949,26 @@ def _delete_collider_exp_vertices_exp(target_obj, vertex_indices):
         bm.to_mesh(mesh)
         mesh.update(calc_edges=True)
         return {"verts_removed": removed}
+    finally:
+        bm.free()
+
+
+def _delete_all_collider_exp_vertices_exp(target_obj):
+    if target_obj is None or target_obj.type != "MESH":
+        raise RuntimeError("Target Geometry LOD object must be a mesh")
+    if target_obj.mode == "EDIT":
+        raise RuntimeError("Target Geometry LOD must not be in Edit Mode")
+    mesh = target_obj.data
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh)
+        verts = [vert for vert in bm.verts if vert.is_valid]
+        if verts:
+            bmesh.ops.delete(bm, geom=verts, context="VERTS")
+        bm.normal_update()
+        bm.to_mesh(mesh)
+        mesh.update(calc_edges=True)
+        return {"verts_removed": len(verts)}
     finally:
         bm.free()
 
@@ -7763,23 +8034,395 @@ def _simplify_collider_exp_points_exp(points, detail):
     return selected
 
 
+def _count_collider_exp_hull_triangles_exp(face_indices):
+    return sum(max(0, len(face) - 2) for face in face_indices or [] if len(face) >= 3)
+
+
+def _collider_exp_hull_detail_candidates_exp(detail, max_triangles):
+    detail = max(4, min(int(detail), 128))
+    if max_triangles <= 0:
+        return (detail,)
+
+    candidates = {detail, 4}
+    step = 1 if detail <= 24 else 4
+    candidates.update(range(detail, 3, -step))
+    candidates.update((96, 64, 48, 32, 24, 16, 12, 8, 6))
+    return tuple(sorted((value for value in candidates if 4 <= value <= detail), reverse=True))
+
+
+def _build_collider_exp_hull_data_for_budget_exp(target_obj, world_points, op):
+    unique_points = _dedupe_world_points(world_points)
+    if len(unique_points) < 4:
+        raise RuntimeError("Need at least 4 unique points to build a collider")
+
+    detail = max(4, min(int(getattr(op, "convex_detail", 16)), 128))
+    max_triangles = max(0, int(getattr(op, "convex_max_triangles", 0)))
+    merge_distance = float(getattr(op, "merge_distance", 0.0))
+    recalc_normals = bool(getattr(op, "recalc_normals", True))
+    target_to_local = target_obj.matrix_world.inverted_safe()
+    best = None
+    last_error = None
+
+    for candidate_detail in _collider_exp_hull_detail_candidates_exp(detail, max_triangles):
+        hull_points = _simplify_collider_exp_points_exp(unique_points, candidate_detail)
+        try:
+            hull_data = _build_clean_hull_data_from_local_points(
+                [target_to_local @ point for point in hull_points],
+                merge_distance=merge_distance,
+                recalc_normals=recalc_normals,
+            )
+        except Exception as e:
+            last_error = e
+            continue
+        triangle_count = _count_collider_exp_hull_triangles_exp(hull_data.get("faces", []))
+        current = {
+            "hull_data": hull_data,
+            "hull_points": hull_points,
+            "actual_detail": candidate_detail,
+            "triangles": triangle_count,
+            "max_triangles": max_triangles,
+        }
+        if max_triangles <= 0:
+            return current
+        if triangle_count <= max_triangles:
+            return current
+        if best is None or triangle_count < best["triangles"]:
+            best = current
+
+    if best is None:
+        if last_error is not None:
+            raise RuntimeError(_fmt_exc(last_error))
+        raise RuntimeError("Could not simplify convex hull")
+    return best
+
+
+def _append_collider_exp_hull_data_to_object_exp(target_obj, hull_data, recalc_normals=True):
+    if target_obj is None or target_obj.type != "MESH":
+        raise RuntimeError("Target Geometry LOD object must be a mesh")
+    if target_obj.mode == "EDIT":
+        raise RuntimeError("Target Geometry LOD must not be in Edit Mode")
+
+    mesh = target_obj.data
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh)
+        before_vert_count = len(bm.verts)
+        before_face_count = len(bm.faces)
+
+        new_verts = [bm.verts.new(point.copy()) for point in hull_data.get("verts", [])]
+        bm.verts.ensure_lookup_table()
+
+        new_faces = []
+        for face_indices in hull_data.get("faces", []):
+            face_verts = [new_verts[idx] for idx in face_indices if 0 <= idx < len(new_verts)]
+            if len(face_verts) < 3 or len(set(face_verts)) < 3:
+                continue
+            try:
+                new_faces.append(bm.faces.new(face_verts))
+            except ValueError:
+                continue
+
+        if not new_faces:
+            raise RuntimeError("Could not append simplified convex hull to the target mesh")
+
+        if recalc_normals:
+            bmesh.ops.recalc_face_normals(bm, faces=new_faces)
+
+        bm.normal_update()
+        bm.verts.index_update()
+        bm.faces.index_update()
+        vertex_indices = [vert.index for vert in new_verts if vert.is_valid]
+        face_indices = [face.index for face in new_faces if face.is_valid]
+        bm.to_mesh(mesh)
+        mesh.update(calc_edges=True)
+        return {
+            "verts_added": len(mesh.vertices) - before_vert_count,
+            "faces_added": len(mesh.polygons) - before_face_count,
+            "vertex_indices": vertex_indices,
+            "face_indices": face_indices,
+        }
+    finally:
+        bm.free()
+
+
+def _apply_collider_exp_hull_build_stats_exp(stats, build):
+    stats["used_verts"] = len(build.get("hull_points", []))
+    stats["actual_detail"] = int(build.get("actual_detail", 0))
+    stats["triangles"] = int(build.get("triangles", 0))
+    stats["max_triangles"] = int(build.get("max_triangles", 0))
+    return stats
+
+
 def _append_collider_exp_hull_to_object_exp(target_obj, world_points, op):
-    before_vert_count = len(target_obj.data.vertices)
-    before_face_count = len(target_obj.data.polygons)
-    detail = int(getattr(op, "convex_detail", 16))
-    hull_points = _simplify_collider_exp_points_exp(world_points, detail)
-    stats = _append_collider_hull_to_object(
+    build = _build_collider_exp_hull_data_for_budget_exp(target_obj, world_points, op)
+    stats = _append_collider_exp_hull_data_to_object_exp(
         target_obj,
-        hull_points,
-        merge_distance=float(getattr(op, "merge_distance", 0.0)),
+        build["hull_data"],
         recalc_normals=bool(getattr(op, "recalc_normals", True)),
     )
-    after_vert_count = len(target_obj.data.vertices)
-    after_face_count = len(target_obj.data.polygons)
-    stats["vertex_indices"] = list(range(before_vert_count, after_vert_count))
-    stats["face_indices"] = list(range(before_face_count, after_face_count))
-    stats["used_verts"] = len(hull_points)
-    return stats
+    return _apply_collider_exp_hull_build_stats_exp(stats, build)
+
+
+def _collider_exp_collection_path_names_exp(context, obj):
+    scene_root = getattr(getattr(context, "scene", None), "collection", None)
+    names = []
+    for collection in getattr(obj, "users_collection", []):
+        path = None
+        if scene_root is not None:
+            try:
+                path = _find_collection_path(scene_root, collection.as_pointer())
+            except Exception:
+                path = None
+        for item in path or [collection]:
+            name = getattr(item, "name", "") or ""
+            if name:
+                names.append(name)
+    return names
+
+
+def _is_collider_exp_object_in_lod_collection_exp(context, obj):
+    names = _collider_exp_collection_path_names_exp(context, obj)
+    logical_names = {_logical_collection_name(name) for name in names}
+    accepted = _logical_collection_names(
+        _COLLIDER_COLLECTION_NAME,
+        _COLLIDER_COLLECTION_ALIASES,
+        "Geometry",
+        "View Geometry",
+        "Fire Geometry",
+        _MISC_COLLECTION_NAME,
+        "Roadway",
+    )
+    return bool(logical_names.intersection(accepted))
+
+
+def _is_collider_exp_validation_candidate_exp(context, obj):
+    if not _is_live_blender_object_exp(obj):
+        return False
+    if getattr(obj, "type", None) != "MESH":
+        return False
+    try:
+        if obj.get(_COLLIDER_EXP_TYPE_PROP):
+            return True
+    except Exception:
+        pass
+    lod_token = _collider_lod_token_from_object(obj, allow_name_fallback=True)
+    if lod_token in {*_COLLIDER_LOD_NAMES.keys(), _ROADWAY_LOD_TOKEN}:
+        return True
+    return _is_collider_exp_object_in_lod_collection_exp(context, obj)
+
+
+def _resolve_collider_exp_validation_objects_exp(context, settings):
+    selected = [
+        obj for obj in getattr(context, "selected_objects", [])
+        if _is_collider_exp_validation_candidate_exp(context, obj)
+    ]
+    if selected:
+        return selected
+
+    active = getattr(getattr(context, "view_layer", None), "objects", None)
+    active_obj = getattr(active, "active", None) if active is not None else None
+    if _is_collider_exp_validation_candidate_exp(context, active_obj):
+        return [active_obj]
+
+    target_obj = None
+    if settings is not None:
+        try:
+            target_obj = getattr(settings, "geometry_object", None)
+        except ReferenceError:
+            target_obj = None
+        except Exception:
+            target_obj = None
+    if _is_collider_exp_validation_candidate_exp(context, target_obj):
+        return [target_obj]
+
+    return []
+
+
+def _collider_exp_face_islands_exp(bm):
+    unvisited = {face for face in bm.faces if face.is_valid}
+    islands = []
+    while unvisited:
+        first = unvisited.pop()
+        island = []
+        stack = [first]
+        while stack:
+            face = stack.pop()
+            if face is None or not face.is_valid:
+                continue
+            island.append(face)
+            for edge in face.edges:
+                if edge is None or not edge.is_valid:
+                    continue
+                for linked_face in edge.link_faces:
+                    if linked_face in unvisited:
+                        unvisited.remove(linked_face)
+                        stack.append(linked_face)
+        islands.append(island)
+    return islands
+
+
+def _collider_exp_faces_bounds_exp(faces):
+    verts = []
+    seen = set()
+    for face in faces:
+        for vert in face.verts:
+            if vert is None or not vert.is_valid:
+                continue
+            key = id(vert)
+            if key in seen:
+                continue
+            seen.add(key)
+            verts.append(vert)
+    if not verts:
+        return None, None, None
+    min_v = Vector((
+        min(vert.co.x for vert in verts),
+        min(vert.co.y for vert in verts),
+        min(vert.co.z for vert in verts),
+    ))
+    max_v = Vector((
+        max(vert.co.x for vert in verts),
+        max(vert.co.y for vert in verts),
+        max(vert.co.z for vert in verts),
+    ))
+    return min_v, max_v, (min_v + max_v) * 0.5
+
+
+def _validate_collider_exp_object_exp(context, obj, *, max_triangles=0, minimum_size=0.0):
+    errors = []
+    warnings = []
+    details = []
+    mesh = getattr(obj, "data", None)
+    if obj is None or getattr(obj, "type", None) != "MESH" or mesh is None:
+        return {"errors": ["Object must be a mesh"], "warnings": warnings, "details": details}
+
+    triangle_count = sum(max(0, int(poly.loop_total) - 2) for poly in mesh.polygons)
+    details.append(f"triangles={triangle_count}")
+    max_triangles = max(0, int(max_triangles))
+    if max_triangles > 0 and triangle_count > max_triangles:
+        warnings.append(f"Triangle count {triangle_count} exceeds limit {max_triangles}")
+
+    ngon_count = sum(1 for poly in mesh.polygons if int(poly.loop_total) > 4)
+    if ngon_count:
+        errors.append(f"N-gons: {ngon_count}")
+
+    scale = getattr(obj, "scale", (1.0, 1.0, 1.0))
+    bad_scale = [axis for axis in range(3) if abs(float(scale[axis]) - 1.0) > 1e-4]
+    if bad_scale:
+        warnings.append(f"Scale is not applied: ({scale[0]:.4g}, {scale[1]:.4g}, {scale[2]:.4g})")
+
+    if not _is_collider_exp_object_in_lod_collection_exp(context, obj):
+        errors.append("Object is not inside a collision/LOD collection")
+
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        bm.normal_update()
+
+        non_manifold_count = sum(
+            1 for edge in bm.edges
+            if edge.is_valid and len([face for face in edge.link_faces if face.is_valid]) != 2
+        )
+        if non_manifold_count:
+            errors.append(f"Non-manifold edges: {non_manifold_count}")
+
+        minimum_size = max(0.0, float(minimum_size))
+        tiny_islands = 0
+        flipped_faces = 0
+        for island in _collider_exp_face_islands_exp(bm):
+            min_v, max_v, center = _collider_exp_faces_bounds_exp(island)
+            if min_v is None:
+                continue
+            size = max_v - min_v
+            if minimum_size > 0.0 and max(abs(size.x), abs(size.y), abs(size.z)) < minimum_size:
+                tiny_islands += 1
+            for face in island:
+                face_center = face.calc_center_median()
+                direction = face_center - center
+                if direction.length <= 1e-8:
+                    continue
+                if face.normal.dot(direction.normalized()) < -0.05:
+                    flipped_faces += 1
+
+        if tiny_islands:
+            warnings.append(f"Too-small collision islands: {tiny_islands} below {minimum_size:g} m")
+        if flipped_faces:
+            warnings.append(f"Possible flipped normals: {flipped_faces} face(s)")
+    finally:
+        bm.free()
+
+    return {"errors": errors, "warnings": warnings, "details": details}
+
+
+def _print_collider_exp_validation_report_exp(results):
+    print("=== NH Collision Validate ===")
+    for obj, result in results:
+        errors = result.get("errors", [])
+        warnings = result.get("warnings", [])
+        details = result.get("details", [])
+        status = "OK" if not errors and not warnings else "CHECK"
+        print(f"[{status}] {obj.name}")
+        for detail in details:
+            print(f"  - {detail}")
+        for error in errors:
+            print(f"  - ERROR: {error}")
+        for warning in warnings:
+            print(f"  - WARNING: {warning}")
+
+
+def _collider_exp_self_test_cube_mesh_exp(name, size=2.0):
+    half = float(size) * 0.5
+    mesh = bpy.data.meshes.new(name)
+    mesh.from_pydata(
+        [
+            (-half, -half, -half),
+            ( half, -half, -half),
+            ( half,  half, -half),
+            (-half,  half, -half),
+            (-half, -half,  half),
+            ( half, -half,  half),
+            ( half,  half,  half),
+            (-half,  half,  half),
+        ],
+        [],
+        [
+            (0, 3, 2, 1),
+            (4, 5, 6, 7),
+            (0, 1, 5, 4),
+            (1, 2, 6, 5),
+            (2, 3, 7, 6),
+            (3, 0, 4, 7),
+        ],
+    )
+    mesh.update(calc_edges=True)
+    return mesh
+
+
+def _collider_exp_mesh_signature_exp(obj):
+    mesh = getattr(obj, "data", None)
+    if obj is None or getattr(obj, "type", None) != "MESH" or mesh is None:
+        return None
+    return (
+        tuple(tuple(round(float(coord), 6) for coord in vert.co) for vert in mesh.vertices),
+        tuple(tuple(poly.vertices) for poly in mesh.polygons),
+        tuple(round(float(value), 6) for row in obj.matrix_world for value in row),
+    )
+
+
+def _remove_collider_exp_self_test_data_exp(root_collection, meshes):
+    if root_collection is not None and bpy.data.collections.get(root_collection.name) is not None:
+        _remove_collection_tree(root_collection)
+    for mesh in list(meshes):
+        try:
+            if mesh is not None and mesh.users == 0 and bpy.data.meshes.get(mesh.name) is not None:
+                bpy.data.meshes.remove(mesh)
+        except (ReferenceError, RuntimeError):
+            pass
+        except Exception:
+            pass
 
 
 def _axis_vector_exp(axis_index):
@@ -7813,12 +8456,140 @@ def _infer_inner_factor_from_source_exp(data, axis_a, axis_b):
         da = (point[axis_a] - center[axis_a]) / radius_a
         db = (point[axis_b] - center[axis_b]) / radius_b
         distances.append((da * da + db * db) ** 0.5)
+    inner_candidates = [
+        distance for distance in distances
+        if 0.35 <= distance <= 0.98
+    ]
+    if not inner_candidates:
+        return 0.0
+    inner = min(inner_candidates)
+    return max(0.0, min(inner * 0.9, 0.85))
+
+
+def _infer_inner_factor_exact_from_source_exp(data, axis_a, axis_b):
+    center = data["center"]
+    size = data["size"]
+    radius_a = max(abs(size[axis_a]) * 0.5, 1e-6)
+    radius_b = max(abs(size[axis_b]) * 0.5, 1e-6)
+    distances = []
+    for point in data.get("local_points") or []:
+        da = (point[axis_a] - center[axis_a]) / radius_a
+        db = (point[axis_b] - center[axis_b]) / radius_b
+        distance = (da * da + db * db) ** 0.5
+        if 0.05 <= distance <= 0.98:
+            distances.append(distance)
     if not distances:
         return 0.0
-    inner = min(distances)
-    if inner < 0.35:
-        return 0.0
-    return max(0.0, min(inner * 0.9, 0.85))
+    return max(0.0, min(min(distances), 0.98))
+
+
+def _radial_direction_count_from_data_exp(data, axis_a, axis_b):
+    center = data["center"]
+    size = data["size"]
+    radius = max(abs(size[axis_a]), abs(size[axis_b]), 1e-6)
+    keys = set()
+    for point in data.get("local_points") or []:
+        da = point[axis_a] - center[axis_a]
+        db = point[axis_b] - center[axis_b]
+        if (da * da + db * db) ** 0.5 < radius * 0.05:
+            continue
+        angle = (math.atan2(db, da) + (2.0 * math.pi)) % (2.0 * math.pi)
+        keys.add(int(round(angle / (2.0 * math.pi) * 4096.0)) % 4096)
+    return len(keys)
+
+
+def _ring_vectors_from_data_exp(data, axis_a, axis_b):
+    center = data["center"]
+    size = data["size"]
+    radius = max(abs(size[axis_a]) * 0.5, abs(size[axis_b]) * 0.5, 1e-6)
+    buckets = {}
+    for point in data.get("local_points") or []:
+        vec = Vector((0.0, 0.0, 0.0))
+        vec[axis_a] = point[axis_a] - center[axis_a]
+        vec[axis_b] = point[axis_b] - center[axis_b]
+        length = vec.length
+        if length < radius * 0.05:
+            continue
+        angle = (math.atan2(vec[axis_b], vec[axis_a]) + (2.0 * math.pi)) % (2.0 * math.pi)
+        key = int(round(angle / (2.0 * math.pi) * 4096.0)) % 4096
+        current = buckets.get(key)
+        if current is None or length > current.length:
+            buckets[key] = vec
+
+    return sorted(
+        buckets.values(),
+        key=lambda vec: (math.atan2(vec[axis_b], vec[axis_a]) + (2.0 * math.pi)) % (2.0 * math.pi),
+    )
+
+
+def _ring_bounds_vectors_from_data_exp(data, axis_a, axis_b):
+    center = data["center"]
+    size = data["size"]
+    radius = max(abs(size[axis_a]) * 0.5, abs(size[axis_b]) * 0.5, 1e-6)
+    buckets = {}
+    for point in data.get("local_points") or []:
+        vec = Vector((0.0, 0.0, 0.0))
+        vec[axis_a] = point[axis_a] - center[axis_a]
+        vec[axis_b] = point[axis_b] - center[axis_b]
+        length = vec.length
+        if length < radius * 0.05:
+            continue
+        angle = (math.atan2(vec[axis_b], vec[axis_a]) + (2.0 * math.pi)) % (2.0 * math.pi)
+        key = int(round(angle / (2.0 * math.pi) * 4096.0)) % 4096
+        item = buckets.get(key)
+        if item is None:
+            buckets[key] = {"angle": angle, "inner": vec, "outer": vec}
+            continue
+        if length < item["inner"].length:
+            item["inner"] = vec
+        if length > item["outer"].length:
+            item["outer"] = vec
+
+    return [
+        (item["inner"], item["outer"])
+        for item in sorted(buckets.values(), key=lambda value: value["angle"])
+    ]
+
+
+def _ellipse_vector_from_angle_exp(axis_a, axis_b, radius_a, radius_b, angle):
+    return (
+        _axis_vector_exp(axis_a) * (math.cos(angle) * radius_a)
+        + _axis_vector_exp(axis_b) * (math.sin(angle) * radius_b)
+    )
+
+
+def _ellipse_radius_in_direction_exp(radius_a, radius_b, angle):
+    radius_a = max(float(radius_a), 1e-6)
+    radius_b = max(float(radius_b), 1e-6)
+    c = math.cos(angle)
+    s = math.sin(angle)
+    denom = ((c / radius_a) ** 2 + (s / radius_b) ** 2) ** 0.5
+    if denom <= 1e-12:
+        return min(radius_a, radius_b)
+    return 1.0 / denom
+
+
+def _ellipse_direction_axis_exp(axis_a, axis_b, angle):
+    axis = _axis_vector_exp(axis_a) * math.cos(angle) + _axis_vector_exp(axis_b) * math.sin(angle)
+    if axis.length_squared <= 1e-12:
+        return _axis_vector_exp(axis_a)
+    return axis
+
+
+def _perpendicular_axis_in_plane_exp(axis_a, axis_b, axis):
+    tangent = _axis_vector_exp(axis_a) * (-axis[axis_b]) + _axis_vector_exp(axis_b) * axis[axis_a]
+    if tangent.length_squared <= 1e-12:
+        return _axis_vector_exp(axis_b)
+    return tangent
+
+
+def _ellipse_tangent_axis_exp(axis_a, axis_b, radius_a, radius_b, angle):
+    del radius_a, radius_b
+    return _perpendicular_axis_in_plane_exp(
+        axis_a,
+        axis_b,
+        _ellipse_direction_axis_exp(axis_a, axis_b, angle),
+    )
 
 
 def _make_oriented_box_world_exp(matrix_world, center_local, axis_u, axis_v, axis_w, size_u, size_v, size_w):
@@ -7852,10 +8623,242 @@ def _apply_floor_contact_to_vertices_exp(world_vertices, floor_z, enabled):
     return [point + Vector((0.0, 0.0, delta_z)) for point in world_vertices]
 
 
-def _cylinder_box_mesh_from_data_exp(data, op):
+def _is_collider_exp_guide_object_exp(obj, guide_type=""):
+    if not _is_live_blender_object_exp(obj):
+        return False
+    if getattr(obj, "type", None) != "MESH":
+        return False
+    try:
+        value = str(obj.get(_COLLIDER_EXP_GUIDE_PROP, "") or "")
+    except Exception:
+        return False
+    if not value:
+        return False
+    if guide_type:
+        return value == str(guide_type)
+    return True
+
+
+def _axis_offset_exp(axis_index, amount):
+    vec = Vector((0.0, 0.0, 0.0))
+    vec[axis_index] = float(amount)
+    return vec
+
+
+def _cylinder_guide_mesh_from_data_exp(data, op):
     axis_a, axis_b, depth_axis = _ring_axes_from_data_exp(data)
     center = data["center"] + _collider_exp_vec_from_props_exp(op, "offset")
     scale_vec = _collider_exp_scale_vec_exp(op)
+    size = data["size"]
+    minimum_size = max(float(getattr(op, "minimum_size", 0.0)), 1e-6)
+    radius_a = max(abs(size[axis_a]) * 0.5 * scale_vec[axis_a], minimum_size * 0.5)
+    radius_b = max(abs(size[axis_b]) * 0.5 * scale_vec[axis_b], minimum_size * 0.5)
+    depth = max(abs(size[depth_axis]) * scale_vec[depth_axis], minimum_size)
+    segments = max(4, min(int(getattr(op, "cylinder_segments", 16)), 128))
+    half_depth_vec = _axis_offset_exp(depth_axis, depth * 0.5)
+
+    vertices = []
+    bottom = []
+    top = []
+    for idx in range(segments):
+        angle = (2.0 * math.pi * idx) / segments
+        ring_vec = _ellipse_vector_from_angle_exp(axis_a, axis_b, radius_a, radius_b, angle)
+        bottom.append(len(vertices))
+        vertices.append(center + ring_vec - half_depth_vec)
+        top.append(len(vertices))
+        vertices.append(center + ring_vec + half_depth_vec)
+
+    faces = []
+    for idx in range(segments):
+        nxt = (idx + 1) % segments
+        faces.append((bottom[idx], bottom[nxt], top[nxt], top[idx]))
+    faces.append(tuple(reversed(bottom)))
+    faces.append(tuple(top))
+    return vertices, faces
+
+
+def _pipe_inner_factor_for_data_exp(data, axis_a, axis_b, radius_a, radius_b, op):
+    minimum_size = max(float(getattr(op, "minimum_size", 0.0)), 1e-6)
+    if _collider_exp_data_is_guide_exp(data, "PIPE"):
+        inner_factor = _infer_inner_factor_exact_from_source_exp(data, axis_a, axis_b)
+        return max(0.0, min(inner_factor, 0.98))
+
+    configured_inner = max(float(getattr(op, "pipe_inner_radius", 0.5)), 0.0)
+    thickness = max(float(getattr(op, "pipe_thickness", 0.001)), minimum_size)
+    avg_radius = max((radius_a + radius_b) * 0.5, minimum_size)
+    inferred_inner = _infer_inner_factor_from_source_exp(data, axis_a, axis_b)
+    if inferred_inner > 0.0:
+        inner_factor = inferred_inner
+    elif configured_inner <= 0.98:
+        inner_factor = configured_inner
+    else:
+        inner_factor = configured_inner / avg_radius
+    inner_factor = max(0.0, min(inner_factor, 0.98))
+    return min(inner_factor, max(0.0, 1.0 - (thickness / avg_radius)))
+
+
+def _pipe_guide_mesh_from_data_exp(data, op):
+    axis_a, axis_b, depth_axis = _ring_axes_from_data_exp(data)
+    center = data["center"] + _collider_exp_vec_from_props_exp(op, "offset")
+    scale_vec = _collider_exp_scale_vec_exp(op)
+    size = data["size"]
+    minimum_size = max(float(getattr(op, "minimum_size", 0.0)), 1e-6)
+    outer_multiplier = max(float(getattr(op, "pipe_outer_radius", 1.0)), 0.001)
+    configured_depth = max(float(getattr(op, "pipe_depth", 0.25)), 0.001)
+
+    source_radius_a = max(abs(size[axis_a]) * 0.5, minimum_size * 0.5)
+    source_radius_b = max(abs(size[axis_b]) * 0.5, minimum_size * 0.5)
+    radius_a = max(source_radius_a * outer_multiplier * scale_vec[axis_a], minimum_size * 0.5)
+    radius_b = max(source_radius_b * outer_multiplier * scale_vec[axis_b], minimum_size * 0.5)
+    depth = max(abs(size[depth_axis]) * scale_vec[depth_axis], configured_depth * scale_vec[depth_axis], minimum_size)
+    inner_factor = _pipe_inner_factor_for_data_exp(data, axis_a, axis_b, radius_a, radius_b, op)
+    inner_radius_a = max(radius_a * inner_factor, minimum_size * 0.5)
+    inner_radius_b = max(radius_b * inner_factor, minimum_size * 0.5)
+    segments = max(4, min(int(getattr(op, "pipe_segments", 24)), 128))
+    half_depth_vec = _axis_offset_exp(depth_axis, depth * 0.5)
+
+    vertices = []
+    outer_bottom = []
+    outer_top = []
+    inner_bottom = []
+    inner_top = []
+    for idx in range(segments):
+        angle = (2.0 * math.pi * idx) / segments
+        outer_vec = _ellipse_vector_from_angle_exp(axis_a, axis_b, radius_a, radius_b, angle)
+        inner_vec = _ellipse_vector_from_angle_exp(axis_a, axis_b, inner_radius_a, inner_radius_b, angle)
+        outer_bottom.append(len(vertices))
+        vertices.append(center + outer_vec - half_depth_vec)
+        outer_top.append(len(vertices))
+        vertices.append(center + outer_vec + half_depth_vec)
+        inner_bottom.append(len(vertices))
+        vertices.append(center + inner_vec - half_depth_vec)
+        inner_top.append(len(vertices))
+        vertices.append(center + inner_vec + half_depth_vec)
+
+    faces = []
+    for idx in range(segments):
+        nxt = (idx + 1) % segments
+        faces.append((outer_bottom[idx], outer_bottom[nxt], outer_top[nxt], outer_top[idx]))
+        faces.append((inner_bottom[nxt], inner_bottom[idx], inner_top[idx], inner_top[nxt]))
+        faces.append((outer_top[idx], outer_top[nxt], inner_top[nxt], inner_top[idx]))
+        faces.append((outer_bottom[nxt], outer_bottom[idx], inner_bottom[idx], inner_bottom[nxt]))
+    return vertices, faces
+
+
+def _create_collider_exp_guide_object_exp(context, data, op, guide_type):
+    if str(guide_type) == "PIPE":
+        vertices, faces = _pipe_guide_mesh_from_data_exp(data, op)
+        name = "NH Pipe Guide"
+    else:
+        vertices, faces = _cylinder_guide_mesh_from_data_exp(data, op)
+        guide_type = "CYLINDER"
+        name = "NH Cylinder Guide"
+
+    mesh = bpy.data.meshes.new(f"{name} Mesh")
+    mesh.from_pydata([tuple(vertex) for vertex in vertices], [], faces)
+    mesh.update(calc_edges=True)
+
+    obj = bpy.data.objects.new(name, mesh)
+    obj.matrix_world = data["matrix_world"].copy()
+    obj[_COLLIDER_EXP_GUIDE_PROP] = str(guide_type)
+    obj[_COLLIDER_EXP_GUIDE_SOURCE_PROP] = getattr(data.get("source_obj"), "name", "") or ""
+    try:
+        obj.show_wire = True
+        obj.show_in_front = True
+        obj.color = (0.2, 0.9, 0.75, 0.45)
+    except Exception:
+        pass
+
+    source_obj = data.get("source_obj")
+    guide_collection = None
+    if source_obj is not None:
+        guide_collection = next(iter(getattr(source_obj, "users_collection", []) or []), None)
+    if guide_collection is None:
+        guide_collection = getattr(context, "collection", None)
+    if guide_collection is None:
+        guide_collection = getattr(getattr(context, "scene", None), "collection", None)
+    if guide_collection is not None:
+        guide_collection.objects.link(obj)
+    else:
+        context.collection.objects.link(obj)
+
+    _enable_collider_object_color_preview(context)
+    return obj
+
+
+def _cylinder_guide_box_mesh_from_data_exp(data, axis_a, axis_b, depth_axis, center, depth, minimum_size):
+    ring_vectors = _ring_vectors_from_data_exp(data, axis_a, axis_b)
+    edge_count = len(ring_vectors)
+    if edge_count < 4 or edge_count % 2 != 0:
+        return None
+
+    half_edges = edge_count // 2
+    axis_depth = _axis_vector_exp(depth_axis)
+    vertices = []
+    faces = []
+    for idx in range(half_edges):
+        p0 = ring_vectors[idx]
+        p1 = ring_vectors[(idx + 1) % edge_count]
+        q0 = ring_vectors[(idx + half_edges) % edge_count]
+        q1 = ring_vectors[(idx + 1 + half_edges) % edge_count]
+        edge_mid = (p0 + p1) * 0.5
+        opposite_mid = (q0 + q1) * 0.5
+        radial_vec = edge_mid - opposite_mid
+        tangent_vec = p1 - p0
+        if radial_vec.length_squared <= 1e-12 or tangent_vec.length_squared <= 1e-12:
+            continue
+        radial_axis = radial_vec.normalized()
+        tangent_axis = tangent_vec - radial_axis * tangent_vec.dot(radial_axis)
+        if tangent_axis.length_squared <= 1e-12:
+            tangent_axis = _perpendicular_axis_in_plane_exp(axis_a, axis_b, radial_axis)
+        box_vertices = _make_oriented_box_world_exp(
+            data["matrix_world"],
+            center + (edge_mid + opposite_mid) * 0.5,
+            radial_axis,
+            tangent_axis,
+            axis_depth,
+            max(radial_vec.length, minimum_size),
+            max(min(tangent_vec.length, (q1 - q0).length), minimum_size),
+            depth,
+        )
+        _append_box_data_exp(vertices, faces, box_vertices)
+
+    return vertices, faces
+
+
+def _pipe_guide_trapezoid_mesh_from_data_exp(data, axis_a, axis_b, depth_axis, center, depth):
+    ring_pairs = _ring_bounds_vectors_from_data_exp(data, axis_a, axis_b)
+    segment_count = len(ring_pairs)
+    if segment_count < 4:
+        return None
+
+    half_depth_vec = _axis_offset_exp(depth_axis, depth * 0.5)
+    vertices = []
+    faces = []
+    for idx in range(segment_count):
+        inner0, outer0 = ring_pairs[idx]
+        inner1, outer1 = ring_pairs[(idx + 1) % segment_count]
+        if outer0.length_squared <= 1e-12 or outer1.length_squared <= 1e-12:
+            continue
+        box_vertices = [
+            data["matrix_world"] @ (center + inner0 - half_depth_vec),
+            data["matrix_world"] @ (center + outer0 - half_depth_vec),
+            data["matrix_world"] @ (center + outer1 - half_depth_vec),
+            data["matrix_world"] @ (center + inner1 - half_depth_vec),
+            data["matrix_world"] @ (center + inner0 + half_depth_vec),
+            data["matrix_world"] @ (center + outer0 + half_depth_vec),
+            data["matrix_world"] @ (center + outer1 + half_depth_vec),
+            data["matrix_world"] @ (center + inner1 + half_depth_vec),
+        ]
+        _append_box_data_exp(vertices, faces, box_vertices)
+
+    return vertices, faces
+
+
+def _cylinder_box_mesh_from_data_exp(data, op):
+    axis_a, axis_b, depth_axis = _ring_axes_from_data_exp(data)
+    center = data["center"] + _collider_exp_shape_offset_vec_exp(data, op)
+    scale_vec = _collider_exp_shape_scale_vec_exp(data, op)
     size = data["size"]
     minimum_size = max(float(getattr(op, "minimum_size", 0.0)), 1e-6)
 
@@ -7863,34 +8866,45 @@ def _cylinder_box_mesh_from_data_exp(data, op):
     radius_b = max(abs(size[axis_b]) * 0.5 * scale_vec[axis_b], minimum_size * 0.5)
     depth = max(abs(size[depth_axis]) * scale_vec[depth_axis], minimum_size)
     inner_factor = 0.0
-    segments = max(4, min(int(getattr(op, "cylinder_segments", 16)), 128))
-    step = (2.0 * math.pi) / segments
+    if _collider_exp_data_is_guide_exp(data, "CYLINDER"):
+        guide_mesh = _cylinder_guide_box_mesh_from_data_exp(data, axis_a, axis_b, depth_axis, center, depth, minimum_size)
+        if guide_mesh is not None:
+            vertices, faces = guide_mesh
+            vertices = _apply_floor_contact_to_vertices_exp(
+                vertices,
+                data["world_floor_z"],
+                bool(getattr(op, "floor_contact", False)),
+            )
+            return vertices, faces, inner_factor
+
+    segments = max(2, min(int(getattr(op, "cylinder_segments", 16)), 128))
+    step = math.pi / segments
     axis_depth = _axis_vector_exp(depth_axis)
 
     vertices = []
     faces = []
     for idx in range(segments):
-        angle = (idx + 0.5) * step
-        c = math.cos(angle)
-        s = math.sin(angle)
-        outer_vec = _axis_vector_exp(axis_a) * (c * radius_a) + _axis_vector_exp(axis_b) * (s * radius_b)
-        inner_vec = outer_vec * inner_factor
-        center_vec = (outer_vec + inner_vec) * 0.5
-        radial_axis = outer_vec.normalized() if outer_vec.length_squared > 1e-12 else _axis_vector_exp(axis_a)
-        tangent_axis = _axis_vector_exp(axis_a) * (-s) + _axis_vector_exp(axis_b) * c
-        if tangent_axis.length_squared <= 1e-12:
-            tangent_axis = _axis_vector_exp(axis_b)
-
+        angle = idx * step
         a0 = angle - step * 0.5
         a1 = angle + step * 0.5
-        edge0 = _axis_vector_exp(axis_a) * (math.cos(a0) * radius_a) + _axis_vector_exp(axis_b) * (math.sin(a0) * radius_b)
-        edge1 = _axis_vector_exp(axis_a) * (math.cos(a1) * radius_a) + _axis_vector_exp(axis_b) * (math.sin(a1) * radius_b)
-        tangent_len = max((edge1 - edge0).length * 1.05, minimum_size)
-        radial_len = max((outer_vec - inner_vec).length, minimum_size)
+        radial_axis = _ellipse_direction_axis_exp(axis_a, axis_b, angle)
+        tangent_axis = _ellipse_tangent_axis_exp(axis_a, axis_b, radius_a, radius_b, angle)
+        edge0 = _ellipse_vector_from_angle_exp(axis_a, axis_b, radius_a, radius_b, a0)
+        edge1 = _ellipse_vector_from_angle_exp(axis_a, axis_b, radius_a, radius_b, a1)
+        radial_half = min(
+            abs(edge0.dot(radial_axis)),
+            abs(edge1.dot(radial_axis)),
+            _ellipse_radius_in_direction_exp(radius_a, radius_b, angle),
+        )
+        radial_len = max(radial_half * 2.0, minimum_size)
+        tangent_len = max(
+            abs((edge1 - edge0).dot(tangent_axis)),
+            minimum_size,
+        )
 
         box = _make_oriented_box_world_exp(
             data["matrix_world"],
-            center + center_vec,
+            center,
             radial_axis,
             tangent_axis,
             axis_depth,
@@ -7908,34 +8922,60 @@ def _cylinder_box_mesh_from_data_exp(data, op):
     return vertices, faces, inner_factor
 
 
+def _remove_collider_exp_guide_after_conversion_exp(context, guide_obj):
+    del context
+    if not _is_collider_exp_guide_object_exp(guide_obj):
+        return
+    mesh = getattr(guide_obj, "data", None)
+    try:
+        bpy.data.objects.remove(guide_obj, do_unlink=True)
+    except (ReferenceError, RuntimeError):
+        return
+    except Exception:
+        return
+    if mesh is not None:
+        try:
+            if mesh.users == 0 and bpy.data.meshes.get(mesh.name) is not None:
+                bpy.data.meshes.remove(mesh)
+        except Exception:
+            pass
+
+
 def _pipe_box_mesh_from_data_exp(data, op):
     axis_a, axis_b, depth_axis = _ring_axes_from_data_exp(data)
-    center = data["center"] + _collider_exp_vec_from_props_exp(op, "offset")
-    scale_vec = _collider_exp_scale_vec_exp(op)
+    center = data["center"] + _collider_exp_shape_offset_vec_exp(data, op)
+    scale_vec = _collider_exp_shape_scale_vec_exp(data, op)
     size = data["size"]
     minimum_size = max(float(getattr(op, "minimum_size", 0.0)), 1e-6)
-    outer_multiplier = max(float(getattr(op, "pipe_outer_radius", 1.0)), 0.001)
-    configured_inner = max(float(getattr(op, "pipe_inner_radius", 0.5)), 0.0)
+    outer_multiplier = 1.0 if _collider_exp_data_is_guide_exp(data, "PIPE") else max(float(getattr(op, "pipe_outer_radius", 1.0)), 0.001)
     configured_depth = max(float(getattr(op, "pipe_depth", 0.25)), 0.001)
-    thickness = max(float(getattr(op, "pipe_thickness", 0.001)), minimum_size)
 
     source_radius_a = max(abs(size[axis_a]) * 0.5, minimum_size * 0.5)
     source_radius_b = max(abs(size[axis_b]) * 0.5, minimum_size * 0.5)
     radius_a = max(source_radius_a * outer_multiplier * scale_vec[axis_a], minimum_size * 0.5)
     radius_b = max(source_radius_b * outer_multiplier * scale_vec[axis_b], minimum_size * 0.5)
-    depth = max(abs(size[depth_axis]) * scale_vec[depth_axis], configured_depth * scale_vec[depth_axis], minimum_size)
-
-    inferred_inner = _infer_inner_factor_from_source_exp(data, axis_a, axis_b)
-    avg_radius = max((radius_a + radius_b) * 0.5, minimum_size)
-    if inferred_inner > 0.0:
-        inner_factor = inferred_inner
-    elif configured_inner <= 0.98:
-        inner_factor = configured_inner
+    source_depth = abs(size[depth_axis]) * scale_vec[depth_axis]
+    if _is_collider_exp_guide_object_exp(data.get("source_obj"), "PIPE"):
+        depth = max(source_depth, minimum_size)
     else:
-        inner_factor = configured_inner / avg_radius
-    inner_factor = max(0.0, min(inner_factor, 0.98))
-    inner_factor = min(inner_factor, max(0.0, 1.0 - (thickness / avg_radius)))
+        depth = max(source_depth, configured_depth * scale_vec[depth_axis], minimum_size)
+
+    inner_factor = _pipe_inner_factor_for_data_exp(data, axis_a, axis_b, radius_a, radius_b, op)
+    if _collider_exp_data_is_guide_exp(data, "PIPE"):
+        guide_mesh = _pipe_guide_trapezoid_mesh_from_data_exp(data, axis_a, axis_b, depth_axis, center, depth)
+        if guide_mesh is not None:
+            vertices, faces = guide_mesh
+            vertices = _apply_floor_contact_to_vertices_exp(
+                vertices,
+                data["world_floor_z"],
+                bool(getattr(op, "floor_contact", False)),
+            )
+            return vertices, faces
+
+    guide_edge_count = _radial_direction_count_from_data_exp(data, axis_a, axis_b) if _collider_exp_data_is_guide_exp(data, "PIPE") else 0
     segments = max(4, min(int(getattr(op, "pipe_segments", 24)), 128))
+    if guide_edge_count >= 4:
+        segments = max(4, min(guide_edge_count, 128))
     step = (2.0 * math.pi) / segments
     axis_depth = _axis_vector_exp(depth_axis)
 
@@ -7949,16 +8989,12 @@ def _pipe_box_mesh_from_data_exp(data, op):
         inner_vec = outer_vec * inner_factor
         center_vec = (outer_vec + inner_vec) * 0.5
         radial_axis = outer_vec.normalized() if outer_vec.length_squared > 1e-12 else _axis_vector_exp(axis_a)
-        tangent_axis = _axis_vector_exp(axis_a) * (-s) + _axis_vector_exp(axis_b) * c
-        if tangent_axis.length_squared <= 1e-12:
-            tangent_axis = _axis_vector_exp(axis_b)
+        tangent_axis = _perpendicular_axis_in_plane_exp(axis_a, axis_b, radial_axis)
 
         a0 = angle - step * 0.5
         a1 = angle + step * 0.5
-        edge0 = _axis_vector_exp(axis_a) * (math.cos(a0) * radius_a) + _axis_vector_exp(axis_b) * (math.sin(a0) * radius_b)
-        edge1 = _axis_vector_exp(axis_a) * (math.cos(a1) * radius_a) + _axis_vector_exp(axis_b) * (math.sin(a1) * radius_b)
-        tangent_len = max((edge1 - edge0).length * 1.05, minimum_size)
         radial_len = max((outer_vec - inner_vec).length, minimum_size)
+        tangent_len = max(outer_vec.length * math.tan(step * 0.5) * 2.08, minimum_size)
 
         box = _make_oriented_box_world_exp(
             data["matrix_world"],
@@ -8115,6 +9151,12 @@ class CRAY_OT_EnsureColliderLODExp(Operator):
         )
         return self.execute(context)
 
+    def draw(self, context):
+        del context
+        self.layout.use_property_split = True
+        self.layout.use_property_decorate = False
+        self.layout.prop(self, "target_lod")
+
     def execute(self, context):
         settings = _require_collider_exp_enabled_exp(self, context)
         if settings is None:
@@ -8164,11 +9206,15 @@ class CRAY_OT_GenerateBoxColliderExp(Operator):
         _copy_collider_exp_settings_to_operator_exp(self, _collider_exp_settings_exp(context))
         return self.execute(context)
 
+    def draw(self, context):
+        del context
+        _draw_collider_exp_operator_panel_exp(self.layout, self)
+
     def execute(self, context):
         settings = _require_collider_exp_enabled_exp(self, context)
         if settings is None:
             return {"CANCELLED"}
-        source_obj = _resolve_collider_exp_source_object_exp(context, getattr(settings, "source_object", None))
+        source_obj = _resolve_collider_exp_guide_creation_source_exp(context, settings)
         if source_obj is None:
             self.report({"ERROR"}, "Source Object must be a mesh")
             return {"CANCELLED"}
@@ -8224,18 +9270,34 @@ class CRAY_OT_GenerateConvexHullColliderExp(Operator):
     merge_distance: FloatProperty(name="Merge Distance", default=0.0, min=0.0)
     recalc_normals: BoolProperty(name="Recalculate Normals", default=True)
     convex_detail: IntProperty(
-        name="Convex Detail",
+        name="Hull Detail",
         description="Simplification/detail level for experimental convex hull",
         default=16,
         min=4,
         max=128,
     )
+    convex_max_triangles: IntProperty(
+        name="Max Hull Triangles",
+        description="Triangle budget used when simplifying experimental convex hulls",
+        default=64,
+        min=4,
+        max=2048,
+    )
 
     def invoke(self, context, event):
         del event
-        props = _collider_exp_operator_props_exp(("convex_detail",))
+        props = _collider_exp_operator_props_exp(("convex_detail", "convex_max_triangles"))
         _copy_collider_exp_settings_to_operator_exp(self, _collider_exp_settings_exp(context), prop_names=props)
         return self.execute(context)
+
+    def draw(self, context):
+        del context
+        _draw_collider_exp_operator_panel_exp(
+            self.layout,
+            self,
+            ("convex_detail", "convex_max_triangles"),
+            extra_label="Convex Hull",
+        )
 
     def execute(self, context):
         settings = _require_collider_exp_enabled_exp(self, context)
@@ -8256,7 +9318,7 @@ class CRAY_OT_GenerateConvexHullColliderExp(Operator):
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
 
-        props = _collider_exp_operator_props_exp(("convex_detail",))
+        props = _collider_exp_operator_props_exp(("convex_detail", "convex_max_triangles"))
         try:
             settings.geometry_object = target_obj
         except Exception:
@@ -8276,9 +9338,22 @@ class CRAY_OT_GenerateConvexHullColliderExp(Operator):
                 "vertex_indices": stats.get("vertex_indices", []),
                 "face_indices": stats.get("face_indices", []),
                 "convex_detail": int(self.convex_detail),
+                "convex_max_triangles": int(self.convex_max_triangles),
+                "actual_detail": int(stats.get("actual_detail", self.convex_detail)),
+                "triangles": int(stats.get("triangles", 0)),
             },
         )
-        self.report({"INFO"}, f"Generated convex hull in {target_obj.name}: +{stats['verts_added']} verts, +{stats['faces_added']} faces")
+        report_level = {"WARNING"} if (
+            int(stats.get("max_triangles", 0)) > 0
+            and int(stats.get("triangles", 0)) > int(stats.get("max_triangles", 0))
+        ) else {"INFO"}
+        self.report(
+            report_level,
+            (
+                f"Generated convex hull in {target_obj.name}: "
+                f"+{stats['verts_added']} verts, +{stats['faces_added']} faces, {stats.get('triangles', 0)} tris"
+            ),
+        )
         return {"FINISHED"}
 
 
@@ -8286,7 +9361,7 @@ class CRAY_OT_RebuildConvexHullColliderExp(Operator):
     """Rebuild the last experimental convex hull with the current settings"""
 
     bl_idname = "cray.rebuild_convex_hull_collider_exp"
-    bl_label = "Rebuild Convex Hull"
+    bl_label = "Simplify/Rebuild Convex Hull"
     bl_options = {"REGISTER", "UNDO"}
 
     target_lod: EnumProperty(name="Target LOD", items=_COLLIDER_TARGET_LOD_ITEMS, default="6")
@@ -8302,35 +9377,55 @@ class CRAY_OT_RebuildConvexHullColliderExp(Operator):
     merge_distance: FloatProperty(name="Merge Distance", default=0.0, min=0.0)
     recalc_normals: BoolProperty(name="Recalculate Normals", default=True)
     convex_detail: IntProperty(
-        name="Convex Detail",
+        name="Hull Detail",
         description="Simplification/detail level for experimental convex hull",
         default=16,
         min=4,
         max=128,
     )
+    convex_max_triangles: IntProperty(
+        name="Max Hull Triangles",
+        description="Triangle budget used when simplifying experimental convex hulls",
+        default=64,
+        min=4,
+        max=2048,
+    )
 
     def invoke(self, context, event):
         del event
-        props = _collider_exp_operator_props_exp(("convex_detail",))
+        props = _collider_exp_operator_props_exp(("convex_detail", "convex_max_triangles"))
         _copy_collider_exp_settings_to_operator_exp(self, _collider_exp_settings_exp(context), prop_names=props)
         return self.execute(context)
+
+    def draw(self, context):
+        del context
+        _draw_collider_exp_operator_panel_exp(
+            self.layout,
+            self,
+            ("convex_detail", "convex_max_triangles"),
+            extra_label="Simplify Convex Hull",
+        )
 
     def execute(self, context):
         settings = _require_collider_exp_enabled_exp(self, context)
         if settings is None:
             return {"CANCELLED"}
-        target_obj = getattr(settings, "geometry_object", None)
+        target_obj, target_source = _resolve_collider_exp_convex_hull_target_exp(context, settings)
         if target_obj is None or target_obj.type != "MESH":
-            self.report({"ERROR"}, "Target LOD Object must be a mesh")
+            self.report({"ERROR"}, "No convex hull collision found. Select a generated hull or create one first")
+            return {"CANCELLED"}
+        if target_obj.mode == "EDIT":
+            self.report({"ERROR"}, "Leave Edit Mode before simplifying a convex hull")
             return {"CANCELLED"}
 
         try:
-            params = _get_collider_exp_custom_params_exp(target_obj)
             exp_type = str(target_obj.get(_COLLIDER_EXP_TYPE_PROP, ""))
             if exp_type != "CONVEX_HULL":
-                raise RuntimeError("Last experimental collider on this target is not a convex hull")
-            matrix_world = _matrix_from_list_exp(params.get("matrix_world"))
-            local_points = _points_from_list_exp(params.get("local_points", []))
+                raise RuntimeError("Selected object is not an experimental convex hull")
+            original_name = target_obj.name
+            original_mesh_name = target_obj.data.name if target_obj.data is not None else ""
+            original_collections = list(getattr(target_obj, "users_collection", []))
+            params, matrix_world, local_points, replace_whole_object = _get_collider_exp_hull_rebuild_data_exp(target_obj)
             if len(local_points) < 4:
                 raise RuntimeError("Stored convex hull source has fewer than 4 points")
             min_v, max_v = _bounds_from_points_exp(local_points)
@@ -8346,20 +9441,29 @@ class CRAY_OT_RebuildConvexHullColliderExp(Operator):
                 "world_floor_z": min((matrix_world @ point).z for point in local_points),
             }
             world_points = _transform_collider_exp_local_points_exp(data, self)
-            preview_points = _simplify_collider_exp_points_exp(world_points, int(self.convex_detail))
-            target_to_local = target_obj.matrix_world.inverted_safe()
-            _build_clean_hull_data_from_local_points(
-                [target_to_local @ point for point in preview_points],
-                merge_distance=float(self.merge_distance),
-                recalc_normals=bool(self.recalc_normals),
+            build = _build_collider_exp_hull_data_for_budget_exp(target_obj, world_points, self)
+            vertex_indices = params.get("vertex_indices", [])
+            if replace_whole_object or not vertex_indices:
+                _delete_all_collider_exp_vertices_exp(target_obj)
+            else:
+                _delete_collider_exp_vertices_exp(target_obj, vertex_indices)
+            stats = _append_collider_exp_hull_data_to_object_exp(
+                target_obj,
+                build["hull_data"],
+                recalc_normals=bool(getattr(self, "recalc_normals", True)),
             )
-            _delete_collider_exp_vertices_exp(target_obj, params.get("vertex_indices", []))
-            stats = _append_collider_exp_hull_to_object_exp(target_obj, world_points, self)
+            stats = _apply_collider_exp_hull_build_stats_exp(stats, build)
+            target_obj.name = original_name
+            if target_obj.data is not None and original_mesh_name:
+                target_obj.data.name = original_mesh_name
+            for collection in original_collections:
+                if collection is not None and not _collection_directly_contains_object(collection, target_obj):
+                    collection.objects.link(target_obj)
         except Exception as e:
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
 
-        props = _collider_exp_operator_props_exp(("convex_detail",))
+        props = _collider_exp_operator_props_exp(("convex_detail", "convex_max_triangles"))
         try:
             settings.geometry_object = target_obj
         except Exception:
@@ -8382,17 +9486,38 @@ class CRAY_OT_RebuildConvexHullColliderExp(Operator):
                 "vertex_indices": stats.get("vertex_indices", []),
                 "face_indices": stats.get("face_indices", []),
                 "convex_detail": int(self.convex_detail),
+                "convex_max_triangles": int(self.convex_max_triangles),
+                "actual_detail": int(stats.get("actual_detail", self.convex_detail)),
+                "triangles": int(stats.get("triangles", 0)),
+                "uuid": params.get("uuid"),
             },
         )
-        self.report({"INFO"}, f"Rebuilt convex hull in {target_obj.name}: +{stats['verts_added']} verts, +{stats['faces_added']} faces")
+        try:
+            _deselect_all_in_view_layer(context)
+            target_obj.select_set(True)
+            context.view_layer.objects.active = target_obj
+        except Exception:
+            pass
+        report_level = {"WARNING"} if (
+            int(stats.get("max_triangles", 0)) > 0
+            and int(stats.get("triangles", 0)) > int(stats.get("max_triangles", 0))
+        ) else {"INFO"}
+        source_note = "active hull" if target_source == "active" else "last hull"
+        self.report(
+            report_level,
+            (
+                f"Rebuilt {source_note} in {target_obj.name}: "
+                f"+{stats['verts_added']} verts, +{stats['faces_added']} faces, {stats.get('triangles', 0)} tris"
+            ),
+        )
         return {"FINISHED"}
 
 
-class CRAY_OT_GenerateCylinderBoxesColliderExp(Operator):
-    """Generate experimental box segments around a cylindrical form"""
+class CRAY_OT_CreateCylinderGuideColliderExp(Operator):
+    """Create an editable cylinder guide that can be adjusted before box generation"""
 
-    bl_idname = "cray.generate_cylinder_boxes_collider_exp"
-    bl_label = "Generate Cylinder Boxes"
+    bl_idname = "cray.create_cylinder_guide_collider_exp"
+    bl_label = "Create Cylinder Guide"
     bl_options = {"REGISTER", "UNDO"}
 
     target_lod: EnumProperty(name="Target LOD", items=_COLLIDER_TARGET_LOD_ITEMS, default="6")
@@ -8415,6 +9540,15 @@ class CRAY_OT_GenerateCylinderBoxesColliderExp(Operator):
         _copy_collider_exp_settings_to_operator_exp(self, _collider_exp_settings_exp(context), prop_names=props)
         return self.execute(context)
 
+    def draw(self, context):
+        del context
+        _draw_collider_exp_operator_panel_exp(
+            self.layout,
+            self,
+            ("cylinder_segments",),
+            extra_label="Cylinder Guide",
+        )
+
     def execute(self, context):
         settings = _require_collider_exp_enabled_exp(self, context)
         if settings is None:
@@ -8423,19 +9557,15 @@ class CRAY_OT_GenerateCylinderBoxesColliderExp(Operator):
         if source_obj is None:
             self.report({"ERROR"}, "Source Object must be a mesh")
             return {"CANCELLED"}
+
         try:
-            target_obj = _ensure_collider_exp_target_object_exp(context, settings, source_obj, op=self)
-            if target_obj == source_obj:
-                raise RuntimeError("Target Geometry LOD must be separate from the Source Object")
-            data = _collect_collider_exp_input_data_exp(context, source_obj, bounds_only=False)
-            vertices, faces, inner_factor = _cylinder_box_mesh_from_data_exp(data, self)
-            stats = _append_collider_exp_mesh_to_object_exp(
-                target_obj,
-                vertices,
-                faces,
-                merge_distance=self.merge_distance,
-                recalc_normals=bool(self.recalc_normals),
-            )
+            data = _collect_collider_exp_input_data_exp(context, source_obj, bounds_only=True)
+            if getattr(source_obj, "mode", "OBJECT") != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+            guide_obj = _create_collider_exp_guide_object_exp(context, data, self, "CYLINDER")
+            _deselect_all_in_view_layer(context)
+            guide_obj.select_set(True)
+            context.view_layer.objects.active = guide_obj
         except Exception as e:
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
@@ -8446,26 +9576,15 @@ class CRAY_OT_GenerateCylinderBoxesColliderExp(Operator):
             settings.exp_mode = "CYLINDER_BOXES"
         except Exception:
             pass
-        _set_collider_exp_custom_props_exp(
-            target_obj,
-            "CYLINDER_BOXES",
-            source_obj,
-            {
-                "vertex_indices": stats.get("vertex_indices", []),
-                "face_indices": stats.get("face_indices", []),
-                "inner_factor": float(inner_factor),
-                "segments": int(self.cylinder_segments),
-            },
-        )
-        self.report({"INFO"}, f"Generated {self.cylinder_segments} cylinder box segments in {target_obj.name}")
+        self.report({"INFO"}, f"Created editable cylinder guide: {guide_obj.name}")
         return {"FINISHED"}
 
 
-class CRAY_OT_GeneratePipeBoxesColliderExp(Operator):
-    """Generate experimental box segments around a ring or pipe"""
+class CRAY_OT_CreatePipeGuideColliderExp(Operator):
+    """Create an editable pipe guide that can be adjusted before box generation"""
 
-    bl_idname = "cray.generate_pipe_boxes_collider_exp"
-    bl_label = "Generate Pipe Boxes"
+    bl_idname = "cray.create_pipe_guide_collider_exp"
+    bl_label = "Create Pipe Guide"
     bl_options = {"REGISTER", "UNDO"}
 
     target_lod: EnumProperty(name="Target LOD", items=_COLLIDER_TARGET_LOD_ITEMS, default="6")
@@ -8498,27 +9617,38 @@ class CRAY_OT_GeneratePipeBoxesColliderExp(Operator):
         _copy_collider_exp_settings_to_operator_exp(self, _collider_exp_settings_exp(context), prop_names=props)
         return self.execute(context)
 
+    def draw(self, context):
+        del context
+        _draw_collider_exp_operator_panel_exp(
+            self.layout,
+            self,
+            (
+                "pipe_segments",
+                "pipe_inner_radius",
+                "pipe_outer_radius",
+                "pipe_thickness",
+                "pipe_depth",
+            ),
+            extra_label="Pipe Guide",
+        )
+
     def execute(self, context):
         settings = _require_collider_exp_enabled_exp(self, context)
         if settings is None:
             return {"CANCELLED"}
-        source_obj = _resolve_collider_exp_source_object_exp(context, getattr(settings, "source_object", None))
+        source_obj = _resolve_collider_exp_guide_creation_source_exp(context, settings)
         if source_obj is None:
             self.report({"ERROR"}, "Source Object must be a mesh")
             return {"CANCELLED"}
+
         try:
-            target_obj = _ensure_collider_exp_target_object_exp(context, settings, source_obj, op=self)
-            if target_obj == source_obj:
-                raise RuntimeError("Target Geometry LOD must be separate from the Source Object")
-            data = _collect_collider_exp_input_data_exp(context, source_obj, bounds_only=False)
-            vertices, faces = _pipe_box_mesh_from_data_exp(data, self)
-            stats = _append_collider_exp_mesh_to_object_exp(
-                target_obj,
-                vertices,
-                faces,
-                merge_distance=self.merge_distance,
-                recalc_normals=bool(self.recalc_normals),
-            )
+            data = _collect_collider_exp_input_data_exp(context, source_obj, bounds_only=True)
+            if getattr(source_obj, "mode", "OBJECT") != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+            guide_obj = _create_collider_exp_guide_object_exp(context, data, self, "PIPE")
+            _deselect_all_in_view_layer(context)
+            guide_obj.select_set(True)
+            context.view_layer.objects.active = guide_obj
         except Exception as e:
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
@@ -8535,19 +9665,180 @@ class CRAY_OT_GeneratePipeBoxesColliderExp(Operator):
             settings.exp_mode = "PIPE_BOXES"
         except Exception:
             pass
+        self.report({"INFO"}, f"Created editable pipe guide: {guide_obj.name}")
+        return {"FINISHED"}
+
+
+class CRAY_OT_GenerateCylinderBoxesColliderExp(Operator):
+    """Generate experimental box segments around a cylindrical form"""
+
+    bl_idname = "cray.generate_cylinder_boxes_collider_exp"
+    bl_label = "Generate Cylinder Boxes From Guide"
+    bl_options = {"REGISTER", "UNDO"}
+
+    target_lod: EnumProperty(name="Target LOD", items=_COLLIDER_TARGET_LOD_ITEMS, default="6")
+    scale_x: FloatProperty(name="Scale X", default=1.0, min=0.001)
+    scale_y: FloatProperty(name="Scale Y", default=1.0, min=0.001)
+    scale_z: FloatProperty(name="Scale Z", default=1.0, min=0.001)
+    scale_multiplier: FloatProperty(name="Scale Multiplier", default=1.0, min=0.001)
+    offset_x: FloatProperty(name="Offset X", default=0.0)
+    offset_y: FloatProperty(name="Offset Y", default=0.0)
+    offset_z: FloatProperty(name="Offset Z", default=0.0)
+    floor_contact: BoolProperty(name="Floor Contact", default=False)
+    minimum_size: FloatProperty(name="Minimum Size", default=0.05, min=0.0)
+    merge_distance: FloatProperty(name="Merge Distance", default=0.0, min=0.0)
+    recalc_normals: BoolProperty(name="Recalculate Normals", default=True)
+    cylinder_segments: IntProperty(name="Cylinder Segments", default=16, min=4, max=128)
+
+    def invoke(self, context, event):
+        del event
+        props = ("target_lod", "minimum_size", "merge_distance", "recalc_normals")
+        _copy_collider_exp_settings_to_operator_exp(self, _collider_exp_settings_exp(context), prop_names=props)
+        return self.execute(context)
+
+    def draw(self, context):
+        del context
+        _draw_collider_exp_guide_conversion_panel_exp(self.layout, self)
+
+    def execute(self, context):
+        settings = _require_collider_exp_enabled_exp(self, context)
+        if settings is None:
+            return {"CANCELLED"}
+        source_obj, target_source_obj = _require_collider_exp_guide_source_exp(self, context, settings, "CYLINDER")
+        if source_obj is None:
+            return {"CANCELLED"}
+        try:
+            if getattr(source_obj, "mode", "OBJECT") != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+            target_obj = _ensure_collider_exp_target_object_exp(context, settings, target_source_obj, op=self)
+            if target_obj == source_obj:
+                raise RuntimeError("Target Geometry LOD must be separate from the Source Object")
+            data = _collect_collider_exp_input_data_exp(context, source_obj, bounds_only=False)
+            vertices, faces, inner_factor = _cylinder_box_mesh_from_data_exp(data, self)
+            stats = _append_collider_exp_mesh_to_object_exp(
+                target_obj,
+                vertices,
+                faces,
+                merge_distance=self.merge_distance,
+                recalc_normals=bool(self.recalc_normals),
+            )
+            _remove_collider_exp_guide_after_conversion_exp(context, source_obj)
+            _deselect_all_in_view_layer(context)
+            target_obj.select_set(True)
+            context.view_layer.objects.active = target_obj
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        actual_segments = len(faces) // len(_COLLIDER_EXP_BOX_FACES)
+        props = ("target_lod", "minimum_size", "merge_distance", "recalc_normals")
+        _write_collider_exp_operator_to_settings_exp(self, settings, prop_names=props)
+        try:
+            settings.exp_mode = "CYLINDER_BOXES"
+        except Exception:
+            pass
         _set_collider_exp_custom_props_exp(
             target_obj,
-            "PIPE_BOXES",
-            source_obj,
+            "CYLINDER_BOXES",
+            target_source_obj,
             {
                 "vertex_indices": stats.get("vertex_indices", []),
                 "face_indices": stats.get("face_indices", []),
-                "segments": int(self.pipe_segments),
-                "inner_radius": float(self.pipe_inner_radius),
-                "outer_radius": float(self.pipe_outer_radius),
+                "inner_factor": float(inner_factor),
+                "segments": int(actual_segments),
             },
         )
-        self.report({"INFO"}, f"Generated {self.pipe_segments} pipe box segments in {target_obj.name}")
+        self.report({"INFO"}, f"Generated {actual_segments} cylinder box segments in {target_obj.name}")
+        return {"FINISHED"}
+
+
+class CRAY_OT_GeneratePipeBoxesColliderExp(Operator):
+    """Generate experimental box segments around a ring or pipe"""
+
+    bl_idname = "cray.generate_pipe_boxes_collider_exp"
+    bl_label = "Generate Pipe Boxes From Guide"
+    bl_options = {"REGISTER", "UNDO"}
+
+    target_lod: EnumProperty(name="Target LOD", items=_COLLIDER_TARGET_LOD_ITEMS, default="6")
+    scale_x: FloatProperty(name="Scale X", default=1.0, min=0.001)
+    scale_y: FloatProperty(name="Scale Y", default=1.0, min=0.001)
+    scale_z: FloatProperty(name="Scale Z", default=1.0, min=0.001)
+    scale_multiplier: FloatProperty(name="Scale Multiplier", default=1.0, min=0.001)
+    offset_x: FloatProperty(name="Offset X", default=0.0)
+    offset_y: FloatProperty(name="Offset Y", default=0.0)
+    offset_z: FloatProperty(name="Offset Z", default=0.0)
+    floor_contact: BoolProperty(name="Floor Contact", default=False)
+    minimum_size: FloatProperty(name="Minimum Size", default=0.05, min=0.0)
+    merge_distance: FloatProperty(name="Merge Distance", default=0.0, min=0.0)
+    recalc_normals: BoolProperty(name="Recalculate Normals", default=True)
+    pipe_segments: IntProperty(name="Pipe Segments", default=24, min=4, max=128)
+    pipe_inner_radius: FloatProperty(name="Pipe Inner Radius", default=0.5, min=0.0)
+    pipe_outer_radius: FloatProperty(name="Pipe Outer Radius", default=1.0, min=0.001)
+    pipe_depth: FloatProperty(name="Pipe Depth", default=0.25, min=0.001)
+    pipe_thickness: FloatProperty(name="Pipe Thickness", default=0.25, min=0.001)
+
+    def invoke(self, context, event):
+        del event
+        props = ("target_lod", "minimum_size", "merge_distance", "recalc_normals")
+        _copy_collider_exp_settings_to_operator_exp(self, _collider_exp_settings_exp(context), prop_names=props)
+        return self.execute(context)
+
+    def draw(self, context):
+        del context
+        _draw_collider_exp_guide_conversion_panel_exp(self.layout, self)
+
+    def execute(self, context):
+        settings = _require_collider_exp_enabled_exp(self, context)
+        if settings is None:
+            return {"CANCELLED"}
+        source_obj, target_source_obj = _require_collider_exp_guide_source_exp(self, context, settings, "PIPE")
+        if source_obj is None:
+            return {"CANCELLED"}
+        try:
+            if getattr(source_obj, "mode", "OBJECT") != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+            target_obj = _ensure_collider_exp_target_object_exp(context, settings, target_source_obj, op=self)
+            if target_obj == source_obj:
+                raise RuntimeError("Target Geometry LOD must be separate from the Source Object")
+            data = _collect_collider_exp_input_data_exp(context, source_obj, bounds_only=False)
+            vertices, faces = _pipe_box_mesh_from_data_exp(data, self)
+            stats = _append_collider_exp_mesh_to_object_exp(
+                target_obj,
+                vertices,
+                faces,
+                merge_distance=self.merge_distance,
+                recalc_normals=bool(self.recalc_normals),
+            )
+            _remove_collider_exp_guide_after_conversion_exp(context, source_obj)
+            _deselect_all_in_view_layer(context)
+            target_obj.select_set(True)
+            context.view_layer.objects.active = target_obj
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        actual_segments = len(faces) // len(_COLLIDER_EXP_BOX_FACES)
+        props = ("target_lod", "minimum_size", "merge_distance", "recalc_normals")
+        _write_collider_exp_operator_to_settings_exp(self, settings, prop_names=props)
+        try:
+            settings.exp_mode = "PIPE_BOXES"
+        except Exception:
+            pass
+        _set_collider_exp_custom_props_exp(
+            target_obj,
+            "PIPE_BOXES",
+            target_source_obj,
+            {
+                "vertex_indices": stats.get("vertex_indices", []),
+                "face_indices": stats.get("face_indices", []),
+                "segments": int(actual_segments),
+                "inner_radius": float(self.pipe_inner_radius),
+                "outer_radius": float(self.pipe_outer_radius),
+                "thickness": float(self.pipe_thickness),
+                "depth": float(self.pipe_depth),
+            },
+        )
+        self.report({"INFO"}, f"Generated {actual_segments} pipe box segments in {target_obj.name}")
         return {"FINISHED"}
 
 
@@ -8577,6 +9868,15 @@ class CRAY_OT_GenerateSphereColliderExp(Operator):
         props = _collider_exp_operator_props_exp(("sphere_segments",))
         _copy_collider_exp_settings_to_operator_exp(self, _collider_exp_settings_exp(context), prop_names=props)
         return self.execute(context)
+
+    def draw(self, context):
+        del context
+        _draw_collider_exp_operator_panel_exp(
+            self.layout,
+            self,
+            ("sphere_segments",),
+            extra_label="Sphere",
+        )
 
     def execute(self, context):
         settings = _require_collider_exp_enabled_exp(self, context)
@@ -8654,6 +9954,20 @@ class CRAY_OT_GenerateCapsuleColliderExp(Operator):
         _copy_collider_exp_settings_to_operator_exp(self, _collider_exp_settings_exp(context), prop_names=props)
         return self.execute(context)
 
+    def draw(self, context):
+        del context
+        _draw_collider_exp_operator_panel_exp(
+            self.layout,
+            self,
+            (
+                "capsule_radius",
+                "capsule_height",
+                "capsule_cap_size",
+                "capsule_vertical_align",
+            ),
+            extra_label="Capsule",
+        )
+
     def execute(self, context):
         settings = _require_collider_exp_enabled_exp(self, context)
         if settings is None:
@@ -8698,6 +10012,347 @@ class CRAY_OT_GenerateCapsuleColliderExp(Operator):
         )
         self.report({"INFO"}, f"Generated capsule collider in {target_obj.name}: +{stats['verts_added']} verts, +{stats['faces_added']} faces")
         return {"FINISHED"}
+
+
+class CRAY_OT_ValidateCollisionExp(Operator):
+    """Validate generated collision objects for common DayZ/P3D collision issues"""
+
+    bl_idname = "cray.validate_collision_exp"
+    bl_label = "Validate Collision"
+    bl_options = {"REGISTER", "UNDO"}
+
+    max_triangles: IntProperty(
+        name="Max Triangles",
+        description="Warn when a collision object exceeds this triangle budget; set to 0 to disable",
+        default=256,
+        min=0,
+        max=100000,
+    )
+    minimum_size: FloatProperty(
+        name="Minimum Size",
+        description="Warn when a disconnected collision island is smaller than this size",
+        default=0.05,
+        min=0.0,
+        precision=4,
+        unit="LENGTH",
+    )
+
+    def invoke(self, context, event):
+        del event
+        settings = _collider_exp_settings_exp(context)
+        if settings is not None:
+            try:
+                self.max_triangles = int(getattr(settings, "convex_max_triangles", self.max_triangles))
+            except Exception:
+                pass
+            try:
+                self.minimum_size = float(getattr(settings, "minimum_size", self.minimum_size))
+            except Exception:
+                pass
+        return self.execute(context)
+
+    def draw(self, context):
+        del context
+        self.layout.use_property_split = True
+        self.layout.use_property_decorate = False
+        self.layout.prop(self, "max_triangles")
+        self.layout.prop(self, "minimum_size")
+
+    def execute(self, context):
+        settings = _collider_exp_settings_exp(context)
+        objects = _resolve_collider_exp_validation_objects_exp(context, settings)
+        if not objects:
+            self.report({"ERROR"}, "No collision objects found. Select a generated collision object or set a target LOD")
+            return {"CANCELLED"}
+
+        results = []
+        for obj in objects:
+            results.append((
+                obj,
+                _validate_collider_exp_object_exp(
+                    context,
+                    obj,
+                    max_triangles=int(self.max_triangles),
+                    minimum_size=float(self.minimum_size),
+                ),
+            ))
+
+        _print_collider_exp_validation_report_exp(results)
+        error_count = sum(len(result.get("errors", [])) for _obj, result in results)
+        warning_count = sum(len(result.get("warnings", [])) for _obj, result in results)
+        object_count = len(results)
+
+        if error_count or warning_count:
+            self.report(
+                {"WARNING"},
+                (
+                    f"Validated {object_count} collision object(s): "
+                    f"{error_count} error(s), {warning_count} warning(s). See System Console"
+                ),
+            )
+        else:
+            self.report({"INFO"}, f"Validated {object_count} collision object(s): no issues found")
+        return {"FINISHED"}
+
+
+class CRAY_OT_RunCollisionToolSelfTestExp(Operator):
+    """Run a small runtime self-test for the experimental collision tool"""
+
+    bl_idname = "cray.run_collision_tool_self_test_exp"
+    bl_label = "NH Debug / Run Collision Tool Self Test"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def _run_step(self, label, log, callback, *, expect_finished=True):
+        try:
+            result = callback()
+        except Exception as e:
+            raise RuntimeError(f"{label}: traceback: {_fmt_exc(e)}")
+
+        if isinstance(result, set):
+            result_set = result
+        elif isinstance(result, (tuple, list)):
+            result_set = set(result)
+        else:
+            result_set = {str(result)}
+
+        log.append(f"{label}: {sorted(result_set)}")
+        if expect_finished and "FINISHED" not in result_set:
+            raise RuntimeError(f"{label}: expected FINISHED, got {sorted(result_set)}")
+        return result_set
+
+    def execute(self, context):
+        scene = getattr(context, "scene", None)
+        view_layer = getattr(context, "view_layer", None)
+        settings = _collider_exp_settings_exp(context)
+        if scene is None or view_layer is None:
+            self.report({"ERROR"}, "Self Test requires an active scene and view layer")
+            return {"CANCELLED"}
+        if settings is None:
+            self.report({"ERROR"}, "Experimental collider settings are unavailable")
+            return {"CANCELLED"}
+
+        log = []
+        root_collection = None
+        visual_obj = None
+        empty_obj = None
+        collision_obj = None
+        created_meshes = []
+        saved_selection = []
+        try:
+            saved_selection = [
+                obj.name for obj in getattr(context, "selected_objects", [])
+                if _is_live_blender_object_exp(obj)
+            ]
+        except Exception:
+            saved_selection = []
+        try:
+            active_obj = getattr(view_layer.objects, "active", None)
+            saved_active_name = active_obj.name if _is_live_blender_object_exp(active_obj) else ""
+        except Exception:
+            saved_active_name = ""
+
+        setting_names = (
+            "enabled",
+            "source_object",
+            "target_lod",
+            "geometry_object",
+            "convex_detail",
+            "convex_max_triangles",
+            "minimum_size",
+            "merge_distance",
+            "recalc_normals",
+        )
+        saved_settings = {}
+        for name in setting_names:
+            try:
+                saved_settings[name] = getattr(settings, name)
+            except (ReferenceError, RuntimeError):
+                saved_settings[name] = None
+            except Exception:
+                pass
+
+        success = False
+        try:
+            suffix = uuid.uuid4().hex[:8]
+            root_collection = bpy.data.collections.new(f"NH_ColliderSelfTest_{suffix}.p3d")
+            scene.collection.children.link(root_collection)
+            visuals_collection = bpy.data.collections.new("Visuals")
+            root_collection.children.link(visuals_collection)
+            log.append(f"Created temp collection: {root_collection.name}")
+
+            visual_mesh = _collider_exp_self_test_cube_mesh_exp(f"NH_ColliderSelfTest_VisualMesh_{suffix}", size=2.0)
+            created_meshes.append(visual_mesh)
+            visual_obj = bpy.data.objects.new(f"NH_ColliderSelfTest_Visual_{suffix}", visual_mesh)
+            visuals_collection.objects.link(visual_obj)
+            visual_signature = _collider_exp_mesh_signature_exp(visual_obj)
+            if visual_signature is None:
+                raise RuntimeError("Could not capture visual object signature")
+
+            empty_obj = bpy.data.objects.new(f"NH_ColliderSelfTest_Empty_{suffix}", None)
+            root_collection.objects.link(empty_obj)
+
+            settings.enabled = True
+            settings.source_object = visual_obj
+            settings.geometry_object = None
+            settings.target_lod = "6"
+            settings.convex_detail = 8
+            settings.convex_max_triangles = 32
+            settings.minimum_size = 0.05
+            settings.merge_distance = 0.0
+            settings.recalc_normals = True
+
+            _deselect_all_in_view_layer(context)
+            visual_obj.select_set(True)
+            view_layer.objects.active = visual_obj
+
+            self._run_step(
+                "Generate Box",
+                log,
+                lambda: bpy.ops.cray.generate_box_collider_exp(
+                    "EXEC_DEFAULT",
+                    target_lod="6",
+                    minimum_size=0.05,
+                    recalc_normals=True,
+                ),
+            )
+            collision_obj = getattr(settings, "geometry_object", None)
+            if not _is_live_blender_object_exp(collision_obj):
+                raise RuntimeError("Generate Box did not create a live collision target")
+            if collision_obj == visual_obj:
+                raise RuntimeError("Collision target reused the visual object")
+            if collision_obj.data is not None:
+                created_meshes.append(collision_obj.data)
+            if not _is_collider_exp_object_in_lod_collection_exp(context, collision_obj):
+                raise RuntimeError("Box collision target is not inside a collision/LOD collection")
+
+            _deselect_all_in_view_layer(context)
+            visual_obj.select_set(True)
+            view_layer.objects.active = visual_obj
+            self._run_step(
+                "Generate Convex Hull",
+                log,
+                lambda: bpy.ops.cray.generate_convex_hull_collider_exp(
+                    "EXEC_DEFAULT",
+                    target_lod="6",
+                    convex_detail=8,
+                    convex_max_triangles=32,
+                    minimum_size=0.05,
+                    recalc_normals=True,
+                ),
+            )
+            collision_obj = getattr(settings, "geometry_object", None)
+            if not _is_live_blender_object_exp(collision_obj):
+                raise RuntimeError("Generate Convex Hull lost the collision target")
+            if not _is_collider_exp_convex_hull_object_exp(collision_obj):
+                raise RuntimeError("Generated collision target was not tagged as CONVEX_HULL")
+            if not _is_collider_exp_object_in_lod_collection_exp(context, collision_obj):
+                raise RuntimeError("Convex hull target is not inside a collision/LOD collection")
+
+            _deselect_all_in_view_layer(context)
+            collision_obj.select_set(True)
+            view_layer.objects.active = collision_obj
+            self._run_step(
+                "Simplify Hull",
+                log,
+                lambda: bpy.ops.cray.rebuild_convex_hull_collider_exp(
+                    "EXEC_DEFAULT",
+                    target_lod="6",
+                    convex_detail=6,
+                    convex_max_triangles=24,
+                    minimum_size=0.05,
+                    recalc_normals=True,
+                ),
+            )
+            if not _is_live_blender_object_exp(collision_obj):
+                raise RuntimeError("Simplify Hull removed the collision object")
+            if not _is_collider_exp_object_in_lod_collection_exp(context, collision_obj):
+                raise RuntimeError("Simplified hull left the collision/LOD collection")
+
+            self._run_step(
+                "Validate Collision",
+                log,
+                lambda: bpy.ops.cray.validate_collision_exp(
+                    "EXEC_DEFAULT",
+                    max_triangles=64,
+                    minimum_size=0.01,
+                ),
+            )
+
+            settings.geometry_object = None
+            _deselect_all_in_view_layer(context)
+            view_layer.objects.active = None
+            self._run_step(
+                "Validate Empty Scene State",
+                log,
+                lambda: bpy.ops.cray.validate_collision_exp(
+                    "EXEC_DEFAULT",
+                    max_triangles=64,
+                    minimum_size=0.01,
+                ),
+                expect_finished=False,
+            )
+
+            _deselect_all_in_view_layer(context)
+            empty_obj.select_set(True)
+            view_layer.objects.active = empty_obj
+            self._run_step(
+                "Validate Non-Mesh Active",
+                log,
+                lambda: bpy.ops.cray.validate_collision_exp(
+                    "EXEC_DEFAULT",
+                    max_triangles=64,
+                    minimum_size=0.01,
+                ),
+                expect_finished=False,
+            )
+
+            settings.geometry_object = collision_obj
+            if _collider_exp_mesh_signature_exp(visual_obj) != visual_signature:
+                raise RuntimeError("Visual object changed during collision self-test")
+
+            success = True
+            print("=== NH Experimental Collider Self Test ===")
+            for item in log:
+                print(item)
+            self.report({"INFO"}, "Collision Tool Self Test passed")
+            return {"FINISHED"}
+        except Exception as e:
+            print("=== NH Experimental Collider Self Test FAILED ===")
+            for item in log:
+                print(item)
+            print(_fmt_exc(e))
+            self.report({"ERROR"}, f"Collision Tool Self Test failed: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+        finally:
+            try:
+                _deselect_all_in_view_layer(context)
+            except Exception:
+                pass
+            _remove_collider_exp_self_test_data_exp(root_collection, created_meshes)
+            for name, value in saved_settings.items():
+                try:
+                    if name in {"source_object", "geometry_object"} and not _is_live_blender_object_exp(value):
+                        setattr(settings, name, None)
+                    else:
+                        setattr(settings, name, value)
+                except Exception:
+                    pass
+            for name in saved_selection:
+                obj = bpy.data.objects.get(name)
+                if obj is not None:
+                    try:
+                        obj.select_set(True)
+                    except Exception:
+                        pass
+            if saved_active_name:
+                active = bpy.data.objects.get(saved_active_name)
+                if active is not None:
+                    try:
+                        view_layer.objects.active = active
+                    except Exception:
+                        pass
+            if success:
+                log.append("Cleanup complete")
 
 
 # ------------------------------------------------------------------------
@@ -17264,7 +18919,11 @@ class CRAY_PT_ColliderExpPanel(Panel):
 
     def draw(self, context):
         layout = self.layout
-        es = context.scene.cray_collider_exp_settings
+        scene = getattr(context, "scene", None)
+        es = getattr(scene, "cray_collider_exp_settings", None)
+        if es is None:
+            layout.label(text="Experimental collider settings are unavailable.", icon="ERROR")
+            return
 
         layout.prop(es, "enabled")
         if not es.enabled:
@@ -17285,113 +18944,65 @@ class CRAY_PT_ColliderExpPanel(Panel):
             prop_names=("target_lod",),
         )
 
-        common = layout.box()
-        common.label(text="Common Transform", icon="EMPTY_ARROWS")
-        row = common.row(align=True)
-        row.prop(es, "scale_x")
-        row.prop(es, "scale_y")
-        row.prop(es, "scale_z")
-        common.prop(es, "scale_multiplier")
-        row = common.row(align=True)
-        row.prop(es, "offset_x")
-        row.prop(es, "offset_y")
-        row.prop(es, "offset_z")
-        common.prop(es, "minimum_size")
-        common.prop(es, "floor_contact")
-        common.prop(es, "merge_distance")
-        common.prop(es, "recalc_normals")
+        create = layout.box()
+        create.operator_context = "INVOKE_DEFAULT"
+        create.label(text="Create Collider", icon="MOD_REMESH")
 
-        mode_box = layout.box()
-        mode_box.label(text="Collider Type", icon="MOD_REMESH")
-        mode_box.prop(es, "exp_mode")
+        op = create.operator("cray.generate_box_collider_exp", text="Box", icon="MESH_CUBE")
+        _assign_collider_exp_operator_props_exp(op, es)
 
-        if es.exp_mode == "BOX":
-            mode_box.label(text="Uses current selection or selected mesh bounds", icon="INFO")
-            op = mode_box.operator("cray.generate_box_collider_exp", text="Generate Box", icon="MESH_CUBE")
-            _assign_collider_exp_operator_props_exp(op, es)
-        elif es.exp_mode == "CONVEX_HULL":
-            mode_box.prop(es, "convex_detail")
-            op = mode_box.operator("cray.generate_convex_hull_collider_exp", text="Generate Convex Hull", icon="MESH_ICOSPHERE")
-            _assign_collider_exp_operator_props_exp(
-                op,
-                es,
-                prop_names=_collider_exp_operator_props_exp(("convex_detail",)),
-            )
-            op = mode_box.operator("cray.rebuild_convex_hull_collider_exp", text="Rebuild Convex Hull", icon="FILE_REFRESH")
-            _assign_collider_exp_operator_props_exp(
-                op,
-                es,
-                prop_names=_collider_exp_operator_props_exp(("convex_detail",)),
-            )
-        elif es.exp_mode == "CYLINDER_BOXES":
-            mode_box.prop(es, "cylinder_segments")
-            mode_box.label(text="Solid cylinder approximated by primitive box segments", icon="CUBE")
-            op = mode_box.operator("cray.generate_cylinder_boxes_collider_exp", text="Generate Cylinder Boxes", icon="MESH_CYLINDER")
-            _assign_collider_exp_operator_props_exp(
-                op,
-                es,
-                prop_names=_collider_exp_operator_props_exp(("cylinder_segments",)),
-            )
-        elif es.exp_mode == "PIPE_BOXES":
-            mode_box.prop(es, "pipe_segments")
-            mode_box.prop(es, "pipe_inner_radius")
-            mode_box.prop(es, "pipe_outer_radius")
-            mode_box.prop(es, "pipe_thickness")
-            mode_box.prop(es, "pipe_depth")
-            mode_box.label(text="Pipe/ring approximated by primitive box segments", icon="CUBE")
-            op = mode_box.operator("cray.generate_pipe_boxes_collider_exp", text="Generate Pipe Boxes", icon="MESH_TORUS")
-            _assign_collider_exp_operator_props_exp(
-                op,
-                es,
-                prop_names=_collider_exp_operator_props_exp((
-                    "pipe_segments",
-                    "pipe_inner_radius",
-                    "pipe_outer_radius",
-                    "pipe_depth",
-                    "pipe_thickness",
-                )),
-            )
-        elif es.exp_mode == "SPHERE":
-            mode_box.prop(es, "sphere_segments")
-            op = mode_box.operator("cray.generate_sphere_collider_exp", text="Generate Sphere", icon="MESH_UVSPHERE")
-            _assign_collider_exp_operator_props_exp(
-                op,
-                es,
-                prop_names=_collider_exp_operator_props_exp(("sphere_segments",)),
-            )
-        elif es.exp_mode == "CAPSULE":
-            mode_box.prop(es, "capsule_radius")
-            mode_box.prop(es, "capsule_height")
-            mode_box.prop(es, "capsule_cap_size")
-            mode_box.prop(es, "capsule_vertical_align")
-            op = mode_box.operator("cray.generate_capsule_collider_exp", text="Generate Capsule", icon="MESH_UVSPHERE")
-            _assign_collider_exp_operator_props_exp(
-                op,
-                es,
-                prop_names=_collider_exp_operator_props_exp((
-                    "capsule_radius",
-                    "capsule_height",
-                    "capsule_cap_size",
-                    "capsule_vertical_align",
-                )),
-            )
+        row = create.row(align=True)
+        op = row.operator("cray.generate_convex_hull_collider_exp", text="Convex Hull", icon="MESH_ICOSPHERE")
+        _assign_collider_exp_operator_props_exp(
+            op,
+            es,
+            prop_names=_collider_exp_operator_props_exp(("convex_detail", "convex_max_triangles")),
+        )
+        op = row.operator("cray.rebuild_convex_hull_collider_exp", text="Simplify Hull", icon="MOD_DECIM")
+        _assign_collider_exp_operator_props_exp(
+            op,
+            es,
+            prop_names=_collider_exp_operator_props_exp(("convex_detail", "convex_max_triangles")),
+        )
+
+        row = create.row(align=True)
+        op = row.operator("cray.generate_sphere_collider_exp", text="Sphere", icon="MESH_UVSPHERE")
+        _assign_collider_exp_operator_props_exp(
+            op,
+            es,
+            prop_names=_collider_exp_operator_props_exp(("sphere_segments",)),
+        )
+        op = row.operator("cray.generate_capsule_collider_exp", text="Capsule", icon="MESH_UVSPHERE")
+        _assign_collider_exp_operator_props_exp(
+            op,
+            es,
+            prop_names=_collider_exp_operator_props_exp((
+                "capsule_radius",
+                "capsule_height",
+                "capsule_cap_size",
+                "capsule_vertical_align",
+            )),
+        )
 
         round_box = layout.box()
+        round_box.operator_context = "INVOKE_DEFAULT"
         round_box.label(text="Round Box Collision", icon="MESH_CYLINDER")
-        round_box.prop(es, "cylinder_segments")
-        op = round_box.operator("cray.generate_cylinder_boxes_collider_exp", text="Generate Cylinder Boxes", icon="MESH_CYLINDER")
+
+        row = round_box.row(align=True)
+        op = row.operator("cray.create_cylinder_guide_collider_exp", text="Create Cylinder", icon="MESH_CYLINDER")
         _assign_collider_exp_operator_props_exp(
             op,
             es,
             prop_names=_collider_exp_operator_props_exp(("cylinder_segments",)),
         )
-        round_box.separator()
-        round_box.prop(es, "pipe_segments")
-        round_box.prop(es, "pipe_inner_radius")
-        round_box.prop(es, "pipe_outer_radius")
-        round_box.prop(es, "pipe_thickness")
-        round_box.prop(es, "pipe_depth")
-        op = round_box.operator("cray.generate_pipe_boxes_collider_exp", text="Generate Pipe Boxes", icon="MESH_TORUS")
+        op = row.operator("cray.generate_cylinder_boxes_collider_exp", text="Boxes From Cylinder", icon="MESH_CUBE")
+        _assign_collider_exp_operator_props_exp(
+            op,
+            es,
+            prop_names=_collider_exp_operator_props_exp(("cylinder_segments",)),
+        )
+        row = round_box.row(align=True)
+        op = row.operator("cray.create_pipe_guide_collider_exp", text="Create Pipe", icon="MESH_TORUS")
         _assign_collider_exp_operator_props_exp(
             op,
             es,
@@ -17403,6 +19014,26 @@ class CRAY_PT_ColliderExpPanel(Panel):
                 "pipe_thickness",
             )),
         )
+        op = row.operator("cray.generate_pipe_boxes_collider_exp", text="Boxes From Pipe", icon="MESH_CUBE")
+        _assign_collider_exp_operator_props_exp(
+            op,
+            es,
+            prop_names=_collider_exp_operator_props_exp((
+                "pipe_segments",
+                "pipe_inner_radius",
+                "pipe_outer_radius",
+                "pipe_depth",
+                "pipe_thickness",
+            )),
+        )
+
+        validate = layout.box()
+        validate.operator_context = "INVOKE_DEFAULT"
+        validate.label(text="Collision QA", icon="CHECKMARK")
+        op = validate.operator("cray.validate_collision_exp", text="Validate Collision", icon="ERROR")
+        op.max_triangles = int(es.convex_max_triangles)
+        op.minimum_size = float(es.minimum_size)
+        validate.operator("cray.run_collision_tool_self_test_exp", text="NH Debug / Run Collision Tool Self Test", icon="CONSOLE")
 
 
 class CRAY_PT_AssetProxyPanel(Panel):
@@ -17670,10 +19301,14 @@ classes = (
     CRAY_OT_GenerateBoxColliderExp,
     CRAY_OT_GenerateConvexHullColliderExp,
     CRAY_OT_RebuildConvexHullColliderExp,
+    CRAY_OT_CreateCylinderGuideColliderExp,
+    CRAY_OT_CreatePipeGuideColliderExp,
     CRAY_OT_GenerateCylinderBoxesColliderExp,
     CRAY_OT_GeneratePipeBoxesColliderExp,
     CRAY_OT_GenerateSphereColliderExp,
     CRAY_OT_GenerateCapsuleColliderExp,
+    CRAY_OT_ValidateCollisionExp,
+    CRAY_OT_RunCollisionToolSelfTestExp,
 
     CRAY_PG_TexDBItem,
     CRAY_PG_ObjMatImagesItem,

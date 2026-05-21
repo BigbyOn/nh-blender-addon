@@ -2,6 +2,57 @@
 
 Все заметные изменения проекта фиксируются в этом файле.
 
+## [0.5.2.9] - 2026-05-21
+
+### Добавлено
+- В `Geometry Collider (exp)` добавлен двухшаговый workflow для круглых коллизий:
+  - `Create Cylinder` создаёт редактируемый cylinder guide;
+  - `Boxes From Cylinder` генерирует box-collider из уже подогнанного guide;
+  - `Create Pipe` создаёт редактируемый pipe guide;
+  - `Boxes From Pipe` генерирует box-collider из уже подогнанного guide.
+- Для guide-объектов добавлены служебные метки источника, чтобы результат создавался относительно исходного объекта, а не относительно временного guide.
+- Добавлена автоматическая починка отображения mojibake-текста в material dropdown: повреждённые строки вида `РџСЂ...` показываются как нормальная кириллица, без переименования самих материалов.
+
+### Изменено
+- `Boxes From Cylinder` снова создаёт длинные прямые cuboid-боксы через весь диаметр цилиндра.
+- Для 16-edge cylinder guide создаётся 8 прямых box-сегментов без перекошенных заломанных призм.
+- `Boxes From Pipe` строит трапециевидные сегменты по реальным inner/outer ring вершинам guide, вместо прямоугольных боксов, вложенных в кольцо.
+- При генерации из cylinder/pipe guide больше не создаётся отдельная коллекция `NH Collider Guides`.
+- После `Boxes From Cylinder` и `Boxes From Pipe` временный guide удаляется, а активным объектом становится target `Geometry`.
+- Результат генерации сохраняет прежнюю бизнес-логику LOD: создаётся или используется выбранный target, например `Geometries/Geometry`.
+- Параметры shape-операторов в experimental collider tools больше не переносятся между новыми запусками меню; `Scale Multiplier`, scale, offset, segments, radii и depth стартуют с базовых значений. Между операторами сохраняется только `Target LOD`.
+- При создании нового cylinder/pipe guide активный guide больше не становится source для будущего LOD target; source остаётся исходный mesh.
+
+### Исправлено
+- Исправлена проблема, когда сохранённый `Scale Multiplier` ломал реальные размеры следующих box-collider генераций.
+- Исправлена проблема, когда генерация круглой коллизии могла не создавать прежнюю структуру `Geometries` collection и `Geometry` object.
+- Исправлена геометрия cylinder boxes: убраны кривые, перекрученные и визуально сломанные сегменты.
+- Исправлена геометрия pipe boxes: размеры берутся из подогнанного guide, а не из устаревших значений оператора.
+- Исправлена логика сборки ZIP, когда build-script мог падать на уже выставленной версии.
+- Чтение исходников в `build_addon_zip_v2.bat` переведено на UTF-8, чтобы не ломать кириллицу и metadata при сборке.
+- Нормализованы line endings после шумного diff на десятки тысяч строк.
+- `NH_Blender.py` и `NH_Blender/__init__.py` снова синхронизированы.
+
+### Проверено
+- `python -m py_compile` проходит для:
+  - `NH_Blender.py`;
+  - `NH_Blender/__init__.py`;
+  - `NH_Blender/tools/xray_tex_converter/dds_python.py`.
+- Проверена регистрация аддона в Steam Blender:
+  - `D:\SteamLibrary\steamapps\common\Blender\blender.exe`;
+  - Blender `5.1.2`.
+- Проверена регистрация аддона напрямую из ZIP.
+- Выполнен Blender smoke-test:
+  - `Create Cylinder` -> `Boxes From Cylinder`;
+  - `Create Pipe` -> `Boxes From Pipe`;
+  - результат создаётся в `Geometries/Geometry`;
+  - `NH Collider Guides` не создаётся;
+  - cylinder guide с 16 edges даёт 8 box-сегментов;
+  - pipe guide с 24 segments даёт 24 trapezoid-сегмента.
+- Собран архив:
+  - `dist/nh-blender-addon-v0.5.2.9.zip`;
+  - `dist/nh-blender-addon-latest.zip`.
+
 ## [0.5.1.3] - 2026-05-18
 
 ### Добавлено

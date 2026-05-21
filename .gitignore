@@ -30,3 +30,4 @@ release_local.bat
 
 # Build artifacts
 dist/
+build_addon_zip_v2.bat
