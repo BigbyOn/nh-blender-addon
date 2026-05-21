@@ -1,7 +1,7 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Daryl and Enisam",
-    "version": (0, 5, 2, 9),
+    "version": (0, 5, 2, 10),
     "blender": (5, 1, 1),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "All-in-one Blender toolkit for porting and preparing DayZ/Arma assets: fixes, textures, colliders, proxies, snap points, and P3D workflow helpers.",    
@@ -1168,6 +1168,12 @@ _COLLIDER_EXP_MODE_ITEMS = (
     ("SPHERE", "Sphere", "Generate a low-poly spherical collider"),
     ("CAPSULE", "Capsule", "Generate a low-poly capsule collider"),
 )
+_COLLIDER_EXP_SCOPE_ITEMS = (
+    ("FROM_SELECTED", "from selected", "Use the current selection exactly as before"),
+    ("PER_SHELLS", "per shells", "Expand selected vertices to their connected mesh shells and create one collider per shell"),
+    ("PER_OBJECT_COMPONENTS", "per obj comp", "Create one collider per connected component inside the selected vertices"),
+    ("PER_OBJECTS", "per objects", "Create one collider for each selected mesh object"),
+)
 _COLLIDER_LOD_NAMES = {
     "6": "Geometry",
     "8": "Geometry PhysX",
@@ -1771,6 +1777,11 @@ class CRAY_PG_ColliderExpSettings(PropertyGroup):
         name="Collider Type",
         items=_COLLIDER_EXP_MODE_ITEMS,
         default="BOX",
+    )
+    collider_scope: EnumProperty(
+        name="Create Mode",
+        items=_COLLIDER_EXP_SCOPE_ITEMS,
+        default="FROM_SELECTED",
     )
     scale_x: FloatProperty(
         name="Scale X",
@@ -7630,6 +7641,261 @@ def _collect_collider_exp_input_data_exp(context, source_obj, *, bounds_only=Fal
     }
 
 
+def _collider_exp_data_from_local_points_exp(source_obj, local_points, *, face_centers=None):
+    if source_obj is None or source_obj.type != "MESH":
+        raise RuntimeError("Source Object must be a mesh")
+    if not local_points:
+        raise RuntimeError("Source Object has no usable geometry")
+
+    matrix_world = source_obj.matrix_world.copy()
+    min_v, max_v = _bounds_from_points_exp(local_points)
+    world_points = [matrix_world @ point for point in local_points]
+    return {
+        "source_obj": source_obj,
+        "matrix_world": matrix_world,
+        "local_points": [point.copy() for point in local_points],
+        "face_centers_local": list(face_centers or []),
+        "min": min_v,
+        "max": max_v,
+        "center": (min_v + max_v) * 0.5,
+        "size": max_v - min_v,
+        "world_floor_z": min((point.z for point in world_points), default=0.0),
+    }
+
+
+def _collider_exp_all_object_data_exp(source_obj):
+    if source_obj is None or source_obj.type != "MESH":
+        raise RuntimeError("Source Object must be a mesh")
+
+    face_centers = []
+    if source_obj.mode == "EDIT":
+        bm = bmesh.from_edit_mesh(source_obj.data)
+        bm.verts.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        local_points = [vert.co.copy() for vert in bm.verts if vert.is_valid]
+        for face in bm.faces:
+            if face.is_valid and face.verts:
+                face_centers.append(sum((vert.co for vert in face.verts), Vector((0.0, 0.0, 0.0))) / len(face.verts))
+    else:
+        local_points = [vert.co.copy() for vert in source_obj.data.vertices]
+        face_centers = _object_local_face_centers_exp(source_obj)
+        if not local_points:
+            local_points = [Vector(corner) for corner in source_obj.bound_box]
+
+    return _collider_exp_data_from_local_points_exp(source_obj, local_points, face_centers=face_centers)
+
+
+def _collider_exp_selected_source_objects_exp(context, settings):
+    target_obj = getattr(settings, "geometry_object", None) if settings is not None else None
+    active = getattr(getattr(context, "view_layer", None), "objects", None)
+    active_obj = getattr(active, "active", None) if active is not None else None
+
+    def _is_valid_source(obj):
+        return (
+            _is_live_blender_object_exp(obj)
+            and getattr(obj, "type", None) == "MESH"
+            and obj != target_obj
+            and not _is_collider_exp_guide_object_exp(obj)
+        )
+
+    selected = [
+        obj for obj in getattr(context, "selected_objects", [])
+        if _is_valid_source(obj)
+    ]
+    ordered = []
+    if active_obj in selected:
+        ordered.append(active_obj)
+    ordered.extend(obj for obj in selected if obj not in ordered)
+
+    preferred = getattr(settings, "source_object", None) if settings is not None else None
+    if _is_valid_source(preferred) and preferred not in ordered:
+        ordered.append(preferred)
+
+    if not ordered:
+        resolved = _resolve_collider_exp_guide_creation_source_exp(context, settings)
+        if _is_valid_source(resolved):
+            ordered.append(resolved)
+    return ordered
+
+
+def _collider_exp_selected_vertex_indices_exp(source_obj):
+    if source_obj is None or source_obj.type != "MESH" or source_obj.mode != "EDIT":
+        return set()
+
+    bm = bmesh.from_edit_mesh(source_obj.data)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    bm.verts.index_update()
+
+    selected = {vert.index for vert in bm.verts if vert.is_valid and vert.select}
+    for edge in bm.edges:
+        if edge.is_valid and edge.select:
+            selected.update(vert.index for vert in edge.verts if vert.is_valid)
+    for face in bm.faces:
+        if face.is_valid and face.select:
+            selected.update(vert.index for vert in face.verts if vert.is_valid)
+    return selected
+
+
+def _collider_exp_mesh_graph_exp(source_obj, allowed_indices=None):
+    allowed = set(allowed_indices) if allowed_indices is not None else None
+    coords = {}
+    adjacency = {}
+
+    def _allow(index):
+        return allowed is None or index in allowed
+
+    def _add_vertex(index, co):
+        if not _allow(index):
+            return
+        coords[index] = co.copy()
+        adjacency.setdefault(index, set())
+
+    def _add_edge(a, b):
+        if a == b or not _allow(a) or not _allow(b):
+            return
+        if a not in adjacency or b not in adjacency:
+            return
+        adjacency[a].add(b)
+        adjacency[b].add(a)
+
+    if source_obj.mode == "EDIT":
+        bm = bmesh.from_edit_mesh(source_obj.data)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        bm.verts.index_update()
+        for vert in bm.verts:
+            if vert.is_valid:
+                _add_vertex(vert.index, vert.co)
+        for edge in bm.edges:
+            if edge.is_valid and all(vert.is_valid for vert in edge.verts):
+                _add_edge(edge.verts[0].index, edge.verts[1].index)
+        for face in bm.faces:
+            verts = [vert for vert in face.verts if vert.is_valid]
+            for idx, vert in enumerate(verts):
+                _add_edge(vert.index, verts[(idx + 1) % len(verts)].index)
+    else:
+        mesh = source_obj.data
+        for vert in mesh.vertices:
+            _add_vertex(int(vert.index), vert.co)
+        for edge in mesh.edges:
+            a, b = edge.vertices
+            _add_edge(int(a), int(b))
+        for poly in mesh.polygons:
+            verts = [int(idx) for idx in poly.vertices]
+            for idx, vert_idx in enumerate(verts):
+                _add_edge(vert_idx, verts[(idx + 1) % len(verts)])
+
+    return coords, adjacency
+
+
+def _collider_exp_connected_components_exp(source_obj, seed_indices=None, *, selected_only=False):
+    seeds = set(seed_indices or [])
+    allowed = seeds if selected_only and seeds else None
+    coords, adjacency = _collider_exp_mesh_graph_exp(source_obj, allowed_indices=allowed)
+    if not coords:
+        return []
+
+    seed_filter = seeds if seeds else set(coords.keys())
+    visited = set()
+    components = []
+    for start in sorted(coords.keys()):
+        if start in visited:
+            continue
+        stack = [start]
+        visited.add(start)
+        component = set()
+        while stack:
+            current = stack.pop()
+            component.add(current)
+            for nxt in adjacency.get(current, ()):
+                if nxt in visited:
+                    continue
+                visited.add(nxt)
+                stack.append(nxt)
+        if component.intersection(seed_filter):
+            components.append([coords[idx].copy() for idx in sorted(component)])
+    return components
+
+
+def _collect_collider_exp_scope_input_data_exp(context, settings, *, bounds_only=False):
+    mode = str(getattr(settings, "collider_scope", "FROM_SELECTED") or "FROM_SELECTED")
+    if mode == "FROM_SELECTED":
+        source_obj = _resolve_collider_exp_guide_creation_source_exp(context, settings)
+        if source_obj is None:
+            raise RuntimeError("Source Object must be a mesh")
+        return [_collect_collider_exp_input_data_exp(context, source_obj, bounds_only=bounds_only)]
+
+    sources = _collider_exp_selected_source_objects_exp(context, settings)
+    if not sources:
+        raise RuntimeError("Select at least one mesh source object")
+
+    data_items = []
+    if mode == "PER_OBJECTS":
+        for source_obj in sources:
+            data_items.append(_collider_exp_all_object_data_exp(source_obj))
+    elif mode == "PER_SHELLS":
+        for source_obj in sources:
+            selected = _collider_exp_selected_vertex_indices_exp(source_obj)
+            components = _collider_exp_connected_components_exp(source_obj, selected if selected else None)
+            for local_points in components:
+                data_items.append(_collider_exp_data_from_local_points_exp(source_obj, local_points))
+    elif mode == "PER_OBJECT_COMPONENTS":
+        for source_obj in sources:
+            selected = _collider_exp_selected_vertex_indices_exp(source_obj)
+            components = _collider_exp_connected_components_exp(
+                source_obj,
+                selected if selected else None,
+                selected_only=bool(selected),
+            )
+            for local_points in components:
+                data_items.append(_collider_exp_data_from_local_points_exp(source_obj, local_points))
+    else:
+        source_obj = _resolve_collider_exp_guide_creation_source_exp(context, settings)
+        if source_obj is None:
+            raise RuntimeError("Source Object must be a mesh")
+        data_items.append(_collect_collider_exp_input_data_exp(context, source_obj, bounds_only=bounds_only))
+
+    if not data_items:
+        raise RuntimeError("No usable geometry found for the selected create mode")
+    return data_items
+
+
+def _prepare_collider_exp_scope_build_exp(context, settings, op, *, bounds_only=False):
+    data_items = _collect_collider_exp_scope_input_data_exp(context, settings, bounds_only=bounds_only)
+    source_obj = data_items[0]["source_obj"]
+    target_obj = _ensure_collider_exp_target_object_exp(context, settings, source_obj, op=op)
+    for data in data_items:
+        if target_obj == data.get("source_obj"):
+            raise RuntimeError("Target Geometry LOD must be separate from the Source Object")
+    return target_obj, source_obj, data_items
+
+
+def _collider_exp_empty_stats_exp():
+    return {
+        "verts_added": 0,
+        "faces_added": 0,
+        "vertex_indices": [],
+        "face_indices": [],
+        "triangles": 0,
+        "actual_detail": 0,
+        "max_triangles": 0,
+    }
+
+
+def _merge_collider_exp_stats_exp(total, stats):
+    total["verts_added"] += int(stats.get("verts_added", 0))
+    total["faces_added"] += int(stats.get("faces_added", 0))
+    total["vertex_indices"].extend(stats.get("vertex_indices", []) or [])
+    total["face_indices"].extend(stats.get("face_indices", []) or [])
+    total["triangles"] += int(stats.get("triangles", 0))
+    total["actual_detail"] = max(int(total.get("actual_detail", 0)), int(stats.get("actual_detail", 0)))
+    total["max_triangles"] = max(int(total.get("max_triangles", 0)), int(stats.get("max_triangles", 0)))
+    return total
+
+
 def _expanded_local_points_for_minimum_exp(local_points, minimum_size):
     minimum_size = max(float(minimum_size), 0.0)
     if minimum_size <= 0.0:
@@ -9214,23 +9480,24 @@ class CRAY_OT_GenerateBoxColliderExp(Operator):
         settings = _require_collider_exp_enabled_exp(self, context)
         if settings is None:
             return {"CANCELLED"}
-        source_obj = _resolve_collider_exp_guide_creation_source_exp(context, settings)
-        if source_obj is None:
-            self.report({"ERROR"}, "Source Object must be a mesh")
-            return {"CANCELLED"}
         try:
-            target_obj = _ensure_collider_exp_target_object_exp(context, settings, source_obj, op=self)
-            if target_obj == source_obj:
-                raise RuntimeError("Target Geometry LOD must be separate from the Source Object")
-            data = _collect_collider_exp_input_data_exp(context, source_obj, bounds_only=False)
-            vertices = _box_vertices_from_bounds_data_exp(data, self)
-            stats = _append_collider_exp_mesh_to_object_exp(
-                target_obj,
-                vertices,
-                _COLLIDER_EXP_BOX_FACES,
-                merge_distance=self.merge_distance,
-                recalc_normals=bool(self.recalc_normals),
+            target_obj, source_obj, data_items = _prepare_collider_exp_scope_build_exp(
+                context,
+                settings,
+                self,
+                bounds_only=False,
             )
+            stats = _collider_exp_empty_stats_exp()
+            for data in data_items:
+                vertices = _box_vertices_from_bounds_data_exp(data, self)
+                part_stats = _append_collider_exp_mesh_to_object_exp(
+                    target_obj,
+                    vertices,
+                    _COLLIDER_EXP_BOX_FACES,
+                    merge_distance=self.merge_distance,
+                    recalc_normals=bool(self.recalc_normals),
+                )
+                _merge_collider_exp_stats_exp(stats, part_stats)
         except Exception as e:
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
@@ -9244,9 +9511,14 @@ class CRAY_OT_GenerateBoxColliderExp(Operator):
             target_obj,
             "BOX",
             source_obj,
-            {"vertex_indices": stats.get("vertex_indices", []), "face_indices": stats.get("face_indices", [])},
+            {
+                "vertex_indices": stats.get("vertex_indices", []),
+                "face_indices": stats.get("face_indices", []),
+                "scope": str(getattr(settings, "collider_scope", "FROM_SELECTED")),
+                "parts": len(data_items),
+            },
         )
-        self.report({"INFO"}, f"Generated box collider in {target_obj.name}: +{stats['verts_added']} verts, +{stats['faces_added']} faces")
+        self.report({"INFO"}, f"Generated {len(data_items)} box collider part(s) in {target_obj.name}: +{stats['verts_added']} verts, +{stats['faces_added']} faces")
         return {"FINISHED"}
 
 
@@ -9303,17 +9575,18 @@ class CRAY_OT_GenerateConvexHullColliderExp(Operator):
         settings = _require_collider_exp_enabled_exp(self, context)
         if settings is None:
             return {"CANCELLED"}
-        source_obj = _resolve_collider_exp_source_object_exp(context, getattr(settings, "source_object", None))
-        if source_obj is None:
-            self.report({"ERROR"}, "Source Object must be a mesh")
-            return {"CANCELLED"}
         try:
-            target_obj = _ensure_collider_exp_target_object_exp(context, settings, source_obj, op=self)
-            if target_obj == source_obj:
-                raise RuntimeError("Target Geometry LOD must be separate from the Source Object")
-            data = _collect_collider_exp_input_data_exp(context, source_obj, bounds_only=False)
-            world_points = _transform_collider_exp_local_points_exp(data, self)
-            stats = _append_collider_exp_hull_to_object_exp(target_obj, world_points, self)
+            target_obj, source_obj, data_items = _prepare_collider_exp_scope_build_exp(
+                context,
+                settings,
+                self,
+                bounds_only=False,
+            )
+            stats = _collider_exp_empty_stats_exp()
+            for data in data_items:
+                world_points = _transform_collider_exp_local_points_exp(data, self)
+                part_stats = _append_collider_exp_hull_to_object_exp(target_obj, world_points, self)
+                _merge_collider_exp_stats_exp(stats, part_stats)
         except Exception as e:
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
@@ -9333,14 +9606,22 @@ class CRAY_OT_GenerateConvexHullColliderExp(Operator):
             "CONVEX_HULL",
             source_obj,
             {
-                "matrix_world": _matrix_to_list_exp(data["matrix_world"]),
-                "local_points": _points_to_list_exp(data["local_points"]),
                 "vertex_indices": stats.get("vertex_indices", []),
                 "face_indices": stats.get("face_indices", []),
+                "scope": str(getattr(settings, "collider_scope", "FROM_SELECTED")),
+                "parts": len(data_items),
                 "convex_detail": int(self.convex_detail),
                 "convex_max_triangles": int(self.convex_max_triangles),
                 "actual_detail": int(stats.get("actual_detail", self.convex_detail)),
                 "triangles": int(stats.get("triangles", 0)),
+                **(
+                    {
+                        "matrix_world": _matrix_to_list_exp(data_items[0]["matrix_world"]),
+                        "local_points": _points_to_list_exp(data_items[0]["local_points"]),
+                    }
+                    if len(data_items) == 1
+                    else {}
+                ),
             },
         )
         report_level = {"WARNING"} if (
@@ -9351,7 +9632,7 @@ class CRAY_OT_GenerateConvexHullColliderExp(Operator):
             report_level,
             (
                 f"Generated convex hull in {target_obj.name}: "
-                f"+{stats['verts_added']} verts, +{stats['faces_added']} faces, {stats.get('triangles', 0)} tris"
+                f"{len(data_items)} part(s), +{stats['verts_added']} verts, +{stats['faces_added']} faces, {stats.get('triangles', 0)} tris"
             ),
         )
         return {"FINISHED"}
@@ -9882,23 +10163,24 @@ class CRAY_OT_GenerateSphereColliderExp(Operator):
         settings = _require_collider_exp_enabled_exp(self, context)
         if settings is None:
             return {"CANCELLED"}
-        source_obj = _resolve_collider_exp_source_object_exp(context, getattr(settings, "source_object", None))
-        if source_obj is None:
-            self.report({"ERROR"}, "Source Object must be a mesh")
-            return {"CANCELLED"}
         try:
-            target_obj = _ensure_collider_exp_target_object_exp(context, settings, source_obj, op=self)
-            if target_obj == source_obj:
-                raise RuntimeError("Target Geometry LOD must be separate from the Source Object")
-            data = _collect_collider_exp_input_data_exp(context, source_obj, bounds_only=True)
-            vertices, faces = _sphere_mesh_from_data_exp(data, self)
-            stats = _append_collider_exp_mesh_to_object_exp(
-                target_obj,
-                vertices,
-                faces,
-                merge_distance=self.merge_distance,
-                recalc_normals=bool(self.recalc_normals),
+            target_obj, source_obj, data_items = _prepare_collider_exp_scope_build_exp(
+                context,
+                settings,
+                self,
+                bounds_only=True,
             )
+            stats = _collider_exp_empty_stats_exp()
+            for data in data_items:
+                vertices, faces = _sphere_mesh_from_data_exp(data, self)
+                part_stats = _append_collider_exp_mesh_to_object_exp(
+                    target_obj,
+                    vertices,
+                    faces,
+                    merge_distance=self.merge_distance,
+                    recalc_normals=bool(self.recalc_normals),
+                )
+                _merge_collider_exp_stats_exp(stats, part_stats)
         except Exception as e:
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
@@ -9913,9 +10195,14 @@ class CRAY_OT_GenerateSphereColliderExp(Operator):
             target_obj,
             "SPHERE",
             source_obj,
-            {"vertex_indices": stats.get("vertex_indices", []), "face_indices": stats.get("face_indices", [])},
+            {
+                "vertex_indices": stats.get("vertex_indices", []),
+                "face_indices": stats.get("face_indices", []),
+                "scope": str(getattr(settings, "collider_scope", "FROM_SELECTED")),
+                "parts": len(data_items),
+            },
         )
-        self.report({"INFO"}, f"Generated sphere collider in {target_obj.name}: +{stats['verts_added']} verts, +{stats['faces_added']} faces")
+        self.report({"INFO"}, f"Generated {len(data_items)} sphere collider part(s) in {target_obj.name}: +{stats['verts_added']} verts, +{stats['faces_added']} faces")
         return {"FINISHED"}
 
 
@@ -9972,23 +10259,24 @@ class CRAY_OT_GenerateCapsuleColliderExp(Operator):
         settings = _require_collider_exp_enabled_exp(self, context)
         if settings is None:
             return {"CANCELLED"}
-        source_obj = _resolve_collider_exp_source_object_exp(context, getattr(settings, "source_object", None))
-        if source_obj is None:
-            self.report({"ERROR"}, "Source Object must be a mesh")
-            return {"CANCELLED"}
         try:
-            target_obj = _ensure_collider_exp_target_object_exp(context, settings, source_obj, op=self)
-            if target_obj == source_obj:
-                raise RuntimeError("Target Geometry LOD must be separate from the Source Object")
-            data = _collect_collider_exp_input_data_exp(context, source_obj, bounds_only=True)
-            vertices, faces = _capsule_mesh_from_data_exp(data, self)
-            stats = _append_collider_exp_mesh_to_object_exp(
-                target_obj,
-                vertices,
-                faces,
-                merge_distance=self.merge_distance,
-                recalc_normals=bool(self.recalc_normals),
+            target_obj, source_obj, data_items = _prepare_collider_exp_scope_build_exp(
+                context,
+                settings,
+                self,
+                bounds_only=True,
             )
+            stats = _collider_exp_empty_stats_exp()
+            for data in data_items:
+                vertices, faces = _capsule_mesh_from_data_exp(data, self)
+                part_stats = _append_collider_exp_mesh_to_object_exp(
+                    target_obj,
+                    vertices,
+                    faces,
+                    merge_distance=self.merge_distance,
+                    recalc_normals=bool(self.recalc_normals),
+                )
+                _merge_collider_exp_stats_exp(stats, part_stats)
         except Exception as e:
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
@@ -10008,9 +10296,14 @@ class CRAY_OT_GenerateCapsuleColliderExp(Operator):
             target_obj,
             "CAPSULE",
             source_obj,
-            {"vertex_indices": stats.get("vertex_indices", []), "face_indices": stats.get("face_indices", [])},
+            {
+                "vertex_indices": stats.get("vertex_indices", []),
+                "face_indices": stats.get("face_indices", []),
+                "scope": str(getattr(settings, "collider_scope", "FROM_SELECTED")),
+                "parts": len(data_items),
+            },
         )
-        self.report({"INFO"}, f"Generated capsule collider in {target_obj.name}: +{stats['verts_added']} verts, +{stats['faces_added']} faces")
+        self.report({"INFO"}, f"Generated {len(data_items)} capsule collider part(s) in {target_obj.name}: +{stats['verts_added']} verts, +{stats['faces_added']} faces")
         return {"FINISHED"}
 
 
@@ -18946,6 +19239,12 @@ class CRAY_PT_ColliderExpPanel(Panel):
 
         create = layout.box()
         create.operator_context = "INVOKE_DEFAULT"
+        row = create.row(align=True)
+        row.prop_enum(es, "collider_scope", "FROM_SELECTED", text="from selected")
+        row.prop_enum(es, "collider_scope", "PER_SHELLS", text="per shells")
+        row = create.row(align=True)
+        row.prop_enum(es, "collider_scope", "PER_OBJECT_COMPONENTS", text="per obj comp")
+        row.prop_enum(es, "collider_scope", "PER_OBJECTS", text="per objects")
         create.label(text="Create Collider", icon="MOD_REMESH")
 
         op = create.operator("cray.generate_box_collider_exp", text="Box", icon="MESH_CUBE")

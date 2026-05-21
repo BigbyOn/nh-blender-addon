@@ -2,6 +2,31 @@
 
 Все заметные изменения проекта фиксируются в этом файле.
 
+## [0.5.2.10] - 2026-05-21
+
+### Добавлено
+- В `Geometry Collider (exp)` добавлен переключатель режима создания collider-геометрии над блоком `Create Collider`.
+- Добавлены 4 режима ввода, расположенные в UI как 2 ряда по 2 кнопки:
+  - `from selected` — прежнее поведение по текущему выделению;
+  - `per shells` — выбранные вершины расширяются до connected mesh shells, затем создаётся отдельный collider на каждый shell;
+  - `per obj comp` — выделенные группы вершин внутри объекта разбиваются на connected components, затем создаётся отдельный collider на каждую группу;
+  - `per objects` — создаётся отдельный collider на каждый выбранный mesh object.
+
+### Изменено
+- `Box`, `Convex Hull`, `Sphere` и `Capsule` теперь используют общий scope pipeline и могут создавать сразу несколько collider parts за один запуск.
+- В режимах `per shells`, `per obj comp` и `per objects` результат всё равно добавляется в выбранный target `Geometry`, сохраняя прежнюю LOD/collection бизнес-логику.
+- В custom properties сгенерированной collider-геометрии теперь сохраняются `scope` и количество созданных `parts`.
+
+### Проверено
+- Blender smoke-test для новых режимов:
+  - `per objects` на двух mesh objects создаёт 2 box-collider parts;
+  - `per shells` на одном mesh с двумя disconnected shells создаёт 2 box-collider parts;
+  - `per obj comp` на двух выделенных vertex groups создаёт 2 box-collider parts.
+- `python -m py_compile` проходит для:
+  - `NH_Blender.py`;
+  - `NH_Blender/__init__.py`;
+  - `NH_Blender/tools/xray_tex_converter/dds_python.py`.
+
 ## [0.5.2.9] - 2026-05-21
 
 ### Добавлено
