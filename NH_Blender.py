@@ -1,7 +1,7 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Daryl and Enisam",
-    "version": (0, 5, 2, 10),
+    "version": (0, 5, 2, 22),
     "blender": (5, 1, 1),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "All-in-one Blender toolkit for porting and preparing DayZ/Arma assets: fixes, textures, colliders, proxies, snap points, and P3D workflow helpers.",    
@@ -14,7 +14,7 @@ bl_info = {
 import bpy
 import bmesh
 from bpy.app.handlers import persistent
-from bpy.types import Operator, Panel, PropertyGroup, UIList, OperatorFileListElement
+from bpy.types import Operator, Panel, PropertyGroup, UIList, OperatorFileListElement, Menu
 from bpy.props import PointerProperty, StringProperty, FloatProperty, IntProperty, BoolProperty, EnumProperty, CollectionProperty
 from mathutils import Vector, Matrix
 import math
@@ -46,6 +46,17 @@ _PLAIN_AXIS_HELPER_PROP = "cray_plain_axis_helper"
 _PLAIN_AXIS_ROOT_PROP = "cray_plain_axis_root"
 _PLAIN_AXIS_SOURCE_OBJECT_PROP = "cray_plain_axis_source_object"
 _PLAIN_AXIS_CONSTRAINT_NAME = "NH Plain Axis"
+_PLAIN_AXIS_CONSTRAINT_AXES = (
+    "use_location_x",
+    "use_location_y",
+    "use_location_z",
+    "use_rotation_x",
+    "use_rotation_y",
+    "use_rotation_z",
+    "use_scale_x",
+    "use_scale_y",
+    "use_scale_z",
+)
 _PLAIN_AXIS_HOTKEY_REGISTERED = False
 _MESH_KEYMAP_NAME = "Mesh"
 _LINKED_PICK_CONFLICT_KEYMAPS = {
@@ -148,6 +159,7 @@ _PERSISTED_UI_SETTINGS = {
         "capsule_radius",
         "capsule_height",
         "capsule_cap_size",
+        "capsule_follow_source_angle",
         "capsule_vertical_align",
         "recalc_normals",
         "merge_distance",
@@ -171,6 +183,7 @@ _PERSISTED_UI_SETTINGS = {
         "output_diffuse_suffix",
         "fix_mesh_join_batch",
         "fix_mesh_center_to_origin",
+        "material_safe_merge_distance",
         "show_component_fix_tools",
         "fix_list_path",
         "export_warn_loose_vertices",
@@ -1102,6 +1115,10 @@ _MODEL_SPLIT_TARGET_CATEGORY_ITEMS = (
     ("ROADWAY", "Roadway", "A3OB Roadway LOD stored in Misc"),
 )
 
+class CRAY_PG_ModelSplitMergeSourceItem(PropertyGroup):
+    name: StringProperty(name="Name", default="")
+    collection: PointerProperty(name="Collection", type=bpy.types.Collection)
+
 class CRAY_PG_ModelSplitSettings(PropertyGroup):
     part_number: IntProperty(
         name="Part Number",
@@ -1153,6 +1170,13 @@ class CRAY_PG_ModelSplitSettings(PropertyGroup):
         subtype="DIR_PATH",
         description="Folder used when Export Target is set to Custom folder",
     )
+    merge_source_collection: PointerProperty(
+        name="Merge Source",
+        description="Source .p3d root collection to add to the merge list",
+        type=bpy.types.Collection,
+    )
+    merge_sources: CollectionProperty(type=CRAY_PG_ModelSplitMergeSourceItem)
+    merge_sources_index: IntProperty(default=0)
 
 
 _COLLIDER_TARGET_LOD_ITEMS = (
@@ -1831,6 +1855,7 @@ class CRAY_PG_ColliderExpSettings(PropertyGroup):
     )
     minimum_size: FloatProperty(
         name="Minimum Size",
+        description="Smallest generated collider axis/thickness for boxes, rounded box segments, spheres, and capsules",
         default=0.05,
         min=0.0,
         precision=4,
@@ -1916,6 +1941,11 @@ class CRAY_PG_ColliderExpSettings(PropertyGroup):
         min=0.001,
         precision=4,
         unit="LENGTH",
+    )
+    capsule_follow_source_angle: BoolProperty(
+        name="Capsule Follow Source Angle",
+        description="Align capsule top and bottom along the selected shell/object direction instead of world/local Z",
+        default=False,
     )
     capsule_vertical_align: BoolProperty(
         name="Capsule Vertical Align",
@@ -2170,6 +2200,8 @@ _A3OB_EXPORT_CANDIDATES = (
 
 _A3OB_IMPORT_READ_FILE_PATCHES = []
 _A3OB_IMPORT_TRACKING_SUPPRESS_DEPTH = 0
+_A3OB_P3D_FILE_HANDLER_PATCHES = []
+_P3D_DROP_PENDING_PATHS = []
 
 def _op_handle(op_idname: str):
     try:
@@ -2188,6 +2220,75 @@ def _has_any_a3ob_io_ops():
     has_import = _has_any_a3ob_import_ops()
     has_export = any(_op_handle(op) is not None for op, _ in _A3OB_EXPORT_CANDIDATES)
     return has_import and has_export
+
+
+def _iter_file_handler_subclasses(base_cls):
+    seen = set()
+    stack = list(base_cls.__subclasses__())
+    while stack:
+        cls = stack.pop()
+        if cls in seen:
+            continue
+        seen.add(cls)
+        yield cls
+        try:
+            stack.extend(cls.__subclasses__())
+        except Exception:
+            pass
+
+
+def _iter_a3ob_p3d_file_handlers():
+    file_handler_type = getattr(bpy.types, "FileHandler", None)
+    if file_handler_type is None:
+        return
+
+    for cls in _iter_file_handler_subclasses(file_handler_type):
+        try:
+            extensions = str(getattr(cls, "bl_file_extensions", "") or "").lower()
+            import_operator = str(getattr(cls, "bl_import_operator", "") or "")
+        except Exception:
+            continue
+        if ".p3d" not in extensions:
+            continue
+        if import_operator.startswith("a3ob.") or cls.__name__ == "A3OB_FH_import_p3d":
+            yield cls
+
+
+def _nh_p3d_file_handler_poll_drop(cls, context):
+    del cls
+    return bool(getattr(context, "area", None))
+
+
+def _patch_a3ob_p3d_file_handler():
+    patched = False
+    for cls in _iter_a3ob_p3d_file_handlers():
+        if any(patched_cls is cls for patched_cls, _, _ in _A3OB_P3D_FILE_HANDLER_PATCHES):
+            patched = True
+            continue
+        try:
+            original_import_operator = getattr(cls, "bl_import_operator", "")
+            original_poll_drop = cls.__dict__.get("poll_drop", None)
+            cls.bl_import_operator = "cray.p3d_drop_menu"
+            cls.poll_drop = classmethod(_nh_p3d_file_handler_poll_drop)
+            _A3OB_P3D_FILE_HANDLER_PATCHES.append((cls, original_import_operator, original_poll_drop))
+            patched = True
+        except Exception as e:
+            print(f"[NH Plugin] Failed to patch A3OB P3D file drop handler: {_fmt_exc(e)}")
+    return patched
+
+
+def _unpatch_a3ob_p3d_file_handler():
+    while _A3OB_P3D_FILE_HANDLER_PATCHES:
+        cls, original_import_operator, original_poll_drop = _A3OB_P3D_FILE_HANDLER_PATCHES.pop()
+        try:
+            cls.bl_import_operator = original_import_operator
+        except Exception:
+            pass
+        try:
+            if original_poll_drop is not None:
+                cls.poll_drop = original_poll_drop
+        except Exception:
+            pass
 
 def _call_first_available(op_candidates, **kwargs):
     last_err = None
@@ -3634,6 +3735,8 @@ class _MemoryLodManager:
             _move_object_to_collection(memory_obj, memory_collection)
 
         self.apply_a3ob_props(memory_obj)
+        if self.parent_collection is not None:
+            _ensure_plain_axis_constraint_for_new_object(self.context, memory_obj, self.parent_collection)
         return memory_obj
 
 def _snap_axis_index_or_none(axis_token: str):
@@ -3989,6 +4092,148 @@ def _iter_p3d_root_collections(scene):
         if _is_p3d_root_collection_name(col.name):
             roots.append(col)
     return roots
+
+
+def _is_visuals_collection_name(name: str) -> bool:
+    return _strip_blender_numeric_suffix(name).strip().lower() == _VISUALS_COLLECTION_NAME.lower()
+
+
+def _is_resolution0_visual_lod_object(obj) -> bool:
+    if obj is None:
+        return False
+
+    if _is_a3ob_resolution_lod_object(obj):
+        try:
+            props = obj.a3ob_properties_object
+            resolution = float(getattr(props, "resolution", getattr(props, "resolution_float", 0.0)) or 0.0)
+            return abs(resolution) <= 1e-6
+        except Exception:
+            return False
+
+    name = _strip_blender_numeric_suffix(getattr(obj, "name", "") or "").strip().lower()
+    return name == "resolution 0" or name.startswith("resolution 0 ")
+
+
+def _layer_collection_map(context):
+    layer_root = getattr(getattr(context, "view_layer", None), "layer_collection", None)
+    if layer_root is None:
+        return {}
+    return {lc.collection.as_pointer(): lc for lc in _iter_layer_collections(layer_root)}
+
+
+def _set_collection_view_visible(layer_map, collection, visible: bool):
+    lc = layer_map.get(collection.as_pointer()) if layer_map else None
+    if lc is not None:
+        try:
+            lc.exclude = False
+        except Exception:
+            pass
+
+    try:
+        collection.hide_viewport = not visible
+    except Exception:
+        pass
+
+
+def _set_object_view_visible(obj, visible: bool):
+    try:
+        obj.hide_set(not visible)
+    except Exception:
+        pass
+    try:
+        obj.hide_viewport = not visible
+    except Exception:
+        pass
+
+
+def _iter_object_tree(root_obj):
+    stack = [root_obj]
+    while stack:
+        obj = stack.pop()
+        if obj is None:
+            continue
+        yield obj
+        stack.extend(reversed(list(getattr(obj, "children", ()))))
+
+
+def _set_p3d_visual_collection_visibility(context, *, visuals_only: bool):
+    roots = list(_iter_p3d_root_collections(context.scene))
+    if not roots:
+        return 0, 0
+
+    layer_map = _layer_collection_map(context)
+    changed = 0
+
+    for root_col in roots:
+        if visuals_only:
+            visual_ptrs = set()
+            visual_obj_ptrs = set()
+            for child in root_col.children:
+                if not _is_visuals_collection_name(child.name):
+                    continue
+                for visual_col in _iter_collection_tree(child):
+                    visual_ptrs.add(visual_col.as_pointer())
+                    for obj in visual_col.objects:
+                        if not _is_resolution0_visual_lod_object(obj):
+                            continue
+                        for visible_obj in _iter_object_tree(obj):
+                            visual_obj_ptrs.add(visible_obj.as_pointer())
+
+            if not visual_ptrs:
+                continue
+
+            for col in _iter_collection_tree(root_col):
+                visible = (col is root_col) or (col.as_pointer() in visual_ptrs)
+                _set_collection_view_visible(layer_map, col, visible)
+                changed += 1
+
+            for obj in _collect_collection_objects_recursive(root_col):
+                _set_object_view_visible(obj, obj.as_pointer() in visual_obj_ptrs)
+                changed += 1
+            continue
+
+        for col in _iter_collection_tree(root_col):
+            _set_collection_view_visible(layer_map, col, True)
+            changed += 1
+        for obj in _collect_collection_objects_recursive(root_col):
+            _set_object_view_visible(obj, True)
+            changed += 1
+
+    return len(roots), changed
+
+
+class CRAY_OT_SnapSetP3DVisualsOnly(Operator):
+    bl_idname = "cray.snap_set_p3d_visuals_only"
+    bl_label = "Visual 0 Only"
+    bl_description = "Show only Resolution 0 inside Visuals for each .p3d collection, hiding lower LODs and non-visual branches"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        roots, changed = _set_p3d_visual_collection_visibility(context, visuals_only=True)
+        if roots <= 0:
+            self.report({"ERROR"}, "No .p3d collections found in the scene")
+            return {"CANCELLED"}
+        if changed <= 0:
+            self.report({"WARNING"}, "No Visuals collections found inside .p3d roots")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Visual 0 only: updated {changed} item(s) in {roots} .p3d root(s)")
+        return {"FINISHED"}
+
+
+class CRAY_OT_SnapShowAllP3DCollections(Operator):
+    bl_idname = "cray.snap_show_all_p3d_collections"
+    bl_label = "Show All"
+    bl_description = "Show all branches inside each .p3d collection"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        roots, changed = _set_p3d_visual_collection_visibility(context, visuals_only=False)
+        if roots <= 0:
+            self.report({"ERROR"}, "No .p3d collections found in the scene")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Show all: updated {changed} item(s) in {roots} .p3d root(s)")
+        return {"FINISHED"}
+
 
 class CRAY_OT_EnsureMemoryLOD(Operator):
     bl_idname = "cray.ensure_memory_lod"
@@ -7263,6 +7508,7 @@ _COLLIDER_EXP_COMMON_PROPS = (
 )
 _COLLIDER_EXP_PERSISTENT_OPERATOR_PROPS = {
     "target_lod",
+    "minimum_size",
 }
 _COLLIDER_EXP_BOX_FACES = (
     (0, 3, 2, 1),
@@ -7788,7 +8034,62 @@ def _collider_exp_mesh_graph_exp(source_obj, allowed_indices=None):
             for idx, vert_idx in enumerate(verts):
                 _add_edge(vert_idx, verts[(idx + 1) % len(verts)])
 
+    _collider_exp_connect_duplicate_graph_points_exp(coords, adjacency)
     return coords, adjacency
+
+
+def _collider_exp_graph_weld_tolerance_exp(coords):
+    if not coords:
+        return 0.0
+    try:
+        min_v, max_v = _bounds_from_points_exp(list(coords.values()))
+        diagonal = (max_v - min_v).length
+    except Exception:
+        diagonal = 0.0
+    return max(1e-6, diagonal * 1e-7)
+
+
+def _collider_exp_connect_duplicate_graph_points_exp(coords, adjacency, tolerance=None):
+    if not coords:
+        return
+    tolerance = (
+        _collider_exp_graph_weld_tolerance_exp(coords)
+        if tolerance is None
+        else max(float(tolerance), 0.0)
+    )
+    if tolerance <= 0.0:
+        return
+
+    inv = 1.0 / tolerance
+    tolerance_sq = tolerance * tolerance
+    buckets = {}
+    offsets = (-1, 0, 1)
+
+    def _bucket_key(point):
+        return (
+            math.floor(point.x * inv),
+            math.floor(point.y * inv),
+            math.floor(point.z * inv),
+        )
+
+    for index in sorted(coords.keys()):
+        point = coords.get(index)
+        if point is None or not all(math.isfinite(float(point[axis])) for axis in range(3)):
+            continue
+        key = _bucket_key(point)
+        for dx in offsets:
+            for dy in offsets:
+                for dz in offsets:
+                    neighbor_key = (key[0] + dx, key[1] + dy, key[2] + dz)
+                    for other_index in buckets.get(neighbor_key, ()):
+                        other_point = coords.get(other_index)
+                        if other_point is None:
+                            continue
+                        if (point - other_point).length_squared > tolerance_sq:
+                            continue
+                        adjacency.setdefault(index, set()).add(other_index)
+                        adjacency.setdefault(other_index, set()).add(index)
+        buckets.setdefault(key, []).append(index)
 
 
 def _collider_exp_connected_components_exp(source_obj, seed_indices=None, *, selected_only=False):
@@ -9354,26 +9655,170 @@ def _sphere_mesh_from_data_exp(data, op):
     return world_vertices, faces
 
 
-def _capsule_mesh_from_data_exp(data, op):
-    vertical_align = bool(getattr(op, "capsule_vertical_align", True))
-    if vertical_align:
-        matrix_world = Matrix.Identity(4)
+def _collider_exp_points_world_bounds_exp(points):
+    min_v, max_v = _bounds_from_points_exp(points)
+    center = (min_v + max_v) * 0.5
+    return min_v, max_v, center
+
+
+def _collider_exp_world_points_from_data_exp(data):
+    local_points = data.get("local_points") or []
+    if local_points:
+        return [data["matrix_world"] @ point for point in local_points]
+    min_v = data.get("min")
+    max_v = data.get("max")
+    if min_v is not None and max_v is not None:
+        return [
+            data["matrix_world"] @ Vector((x, y, z))
+            for x in (min_v.x, max_v.x)
+            for y in (min_v.y, max_v.y)
+            for z in (min_v.z, max_v.z)
+        ]
+    return []
+
+
+def _collider_exp_largest_bounds_axis_exp(size):
+    axis_index = max(range(3), key=lambda axis: abs(size[axis]))
+    axis = Vector((0.0, 0.0, 0.0))
+    axis[axis_index] = 1.0
+    return axis
+
+
+def _collider_exp_principal_axis_exp(points):
+    if len(points) < 2:
+        return Vector((0.0, 0.0, 1.0))
+
+    min_v, max_v, center = _collider_exp_points_world_bounds_exp(points)
+    fallback = _collider_exp_largest_bounds_axis_exp(max_v - min_v)
+    centered = [point - center for point in points]
+
+    xx = sum(vec.x * vec.x for vec in centered)
+    xy = sum(vec.x * vec.y for vec in centered)
+    xz = sum(vec.x * vec.z for vec in centered)
+    yy = sum(vec.y * vec.y for vec in centered)
+    yz = sum(vec.y * vec.z for vec in centered)
+    zz = sum(vec.z * vec.z for vec in centered)
+    if max(xx, yy, zz) <= 1e-12:
+        return fallback
+
+    axis = fallback.normalized()
+    for _idx in range(16):
+        next_axis = Vector((
+            xx * axis.x + xy * axis.y + xz * axis.z,
+            xy * axis.x + yy * axis.y + yz * axis.z,
+            xz * axis.x + yz * axis.y + zz * axis.z,
+        ))
+        if next_axis.length <= 1e-12:
+            return fallback
+        axis = next_axis.normalized()
+
+    if axis.z < 0.0:
+        axis.negate()
+    return axis
+
+
+def _collider_exp_basis_from_axis_exp(axis):
+    axis_z = axis.normalized() if axis.length > 1e-12 else Vector((0.0, 0.0, 1.0))
+    reference = Vector((0.0, 0.0, 1.0))
+    if abs(axis_z.dot(reference)) > 0.92:
+        reference = Vector((1.0, 0.0, 0.0))
+    axis_x = reference.cross(axis_z)
+    if axis_x.length <= 1e-12:
+        axis_x = Vector((1.0, 0.0, 0.0))
+    else:
+        axis_x.normalize()
+    axis_y = axis_z.cross(axis_x)
+    if axis_y.length <= 1e-12:
+        axis_y = Vector((0.0, 1.0, 0.0))
+    else:
+        axis_y.normalize()
+    return axis_x, axis_y, axis_z
+
+
+def _collider_exp_oriented_capsule_frame_exp(data):
+    world_points = _collider_exp_world_points_from_data_exp(data)
+    if not world_points:
         center = data["matrix_world"] @ data["center"]
+        return center, Vector((1.0, 0.0, 0.0)), Vector((0.0, 1.0, 0.0)), Vector((0.0, 0.0, 1.0)), data["size"]
+
+    axis = _collider_exp_principal_axis_exp(world_points)
+    axis_x, axis_y, axis_z = _collider_exp_basis_from_axis_exp(axis)
+    projections = []
+    for point in world_points:
+        projections.append((point.dot(axis_x), point.dot(axis_y), point.dot(axis_z)))
+
+    min_x = min(item[0] for item in projections)
+    max_x = max(item[0] for item in projections)
+    min_y = min(item[1] for item in projections)
+    max_y = max(item[1] for item in projections)
+    min_z = min(item[2] for item in projections)
+    max_z = max(item[2] for item in projections)
+    center = (
+        axis_x * ((min_x + max_x) * 0.5)
+        + axis_y * ((min_y + max_y) * 0.5)
+        + axis_z * ((min_z + max_z) * 0.5)
+    )
+    size = Vector((max_x - min_x, max_y - min_y, max_z - min_z))
+    return center, axis_x, axis_y, axis_z, size
+
+
+def _capsule_mesh_from_data_exp(data, op):
+    follow_source_angle = bool(getattr(op, "capsule_follow_source_angle", False))
+    if follow_source_angle:
+        center, axis_x, axis_y, axis_z, size = _collider_exp_oriented_capsule_frame_exp(data)
+        center = center + _collider_exp_vec_from_props_exp(op, "offset")
+        matrix_world = None
+    else:
+        axis_x = axis_y = axis_z = None
+        matrix_world = None
+
+    vertical_align = bool(getattr(op, "capsule_vertical_align", True))
+    if follow_source_angle:
+        pass
+    elif vertical_align:
+        matrix_world = Matrix.Identity(4)
+        local_points = data.get("local_points") or []
+        if local_points:
+            world_points = [data["matrix_world"] @ point for point in local_points]
+            min_v, max_v = _bounds_from_points_exp(world_points)
+            center = (min_v + max_v) * 0.5
+            size = max_v - min_v
+        else:
+            center = data["matrix_world"] @ data["center"]
+            size = data["size"]
     else:
         matrix_world = data["matrix_world"]
         center = data["center"]
+        size = data["size"]
 
-    center = center + _collider_exp_vec_from_props_exp(op, "offset")
+    if not follow_source_angle:
+        center = center + _collider_exp_vec_from_props_exp(op, "offset")
     scale_vec = _collider_exp_scale_vec_exp(op)
     minimum_size = max(float(getattr(op, "minimum_size", 0.0)), 1e-6)
-    radius = max(float(getattr(op, "capsule_radius", 0.5)), 0.001)
-    height = max(float(getattr(op, "capsule_height", 2.0)), 0.001)
-    cap_size = max(float(getattr(op, "capsule_cap_size", 0.5)), 0.001)
+    radius_value = max(float(getattr(op, "capsule_radius", 0.5)), 0.001)
+    height_value = max(float(getattr(op, "capsule_height", 2.0)), 0.001)
+    cap_value = max(float(getattr(op, "capsule_cap_size", 0.5)), 0.001)
 
-    radius_x = max(radius * scale_vec.x, minimum_size * 0.5)
-    radius_y = max(radius * scale_vec.y, minimum_size * 0.5)
-    total_height = max(height * scale_vec.z, minimum_size)
-    cap_z = min(max(cap_size * scale_vec.z, minimum_size * 0.5), total_height * 0.5)
+    radius_auto = abs(radius_value - 0.5) <= 1e-6
+    height_auto = abs(height_value - 2.0) <= 1e-6
+    cap_auto = abs(cap_value - 0.5) <= 1e-6
+
+    if radius_auto:
+        radius_x = max(abs(size.x) * 0.5 * scale_vec.x, minimum_size * 0.5)
+        radius_y = max(abs(size.y) * 0.5 * scale_vec.y, minimum_size * 0.5)
+    else:
+        radius_x = max(radius_value * scale_vec.x, minimum_size * 0.5)
+        radius_y = max(radius_value * scale_vec.y, minimum_size * 0.5)
+
+    if height_auto:
+        total_height = max(abs(size.z) * scale_vec.z, minimum_size)
+    else:
+        total_height = max(height_value * scale_vec.z, minimum_size)
+
+    if cap_auto:
+        cap_z = max(min(max(radius_x, radius_y), total_height * 0.5), minimum_size * 0.5)
+    else:
+        cap_z = min(max(cap_value * scale_vec.z, minimum_size * 0.5), total_height * 0.5)
     body_half = max(0.0, (total_height - cap_z * 2.0) * 0.5)
     segments = 16
     cap_rings = 4
@@ -9389,7 +9834,13 @@ def _capsule_mesh_from_data_exp(data, op):
         rings.append((max(math.cos(phi), 0.0), body_half + math.sin(phi) * cap_z))
 
     local_vertices, faces = _radial_rings_mesh_exp(rings, segments, radius_x, radius_y, center)
-    world_vertices = [matrix_world @ point for point in local_vertices]
+    if follow_source_angle:
+        world_vertices = [
+            center + axis_x * (point.x - center.x) + axis_y * (point.y - center.y) + axis_z * (point.z - center.z)
+            for point in local_vertices
+        ]
+    else:
+        world_vertices = [matrix_world @ point for point in local_vertices]
     world_vertices = _apply_floor_contact_to_vertices_exp(
         world_vertices,
         data["world_floor_z"],
@@ -10228,6 +10679,11 @@ class CRAY_OT_GenerateCapsuleColliderExp(Operator):
     capsule_radius: FloatProperty(name="Capsule Radius", default=0.5, min=0.001)
     capsule_height: FloatProperty(name="Capsule Height", default=2.0, min=0.001)
     capsule_cap_size: FloatProperty(name="Capsule Cap Size", default=0.5, min=0.001)
+    capsule_follow_source_angle: BoolProperty(
+        name="Capsule Follow Source Angle",
+        description="Align capsule top and bottom along the selected shell/object direction",
+        default=False,
+    )
     capsule_vertical_align: BoolProperty(name="Capsule Vertical Align", default=True)
 
     def invoke(self, context, event):
@@ -10236,6 +10692,7 @@ class CRAY_OT_GenerateCapsuleColliderExp(Operator):
             "capsule_radius",
             "capsule_height",
             "capsule_cap_size",
+            "capsule_follow_source_angle",
             "capsule_vertical_align",
         ))
         _copy_collider_exp_settings_to_operator_exp(self, _collider_exp_settings_exp(context), prop_names=props)
@@ -10250,6 +10707,7 @@ class CRAY_OT_GenerateCapsuleColliderExp(Operator):
                 "capsule_radius",
                 "capsule_height",
                 "capsule_cap_size",
+                "capsule_follow_source_angle",
                 "capsule_vertical_align",
             ),
             extra_label="Capsule",
@@ -10285,6 +10743,7 @@ class CRAY_OT_GenerateCapsuleColliderExp(Operator):
             "capsule_radius",
             "capsule_height",
             "capsule_cap_size",
+            "capsule_follow_source_angle",
             "capsule_vertical_align",
         ))
         _write_collider_exp_operator_to_settings_exp(self, settings, prop_names=props)
@@ -10301,6 +10760,7 @@ class CRAY_OT_GenerateCapsuleColliderExp(Operator):
                 "face_indices": stats.get("face_indices", []),
                 "scope": str(getattr(settings, "collider_scope", "FROM_SELECTED")),
                 "parts": len(data_items),
+                "capsule_follow_source_angle": bool(self.capsule_follow_source_angle),
             },
         )
         self.report({"INFO"}, f"Generated {len(data_items)} capsule collider part(s) in {target_obj.name}: +{stats['verts_added']} verts, +{stats['faces_added']} faces")
@@ -12622,7 +13082,7 @@ def _remove_empty_subcollections(collection):
             collection.children.unlink(child)
         except Exception:
             continue
-        if len(child.users) == 0:
+        if int(getattr(child, "users", 0) or 0) == 0:
             try:
                 bpy.data.collections.remove(child)
             except Exception:
@@ -12894,7 +13354,7 @@ def _purge_collection_tree(collection):
         except Exception:
             pass
         else:
-            if len(ch.users) == 0:
+            if int(getattr(ch, "users", 0) or 0) == 0:
                 try:
                     bpy.data.collections.remove(ch)
                 except Exception:
@@ -12939,7 +13399,7 @@ def _cleanup_target_collection_keep_mesh(target_collection, keep_obj):
         except Exception:
             continue
 
-        if len(ch.users) == 0:
+        if int(getattr(ch, "users", 0) or 0) == 0:
             try:
                 bpy.data.collections.remove(ch)
             except Exception:
@@ -13079,14 +13539,14 @@ def _remove_helper_named_objects(scene=None, keep_obj=None, max_passes=8):
                     live_col.children.unlink(ch)
                 except Exception:
                     pass
-                if len(ch.users) == 0:
+                if int(getattr(ch, "users", 0) or 0) == 0:
                     try:
                         bpy.data.collections.remove(ch)
                     except Exception:
                         pass
 
             _unlink_collection_from_scene_parents(scene, live_col)
-            if len(live_col.users) == 0:
+            if int(getattr(live_col, "users", 0) or 0) == 0:
                 try:
                     bpy.data.collections.remove(live_col)
                     deleted_collections += 1
@@ -14126,6 +14586,14 @@ class CRAY_PG_TexReplaceSettings(PropertyGroup):
         name="Center Fixed Mesh To (0,0,0)",
         description="After Fix Mesh, move merged object's bounds center to world origin",
         default=True,
+    )
+    material_safe_merge_distance: FloatProperty(
+        name="Material Safe Merge Distance",
+        description="Merge close vertices only when their linked faces use the same material set",
+        default=0.0001,
+        min=0.0,
+        precision=6,
+        unit="LENGTH",
     )
     export_warn_loose_vertices: BoolProperty(
         name="Warn Loose Vertices On Export",
@@ -15385,6 +15853,158 @@ def _planner_add_import_file(settings, filepath: str) -> bool:
     return True
 
 
+def _is_p3d_filepath(filepath: str) -> bool:
+    return bool(filepath) and os.path.splitext(str(filepath))[1].lower() == ".p3d"
+
+
+def _iter_ie_operator_filepaths(directory: str = "", files=None, filepath: str = ""):
+    dir_abs = bpy.path.abspath(directory) if directory else ""
+    dir_abs = os.path.abspath(dir_abs) if dir_abs else ""
+    yielded = False
+
+    for file_item in files or ():
+        name = getattr(file_item, "name", "") or ""
+        if not name:
+            continue
+        yielded = True
+        yield bpy.path.abspath(os.path.join(dir_abs, name) if dir_abs else name)
+
+    if not yielded and filepath:
+        yield bpy.path.abspath(filepath)
+
+
+def _planner_add_import_files_from_operator(settings, *, directory: str = "", files=None, filepath: str = ""):
+    added = 0
+    skipped_duplicate = 0
+    skipped_non_p3d = 0
+
+    for fp in _iter_ie_operator_filepaths(directory=directory, files=files, filepath=filepath):
+        fp = _norm_path(bpy.path.abspath(fp)) if fp else ""
+        if not fp:
+            continue
+        if not _is_p3d_filepath(fp):
+            skipped_non_p3d += 1
+            continue
+        if _planner_add_import_file(settings, fp):
+            added += 1
+        else:
+            skipped_duplicate += 1
+
+    return added, skipped_duplicate, skipped_non_p3d
+
+
+def _collect_p3d_filepaths_from_operator(*, directory: str = "", files=None, filepath: str = ""):
+    paths = []
+    seen = set()
+    for fp in _iter_ie_operator_filepaths(directory=directory, files=files, filepath=filepath):
+        fp = _norm_path(bpy.path.abspath(fp)) if fp else ""
+        if not fp or not _is_p3d_filepath(fp):
+            continue
+        key = os.path.normcase(fp)
+        if key in seen:
+            continue
+        seen.add(key)
+        paths.append(fp)
+    return paths
+
+
+def _set_pending_p3d_drop_paths(paths):
+    _P3D_DROP_PENDING_PATHS.clear()
+    _P3D_DROP_PENDING_PATHS.extend(paths)
+
+
+def _pending_p3d_drop_label():
+    count = len(_P3D_DROP_PENDING_PATHS)
+    if count <= 0:
+        return "No .p3d files"
+    if count == 1:
+        return os.path.basename(_P3D_DROP_PENDING_PATHS[0])
+    return f"{count} .p3d files"
+
+
+def _import_p3d_paths_now(operator, context, paths):
+    st = context.scene.cray_ie_settings
+    if not paths:
+        operator.report({"ERROR"}, "No .p3d files to import")
+        return {"CANCELLED"}
+    if not _has_any_a3ob_import_ops():
+        operator.report({"ERROR"}, "Arma 3 Object Builder import operators not found")
+        return {"CANCELLED"}
+
+    imported = 0
+    skipped_existing = []
+    failed = []
+    used_op = None
+
+    for fp in paths:
+        fp = _norm_path(bpy.path.abspath(fp)) if fp else ""
+        if not fp or not _is_p3d_filepath(fp):
+            failed.append(f"{fp or '<empty>'} -> not a .p3d file")
+            continue
+
+        existing_root = _find_existing_scene_p3d_root(context.scene, fp)
+        if existing_root is not None:
+            skipped_existing.append(f"{os.path.basename(fp)} -> already imported as {existing_root.name}")
+            continue
+        if not os.path.isfile(fp):
+            failed.append(f"{fp} -> file not found")
+            continue
+
+        pre_obj_ptrs = {o.as_pointer() for o in bpy.data.objects}
+        pre_col_ptrs = {c.as_pointer() for c in bpy.data.collections}
+        with _suppress_a3ob_import_tracking():
+            res, op_id, err = _call_first_available(
+                _A3OB_IMPORT_CANDIDATES,
+                filepath=fp,
+                load_textures=False,
+            )
+        if op_id:
+            used_op = op_id
+        if res is None:
+            failed.append(f"{fp} -> {_fmt_exc(err) if err else 'unknown error'}")
+            continue
+
+        imported += 1
+        imported_objs = [o for o in bpy.data.objects if o.as_pointer() not in pre_obj_ptrs]
+        _tag_import_source_on_imported_data(
+            context=context,
+            filepath=fp,
+            imported_objs=imported_objs,
+            pre_collection_ptrs=pre_col_ptrs,
+        )
+        stats = _postprocess_imported_material_previews(
+            context,
+            imported_objs,
+            show_materials=st.import_show_materials,
+            keep_converted_textures=st.import_keep_converted_textures,
+        )
+        _log_import_preview_summary(fp, stats)
+
+    if st.disable_collections_after_import:
+        _disable_all_collections_in_view_layer(context, st.disable_mode)
+
+    if skipped_existing:
+        print("=== P3D Drop Import: Skipped already imported ===")
+        for item in skipped_existing:
+            print(item)
+
+    if failed:
+        print("=== P3D Drop Import: Failures ===")
+        for item in failed:
+            print(item)
+        operator.report(
+            {"WARNING"},
+            f"Imported {imported}, skipped existing {len(skipped_existing)}, failed {len(failed)} (see System Console)",
+        )
+        return {"FINISHED"}
+
+    operator.report(
+        {"INFO"},
+        f"Imported {imported} file(s), skipped existing {len(skipped_existing)}" + (f" via {used_op}" if used_op else ""),
+    )
+    return {"FINISHED"}
+
+
 def _normalize_p3d_lookup_key(value: str) -> str:
     raw = (value or "").replace("/", "\\").strip()
     if not raw:
@@ -15624,6 +16244,70 @@ def _apply_child_of_inverse_with_fallback(context, obj, constraint):
         constraint.inverse_matrix = target.matrix_world.inverted_safe()
     except Exception:
         pass
+
+
+def _set_plain_axis_constraint_axes(constraint):
+    for attr in _PLAIN_AXIS_CONSTRAINT_AXES:
+        try:
+            setattr(constraint, attr, True)
+        except Exception:
+            pass
+
+
+def _find_plain_axis_helper_in_collection(root_collection):
+    if root_collection is None:
+        return None
+    helpers = [obj for obj in _collect_collection_objects_recursive(root_collection) if _is_plain_axis_helper(obj)]
+    if not helpers:
+        return None
+    helpers.sort(key=lambda obj: getattr(obj, "name", ""))
+    return helpers[-1]
+
+
+def _find_plain_axis_reference_constraint(helper_obj, exclude_obj=None):
+    if helper_obj is None:
+        return None
+    helper_ptr = helper_obj.as_pointer()
+    exclude_ptr = exclude_obj.as_pointer() if exclude_obj is not None else None
+    for obj in bpy.data.objects:
+        if exclude_ptr is not None and obj.as_pointer() == exclude_ptr:
+            continue
+        for con in _iter_plain_axis_constraints(obj, helper_ptrs={helper_ptr}):
+            return con
+    return None
+
+
+def _ensure_plain_axis_constraint_for_new_object(context, obj, root_collection):
+    if obj is None or root_collection is None:
+        return False
+
+    helper_obj = _find_plain_axis_helper_in_collection(root_collection)
+    if helper_obj is None:
+        return False
+
+    helper_ptr = helper_obj.as_pointer()
+    if any(True for _con in _iter_plain_axis_constraints(obj, helper_ptrs={helper_ptr})):
+        return False
+
+    reference_constraint = _find_plain_axis_reference_constraint(helper_obj, exclude_obj=obj)
+    if reference_constraint is None:
+        return False
+
+    try:
+        desired_world = obj.matrix_world.copy()
+        helper_delta = helper_obj.matrix_world @ reference_constraint.inverse_matrix
+        obj.matrix_world = helper_delta.inverted_safe() @ desired_world
+        con = obj.constraints.new(type="CHILD_OF")
+        con.name = _PLAIN_AXIS_CONSTRAINT_NAME
+        con.target = helper_obj
+        _set_plain_axis_constraint_axes(con)
+        con.inverse_matrix = reference_constraint.inverse_matrix.copy()
+        context.view_layer.update()
+        return True
+    except Exception as e:
+        print(f"[NH Plugin] Failed to attach new object to Plain Axis: {getattr(obj, 'name', '<object>')}: {_fmt_exc(e)}")
+        return False
+
 
 def _create_plain_axis_helper(context, root_collection, source_obj, world_location):
     helper_name = _plain_axis_helper_name(root_collection)
@@ -15979,6 +16663,481 @@ def _set_model_split_target_lod_a3ob_props(obj, category_token: str):
         _apply_collider_visual_style(obj)
     elif lod_token == _ROADWAY_LOD_TOKEN:
         _apply_object_visual_style(obj, _ROADWAY_OBJECT_COLOR)
+
+def _model_split_id_key(id_data):
+    if id_data is None:
+        return None
+    try:
+        return id_data.as_pointer()
+    except Exception:
+        return id(id_data)
+
+def _model_split_add_unique_collection(collections, seen, collection):
+    key = _model_split_id_key(collection)
+    if key is None or key in seen:
+        return False
+    seen.add(key)
+    collections.append(collection)
+    return True
+
+def _model_split_selected_p3d_root_collections(context):
+    roots = []
+    seen = set()
+
+    for item in getattr(context, "selected_ids", []) or []:
+        if not isinstance(item, bpy.types.Collection):
+            continue
+        root = _find_p3d_root_collection_for_collection(context, item, require_p3d=True)
+        if root is not None:
+            _model_split_add_unique_collection(roots, seen, root)
+
+    for obj in getattr(context, "selected_objects", []) or []:
+        root = _find_p3d_root_collection_for_object(context, obj)
+        if root is not None:
+            _model_split_add_unique_collection(roots, seen, root)
+
+    return roots
+
+def _model_split_merge_source_roots_from_settings(context, settings):
+    roots = []
+    seen = set()
+    for item in getattr(settings, "merge_sources", []) or []:
+        collection = getattr(item, "collection", None)
+        root = _find_p3d_root_collection_for_collection(context, collection, require_p3d=True)
+        if root is not None:
+            _model_split_add_unique_collection(roots, seen, root)
+    return roots
+
+def _model_split_category_for_collection_name(name: str):
+    logical = _logical_collection_name(_strip_blender_numeric_suffix(name or ""))
+    if logical in _logical_collection_names(_VISUALS_COLLECTION_NAME):
+        return "RESOLUTION"
+    if logical in _logical_collection_names(_COLLIDER_COLLECTION_NAME, _COLLIDER_COLLECTION_ALIASES):
+        return "GEOMETRIES"
+    if logical in _logical_collection_names(_MEMORY_COLLECTION_NAME, _MEMORY_COLLECTION_ALIASES):
+        return "POINT_CLOUDS"
+    if logical in _logical_collection_names(_MISC_COLLECTION_NAME):
+        return "ROADWAY"
+    return None
+
+def _model_split_canonical_collection_name(name: str) -> str:
+    clean = _strip_blender_numeric_suffix((name or "").strip())
+    return clean or (name or "Collection")
+
+def _model_split_is_a3ob_lod_object(obj) -> bool:
+    if obj is None or getattr(obj, "type", None) != "MESH":
+        return False
+    if _is_a3ob_proxy_object(obj):
+        return False
+    if not hasattr(obj, "a3ob_properties_object"):
+        return False
+    try:
+        return bool(getattr(obj.a3ob_properties_object, "is_a3_lod", False))
+    except Exception:
+        return False
+
+def _model_split_is_merge_lod_root(obj) -> bool:
+    return _model_split_is_a3ob_lod_object(obj) and getattr(obj, "parent", None) is None
+
+def _model_split_lod_merge_category(obj) -> str:
+    if _model_split_is_a3ob_lod_object(obj):
+        try:
+            return _model_split_category_for_lod_token(getattr(obj.a3ob_properties_object, "lod", ""))
+        except Exception:
+            return "RESOLUTION"
+    return _model_split_category_for_object(obj)
+
+def _model_split_merge_collection_path(target_root, source_root, obj):
+    path = _best_object_collection_path_under_root(source_root, obj)
+    if not path or len(path) <= 1:
+        return target_root
+
+    current = target_root
+    for idx, source_col in enumerate(list(path)[1:]):
+        if idx == 0:
+            category = _model_split_category_for_collection_name(getattr(source_col, "name", "") or "")
+            if category:
+                current = _ensure_model_split_target_category_collection(target_root, category)
+                if current is None:
+                    return target_root
+                continue
+
+        name = _model_split_canonical_collection_name(getattr(source_col, "name", "") or "")
+        color_tag = None
+        try:
+            color_tag = getattr(source_col, "color_tag", None)
+        except Exception:
+            color_tag = None
+        current = _ensure_named_child_collection(current, name, color_tag=color_tag)
+        if current is None:
+            return target_root
+        _clear_ie_source_path_tag(current)
+
+    return current
+
+def _model_split_merge_destination_collection(target_root, source_root, obj):
+    lod_obj = obj if _model_split_is_a3ob_lod_object(obj) else None
+    if lod_obj is None:
+        parent = getattr(obj, "parent", None)
+        if _model_split_is_a3ob_lod_object(parent):
+            lod_obj = parent
+
+    if lod_obj is not None:
+        return _ensure_model_split_target_category_collection(
+            target_root,
+            _model_split_lod_merge_category(lod_obj),
+        ) or target_root
+
+    return _model_split_merge_collection_path(target_root, source_root, obj)
+
+def _move_object_from_root_to_collection(obj, target_collection, source_root):
+    if obj is None or target_collection is None:
+        return
+    _link_object_to_collection(obj, target_collection)
+    if source_root is not None:
+        _unlink_object_from_collection_tree(obj, source_root, keep_collection=target_collection)
+    if not _collection_directly_contains_object(target_collection, obj):
+        _link_object_to_collection(obj, target_collection)
+    _clear_ie_source_path_tag(obj)
+
+def _model_split_move_root_contents_to_merge_target(target_root, source_root):
+    moved = 0
+    objects = list(_collect_collection_objects_recursive(source_root))
+    for obj in objects:
+        dest = _model_split_merge_destination_collection(target_root, source_root, obj)
+        before_in_target = _object_is_directly_or_indirectly_in_collection(target_root, obj)
+        _move_object_from_root_to_collection(obj, dest, source_root)
+        if not before_in_target or not _same_id_data(source_root, target_root):
+            moved += 1
+    return moved
+
+def _model_split_lod_merge_key(obj):
+    if not _model_split_is_merge_lod_root(obj):
+        return None
+
+    props = obj.a3ob_properties_object
+    p3d_mod = _get_a3ob_data_p3d_module()
+    if p3d_mod is not None:
+        signature = _a3ob_lod_signature_from_props(props, p3d_mod)
+        if signature is not None:
+            return ("SIG", _lod_signature_key(signature))
+
+    try:
+        lod_token = str(getattr(props, "lod", "") or "").strip()
+    except Exception:
+        lod_token = ""
+
+    resolution_key = ""
+    if lod_token == "0":
+        try:
+            resolution_key = _format_resolution_lod_index_value(getattr(props, "resolution", 0))
+        except Exception:
+            resolution_key = "0"
+    elif lod_token == "":
+        try:
+            resolution_key = _format_resolution_lod_index_value(getattr(props, "resolution_float", 0.0))
+        except Exception:
+            resolution_key = "0"
+
+    return ("LOD", lod_token, resolution_key)
+
+def _model_split_lod_merge_size(obj):
+    data = getattr(obj, "data", None)
+    if data is None:
+        return 0
+    try:
+        return len(data.polygons) * 1000000 + len(data.vertices) * 1000 + len(data.edges)
+    except Exception:
+        return 0
+
+def _model_split_mesh_has_any_data(obj) -> bool:
+    data = getattr(obj, "data", None)
+    if data is None:
+        return False
+    try:
+        return len(data.vertices) > 0 or len(data.edges) > 0 or len(data.polygons) > 0
+    except Exception:
+        return False
+
+def _model_split_choose_lod_merge_anchor(objects):
+    live = [obj for obj in objects if obj is not None and getattr(obj, "type", None) == "MESH"]
+    if not live:
+        return None
+    return max(live, key=_model_split_lod_merge_size)
+
+def _model_split_rewire_object_refs(objects, object_map):
+    if not object_map:
+        return 0
+
+    rewired = 0
+    for obj in objects or []:
+        if obj is None:
+            continue
+        for modifier in getattr(obj, "modifiers", []) or []:
+            try:
+                target = getattr(modifier, "object", None)
+            except Exception:
+                target = None
+            if target in object_map:
+                try:
+                    modifier.object = object_map[target]
+                    rewired += 1
+                except Exception:
+                    pass
+
+        for constraint in getattr(obj, "constraints", []) or []:
+            try:
+                target = getattr(constraint, "target", None)
+            except Exception:
+                target = None
+            if target in object_map:
+                try:
+                    constraint.target = object_map[target]
+                    rewired += 1
+                except Exception:
+                    pass
+    return rewired
+
+def _model_split_reparent_children_for_lod_merge(lod_roots, anchor_obj):
+    if anchor_obj is None:
+        return 0
+
+    root_set = {obj for obj in lod_roots if obj is not None}
+    reparented = 0
+    for root in list(root_set):
+        for child in list(getattr(root, "children", []) or []):
+            if child in root_set:
+                continue
+            try:
+                world_matrix = child.matrix_world.copy()
+            except Exception:
+                world_matrix = None
+            try:
+                child.parent = anchor_obj
+                if world_matrix is not None:
+                    child.matrix_world = world_matrix
+                reparented += 1
+            except Exception:
+                pass
+    return reparented
+
+def _model_split_refresh_lod_object_name(obj):
+    if obj is None or getattr(obj, "type", None) != "MESH" or not hasattr(obj, "a3ob_properties_object"):
+        return
+    try:
+        props = obj.a3ob_properties_object
+        props.is_a3_lod = True
+        _remove_a3ob_named_property(props, "autocenter")
+        lod_name = props.get_name() if hasattr(props, "get_name") else ""
+        if lod_name:
+            obj.name = lod_name
+            if obj.data is not None:
+                obj.data.name = lod_name
+    except Exception:
+        pass
+
+def _set_a3ob_proxy_index_safe(proxy_obj, proxy_index: int):
+    if proxy_obj is None or not hasattr(proxy_obj, "a3ob_properties_object_proxy"):
+        return False
+    try:
+        props = proxy_obj.a3ob_properties_object_proxy
+    except Exception:
+        return False
+
+    changed = False
+    if hasattr(props, "index"):
+        try:
+            props.index = int(proxy_index)
+            changed = True
+        except Exception:
+            pass
+
+    try:
+        for prop in props.bl_rna.properties:
+            if prop.identifier == "rna_type":
+                continue
+            if prop.name != "Index":
+                continue
+            try:
+                setattr(props, prop.identifier, int(proxy_index))
+                changed = True
+            except Exception:
+                pass
+            break
+    except Exception:
+        pass
+    return changed
+
+def _renumber_a3ob_proxy_children(parent_obj):
+    if parent_obj is None:
+        return 0
+    proxies = [
+        child for child in getattr(parent_obj, "children", []) or []
+        if _is_a3ob_proxy_object(child)
+    ]
+    proxies.sort(key=lambda obj: (getattr(obj, "name", "") or "").lower())
+    changed = 0
+    for idx, proxy_obj in enumerate(proxies, start=1):
+        if _set_a3ob_proxy_index_safe(proxy_obj, idx):
+            changed += 1
+    return changed
+
+def _model_split_join_lod_root_group(context, target_root, lod_roots):
+    lod_roots = [obj for obj in lod_roots if obj is not None and getattr(obj, "type", None) == "MESH"]
+    if len(lod_roots) <= 1:
+        return lod_roots[0] if lod_roots else None, 0, 0, 0
+
+    anchor_obj = _model_split_choose_lod_merge_anchor(lod_roots)
+    if anchor_obj is None:
+        return None, 0, 0, 0
+
+    object_map = {obj: anchor_obj for obj in lod_roots if obj is not anchor_obj}
+    all_target_objects = _collect_collection_objects_recursive(target_root)
+    rewired = _model_split_rewire_object_refs(all_target_objects, object_map)
+    reparented = _model_split_reparent_children_for_lod_merge(lod_roots, anchor_obj)
+
+    joinable = [
+        obj for obj in lod_roots
+        if obj is not None and getattr(obj, "type", None) == "MESH" and _model_split_mesh_has_any_data(obj)
+    ]
+    joined_count = 0
+    if len(joinable) > 1:
+        try:
+            bpy.ops.object.select_all(action="DESELECT")
+        except Exception:
+            pass
+
+        for obj in joinable:
+            _ensure_object_visible_for_ops(obj)
+            try:
+                obj.select_set(True)
+            except Exception:
+                pass
+        try:
+            context.view_layer.objects.active = anchor_obj
+            bpy.ops.object.join()
+            active_after = getattr(context.view_layer.objects, "active", None)
+            if active_after is not None and getattr(active_after, "type", None) == "MESH":
+                anchor_obj = active_after
+            joined_count = max(0, len(joinable) - 1)
+        except Exception as e:
+            raise RuntimeError(f"Join duplicate LOD roots failed: {_fmt_exc(e)}")
+
+    removed_empty = 0
+    for obj in list(lod_roots):
+        try:
+            if obj == anchor_obj:
+                continue
+            if bpy.data.objects.get(obj.name) == obj:
+                bpy.data.objects.remove(obj, do_unlink=True)
+                removed_empty += 1
+        except ReferenceError:
+            pass
+        except Exception:
+            pass
+
+    _model_split_refresh_lod_object_name(anchor_obj)
+    try:
+        _repair_invalid_a3ob_selection_links(anchor_obj)
+    except Exception as e:
+        print(f"Model Split merge: selection repair skipped for {anchor_obj.name}: {_fmt_exc(e)}")
+
+    _renumber_a3ob_proxy_children(anchor_obj)
+    return anchor_obj, joined_count + removed_empty, reparented, rewired
+
+def _model_split_merge_duplicate_lods(context, target_root):
+    buckets = {}
+    for obj in _collect_collection_objects_recursive(target_root):
+        key = _model_split_lod_merge_key(obj)
+        if key is None:
+            continue
+        buckets.setdefault(key, []).append(obj)
+
+    merged_objects = []
+    merged_lod_groups = 0
+    joined_roots = 0
+    reparented = 0
+    rewired = 0
+
+    for _key, objects in buckets.items():
+        if len(objects) <= 1:
+            _renumber_a3ob_proxy_children(objects[0])
+            continue
+        merged_obj, joined, child_count, ref_count = _model_split_join_lod_root_group(context, target_root, objects)
+        if merged_obj is None:
+            continue
+        merged_lod_groups += 1
+        joined_roots += joined
+        reparented += child_count
+        rewired += ref_count
+        merged_objects.append(merged_obj)
+
+    return {
+        "merged_objects": merged_objects,
+        "merged_lod_groups": merged_lod_groups,
+        "joined_roots": joined_roots,
+        "reparented": reparented,
+        "rewired": rewired,
+    }
+
+def _remove_empty_root_collection(context, collection):
+    if collection is None:
+        return 0
+    _remove_empty_subcollections(collection)
+    if len(collection.objects) > 0 or len(collection.children) > 0:
+        return 0
+
+    parent = None
+    scene_root = getattr(getattr(context, "scene", None), "collection", None)
+    if scene_root is not None:
+        parent = _find_parent_collection(scene_root, collection)
+    if parent is not None:
+        try:
+            parent.children.unlink(collection)
+        except Exception:
+            pass
+
+    try:
+        if int(getattr(collection, "users", 0) or 0) == 0 and bpy.data.collections.get(collection.name) == collection:
+            bpy.data.collections.remove(collection)
+            return 1
+    except Exception:
+        pass
+    return 0
+
+def _resolve_model_split_merge_roots(context, settings):
+    target_root = None
+    picked_target = getattr(settings, "named_target_collection", None)
+    if picked_target is not None:
+        target_root = _find_p3d_root_collection_for_collection(context, picked_target, require_p3d=True)
+        if target_root is None:
+            raise RuntimeError("Target Model must be a .p3d root collection or one of its child collections")
+
+    listed_roots = _model_split_merge_source_roots_from_settings(context, settings)
+    selected_roots = _model_split_selected_p3d_root_collections(context)
+    candidate_roots = listed_roots if listed_roots else selected_roots
+
+    if target_root is None:
+        if len(candidate_roots) < 2:
+            raise RuntimeError("Pick Target Model or select/add at least two .p3d collections to merge")
+        target_root = candidate_roots[0]
+
+    source_roots = []
+    seen = {_model_split_id_key(target_root)}
+    for root in candidate_roots:
+        if root is None:
+            continue
+        _model_split_add_unique_collection(source_roots, seen, root)
+
+    if not source_roots:
+        raise RuntimeError("Add or select at least one source .p3d collection different from Target Model")
+
+    try:
+        settings.named_target_collection = target_root
+    except Exception:
+        pass
+
+    return target_root, source_roots
 
 def _collect_model_split_selected_mesh_objects(context):
     selected = [
@@ -16578,6 +17737,16 @@ def _ensure_a3ob_import_patch_timer():
 
     return 2.0
 
+
+def _ensure_a3ob_p3d_file_handler_patch_timer():
+    if _A3OB_P3D_FILE_HANDLER_PATCHES:
+        return None
+
+    if _patch_a3ob_p3d_file_handler():
+        return None
+
+    return 2.0
+
 class CRAY_PG_IEFileItem(PropertyGroup):
     path: StringProperty(name="File", default="", subtype="FILE_PATH")
 
@@ -16687,6 +17856,7 @@ class CRAY_OT_IE_AddFiles(Operator):
 
     files: CollectionProperty(type=OperatorFileListElement)
     directory: StringProperty(subtype="DIR_PATH")
+    filepath: StringProperty(subtype="FILE_PATH", options={"HIDDEN"})
     filter_glob: StringProperty(default="*.p3d", options={"HIDDEN"})
 
     def invoke(self, context, event):
@@ -16695,31 +17865,130 @@ class CRAY_OT_IE_AddFiles(Operator):
 
     def execute(self, context):
         st = context.scene.cray_ie_settings
-        added = 0
-        skipped = 0
-        dir_abs = bpy.path.abspath(self.directory) if self.directory else ""
-
-        for f in self.files:
-            fp = os.path.join(dir_abs, f.name) if dir_abs else f.name
-            fp = bpy.path.abspath(fp)
-            if not fp:
-                continue
-            if _planner_add_import_file(st, fp):
-                added += 1
-            else:
-                skipped += 1
+        added, skipped, skipped_non_p3d = _planner_add_import_files_from_operator(
+            st,
+            directory=getattr(self, "directory", ""),
+            files=getattr(self, "files", ()),
+            filepath=getattr(self, "filepath", ""),
+        )
 
         if added == 0:
-            if skipped > 0:
+            if skipped > 0 and skipped_non_p3d == 0:
                 self.report({"WARNING"}, "All selected files are already in the planner")
+            elif skipped_non_p3d > 0:
+                self.report({"WARNING"}, "No .p3d files added")
             else:
                 self.report({"WARNING"}, "No files added")
         else:
             msg = f"Added {added} file(s)"
             if skipped > 0:
                 msg += f", skipped {skipped} duplicate(s)"
+            if skipped_non_p3d > 0:
+                msg += f", skipped {skipped_non_p3d} non-.p3d file(s)"
             self.report({"INFO"}, msg)
         return {"FINISHED"}
+
+
+class CRAY_OT_P3DDropMenu(Operator):
+    bl_idname = "cray.p3d_drop_menu"
+    bl_label = "P3D Drop"
+    bl_description = "Choose how to handle dropped .p3d files"
+    bl_options = {"REGISTER", "UNDO", "INTERNAL"}
+
+    directory: StringProperty(subtype="DIR_PATH", options={"SKIP_SAVE", "HIDDEN"})
+    files: CollectionProperty(type=OperatorFileListElement, options={"SKIP_SAVE", "HIDDEN"})
+    filepath: StringProperty(subtype="FILE_PATH", options={"SKIP_SAVE", "HIDDEN"})
+
+    def execute(self, context):
+        paths = _collect_p3d_filepaths_from_operator(
+            directory=getattr(self, "directory", ""),
+            files=getattr(self, "files", ()),
+            filepath=getattr(self, "filepath", ""),
+        )
+        if not paths:
+            self.report({"WARNING"}, "No .p3d files dropped")
+            return {"CANCELLED"}
+
+        _set_pending_p3d_drop_paths(paths)
+
+        can_open_menu = (
+            not getattr(bpy.app, "background", False)
+            and getattr(context, "window", None) is not None
+            and getattr(context, "area", None) is not None
+        )
+        if can_open_menu:
+            try:
+                bpy.ops.wm.call_menu(name=CRAY_MT_P3DDropMenu.bl_idname)
+                return {"FINISHED"}
+            except Exception as e:
+                print(f"[NH Plugin] P3D drop menu could not be opened: {_fmt_exc(e)}")
+
+        st = getattr(context.scene, "cray_ie_settings", None)
+        if st is None:
+            self.report({"ERROR"}, "Import/Export planner settings are not available")
+            return {"CANCELLED"}
+
+        added = 0
+        skipped = 0
+        for fp in paths:
+            if _planner_add_import_file(st, fp):
+                added += 1
+            else:
+                skipped += 1
+        _set_pending_p3d_drop_paths([])
+        self.report({"INFO"}, f"Added {added} dropped .p3d file(s), skipped {skipped} duplicate(s)")
+        return {"FINISHED"}
+
+
+class CRAY_MT_P3DDropMenu(Menu):
+    bl_idname = "CRAY_MT_p3d_drop_menu"
+    bl_label = "P3D Drop"
+
+    def draw(self, context):
+        del context
+        layout = self.layout
+        layout.label(text=_pending_p3d_drop_label(), icon="FILE")
+        layout.separator()
+        layout.operator("cray.p3d_drop_add_to_planner", text="Add to Import/Export planner", icon="ADD")
+        layout.operator("cray.p3d_drop_import_now", text="Import now (A3OB)", icon="IMPORT")
+
+
+class CRAY_OT_P3DDropAddToPlanner(Operator):
+    bl_idname = "cray.p3d_drop_add_to_planner"
+    bl_label = "Add Dropped P3D To Planner"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        paths = list(_P3D_DROP_PENDING_PATHS)
+        if not paths:
+            self.report({"ERROR"}, "No dropped .p3d files are pending")
+            return {"CANCELLED"}
+
+        st = context.scene.cray_ie_settings
+        added = 0
+        skipped = 0
+        for fp in paths:
+            if _planner_add_import_file(st, fp):
+                added += 1
+            else:
+                skipped += 1
+        _set_pending_p3d_drop_paths([])
+        self.report({"INFO"}, f"Added {added} .p3d file(s) to planner, skipped {skipped} duplicate(s)")
+        return {"FINISHED"}
+
+
+class CRAY_OT_P3DDropImportNow(Operator):
+    bl_idname = "cray.p3d_drop_import_now"
+    bl_label = "Import Dropped P3D Now"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        paths = list(_P3D_DROP_PENDING_PATHS)
+        if not paths:
+            self.report({"ERROR"}, "No dropped .p3d files are pending")
+            return {"CANCELLED"}
+        _set_pending_p3d_drop_paths([])
+        return _import_p3d_paths_now(self, context, paths)
 
 
 class CRAY_OT_IE_AddByName(Operator):
@@ -16992,6 +18261,197 @@ class CRAY_OT_ModelSplitTransferSelectedToTargetCategory(Operator):
             msg += ", added to Import/Export list" if planner_added else ", already in Import/Export list"
         if failed:
             self.report({"WARNING"}, msg + f", failed {len(failed)} (see System Console)")
+        else:
+            self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+class CRAY_UL_ModelSplitMergeSources(UIList):
+    bl_idname = "CRAY_UL_model_split_merge_sources"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        collection = getattr(item, "collection", None)
+        name = getattr(collection, "name", "") or getattr(item, "name", "") or "<missing collection>"
+        layout.label(text=name, icon="OUTLINER_COLLECTION")
+
+
+class CRAY_OT_ModelSplitMergeAddSource(Operator):
+    bl_idname = "cray.model_split_merge_add_source"
+    bl_label = "Add Merge Source"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        st = context.scene.cray_model_split_settings
+
+        candidates = []
+        seen = set()
+        picked = getattr(st, "merge_source_collection", None)
+        if picked is not None:
+            root = _find_p3d_root_collection_for_collection(context, picked, require_p3d=True)
+            if root is None:
+                self.report({"ERROR"}, "Merge Source must be a .p3d root collection or one of its child collections")
+                return {"CANCELLED"}
+            _model_split_add_unique_collection(candidates, seen, root)
+        else:
+            for root in _model_split_selected_p3d_root_collections(context):
+                _model_split_add_unique_collection(candidates, seen, root)
+
+        if not candidates:
+            self.report({"ERROR"}, "Pick a Merge Source or select .p3d collection/object(s)")
+            return {"CANCELLED"}
+
+        target_root = None
+        picked_target = getattr(st, "named_target_collection", None)
+        if picked_target is not None:
+            target_root = _find_p3d_root_collection_for_collection(context, picked_target, require_p3d=True)
+
+        existing = {
+            _model_split_id_key(getattr(item, "collection", None))
+            for item in getattr(st, "merge_sources", []) or []
+        }
+        added = 0
+        for root in candidates:
+            if _same_id_data(root, target_root):
+                continue
+            key = _model_split_id_key(root)
+            if key in existing:
+                continue
+            item = st.merge_sources.add()
+            item.collection = root
+            item.name = getattr(root, "name", "") or ""
+            st.merge_sources_index = len(st.merge_sources) - 1
+            existing.add(key)
+            added += 1
+
+        if added:
+            self.report({"INFO"}, f"Added {added} merge source collection(s)")
+        else:
+            self.report({"INFO"}, "No new source collection added")
+        return {"FINISHED"}
+
+
+class CRAY_OT_ModelSplitMergeRemoveSource(Operator):
+    bl_idname = "cray.model_split_merge_remove_source"
+    bl_label = "Remove Merge Source"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        st = context.scene.cray_model_split_settings
+        if len(st.merge_sources) == 0:
+            self.report({"INFO"}, "Merge source list is empty")
+            return {"FINISHED"}
+        index = max(0, min(int(getattr(st, "merge_sources_index", 0) or 0), len(st.merge_sources) - 1))
+        st.merge_sources.remove(index)
+        st.merge_sources_index = max(0, min(index, len(st.merge_sources) - 1))
+        self.report({"INFO"}, "Removed merge source")
+        return {"FINISHED"}
+
+
+class CRAY_OT_ModelSplitMergeClearSources(Operator):
+    bl_idname = "cray.model_split_merge_clear_sources"
+    bl_label = "Clear Merge Sources"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        context.scene.cray_model_split_settings.merge_sources.clear()
+        self.report({"INFO"}, "Cleared merge source list")
+        return {"FINISHED"}
+
+
+class CRAY_OT_ModelSplitMergeSelectedCollections(Operator):
+    bl_idname = "cray.model_split_merge_selected_collections"
+    bl_label = "Merge Collections"
+    bl_description = "Merge selected/listed .p3d collections into Target Model and join duplicate A3OB LOD roots"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        st = context.scene.cray_model_split_settings
+
+        if context.mode != "OBJECT":
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception as e:
+                self.report({"ERROR"}, f"Failed to switch to Object Mode: {_fmt_exc(e)}")
+                return {"CANCELLED"}
+
+        try:
+            target_root, source_roots = _resolve_model_split_merge_roots(context, st)
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        try:
+            _ensure_collection_visible_in_view_layer(context, target_root)
+        except Exception:
+            pass
+
+        moved_objects = 0
+        removed_sources = 0
+        failures = []
+        source_name_list = []
+        for source_root in source_roots:
+            try:
+                source_name_list.append(getattr(source_root, "name", "") or "<collection>")
+            except ReferenceError:
+                source_name_list.append("<collection>")
+        source_names = ", ".join(source_name_list)
+        source_count = len(source_roots)
+
+        all_roots = [target_root] + list(source_roots)
+        for root in all_roots:
+            try:
+                moved_objects += _model_split_move_root_contents_to_merge_target(target_root, root)
+            except Exception as e:
+                failures.append(f"{getattr(root, 'name', '<collection>')} -> {_fmt_exc(e)}")
+
+        try:
+            st.merge_sources.clear()
+        except Exception:
+            pass
+
+        for source_root, source_name in zip(source_roots, source_name_list):
+            try:
+                removed_sources += _remove_empty_root_collection(context, source_root)
+            except Exception as e:
+                failures.append(f"{source_name} cleanup -> {_fmt_exc(e)}")
+
+        try:
+            merge_stats = _model_split_merge_duplicate_lods(context, target_root)
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        removed_empty = _remove_empty_subcollections(target_root)
+        planner_added, planner_path = _add_model_split_part_to_planner(context, target_root)
+
+        merged_objects = merge_stats.get("merged_objects", []) if merge_stats else []
+        if merged_objects:
+            _focus_created_split_objects(context, target_root, merged_objects)
+        else:
+            _ensure_collection_visible_in_view_layer(context, target_root)
+
+        if failures:
+            print("=== Model Split Merge: Failures ===")
+            for item in failures:
+                print(item)
+
+        print("=== Model Split Merge ===")
+        print(f"Target: {target_root.name}")
+        print(f"Sources: {source_names}")
+        print(f"Moved/canonicalized objects: {moved_objects}")
+        print(f"Merged duplicate LOD groups: {merge_stats.get('merged_lod_groups', 0)}")
+        print(f"Joined/removed duplicate LOD roots: {merge_stats.get('joined_roots', 0)}")
+        print(f"Reparented children/proxies: {merge_stats.get('reparented', 0)}")
+        print(f"Rewired refs: {merge_stats.get('rewired', 0)}")
+        print(f"Removed empty collections: {removed_empty + removed_sources}")
+
+        msg = (
+            f"Merged {source_count} collection(s) into {target_root.name}; "
+            f"LOD groups joined: {merge_stats.get('merged_lod_groups', 0)}"
+        )
+        if planner_path:
+            msg += ", added to Import/Export list" if planner_added else ", already in Import/Export list"
+        if failures:
+            self.report({"WARNING"}, msg + f"; failed {len(failures)} item(s), see System Console")
         else:
             self.report({"INFO"}, msg)
         return {"FINISHED"}
@@ -18183,6 +19643,208 @@ class CRAY_OT_DeleteSelectedComponentsKeepVertices(Operator):
         return {"FINISHED"}
 
 
+def _material_key_for_mesh_index(mesh, material_index):
+    material_index = int(material_index)
+    materials = getattr(mesh, "materials", None)
+    if materials is not None and 0 <= material_index < len(materials):
+        material = materials[material_index]
+        if material is not None:
+            try:
+                return ("material", int(material.as_pointer()))
+            except Exception:
+                return ("material_name", str(getattr(material, "name", "")))
+    return ("slot", material_index)
+
+
+def _bmesh_vert_material_signature(mesh, vert):
+    keys = {
+        _material_key_for_mesh_index(mesh, face.material_index)
+        for face in vert.link_faces
+        if face.is_valid
+    }
+    return tuple(sorted(keys))
+
+
+def _selected_bmesh_verts_for_material_safe_merge(bm, *, require_selection):
+    if not require_selection:
+        return [vert for vert in bm.verts if vert.is_valid]
+
+    verts = []
+    seen = set()
+
+    def _add_vert(vert):
+        if vert is None or not vert.is_valid:
+            return
+        key = vert.index
+        if key in seen:
+            return
+        seen.add(key)
+        verts.append(vert)
+
+    for vert in bm.verts:
+        if vert.select:
+            _add_vert(vert)
+    for edge in bm.edges:
+        if edge.is_valid and edge.select:
+            for vert in edge.verts:
+                _add_vert(vert)
+    for face in bm.faces:
+        if face.is_valid and face.select:
+            for vert in face.verts:
+                _add_vert(vert)
+    return verts
+
+
+def _merge_bmesh_verts_by_distance_keep_materials(mesh, bm, verts, merge_distance):
+    merge_distance = max(float(merge_distance), 0.0)
+    if merge_distance <= 0.0:
+        return {"removed_verts": 0, "input_verts": len(verts), "material_groups": 0}
+
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    bm.verts.index_update()
+
+    before_vert_count = len(bm.verts)
+    groups = {}
+    seen = set()
+    for vert in verts:
+        if vert is None or not vert.is_valid:
+            continue
+        key = vert.index
+        if key in seen:
+            continue
+        seen.add(key)
+        signature = _bmesh_vert_material_signature(mesh, vert)
+        groups.setdefault(signature, []).append(vert)
+
+    for group_verts in groups.values():
+        live_verts = [vert for vert in group_verts if vert.is_valid]
+        if len(live_verts) < 2:
+            continue
+        bmesh.ops.remove_doubles(bm, verts=live_verts, dist=merge_distance)
+
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    bm.normal_update()
+    return {
+        "removed_verts": max(0, before_vert_count - len(bm.verts)),
+        "input_verts": len(seen),
+        "material_groups": len(groups),
+    }
+
+
+def _merge_object_by_distance_keep_materials(obj, merge_distance):
+    mesh = getattr(obj, "data", None)
+    if obj is None or getattr(obj, "type", None) != "MESH" or mesh is None:
+        raise RuntimeError("Object must be a mesh")
+
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        verts = _selected_bmesh_verts_for_material_safe_merge(bm, require_selection=False)
+        stats = _merge_bmesh_verts_by_distance_keep_materials(mesh, bm, verts, merge_distance)
+        bm.to_mesh(mesh)
+        mesh.update(calc_edges=True)
+        return stats
+    finally:
+        bm.free()
+
+
+def _merge_edit_mesh_by_distance_keep_materials(obj, merge_distance):
+    mesh = getattr(obj, "data", None)
+    if obj is None or getattr(obj, "type", None) != "MESH" or mesh is None:
+        raise RuntimeError("Active object must be a mesh")
+
+    bm = bmesh.from_edit_mesh(mesh)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    bm.verts.index_update()
+    verts = _selected_bmesh_verts_for_material_safe_merge(bm, require_selection=True)
+    if not verts:
+        raise RuntimeError("Select vertices, edges or faces to merge")
+
+    stats = _merge_bmesh_verts_by_distance_keep_materials(mesh, bm, verts, merge_distance)
+    bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=True)
+    return stats
+
+
+class CRAY_OT_MergeByDistanceKeepMaterials(Operator):
+    bl_idname = "cray.merge_by_distance_keep_materials"
+    bl_label = "Material Safe Merge"
+    bl_description = (
+        "Merge vertices by distance, but keep coincident vertices separate when their linked faces "
+        "belong to different materials"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        active_obj = getattr(context, "active_object", None)
+        if context.mode == "EDIT_MESH":
+            return active_obj is not None and active_obj.type == "MESH"
+        return any(
+            obj is not None and obj.type == "MESH"
+            for obj in getattr(context, "selected_objects", [])
+        ) or (active_obj is not None and active_obj.type == "MESH")
+
+    def execute(self, context):
+        ts = context.scene.cray_texreplace_settings
+        merge_distance = float(getattr(ts, "material_safe_merge_distance", 0.0))
+        if merge_distance <= 0.0:
+            self.report({"ERROR"}, "Material Safe Merge Distance must be greater than zero")
+            return {"CANCELLED"}
+
+        total_removed = 0
+        total_input = 0
+        total_groups = 0
+        object_count = 0
+
+        try:
+            if context.mode == "EDIT_MESH":
+                obj = context.active_object
+                stats = _merge_edit_mesh_by_distance_keep_materials(obj, merge_distance)
+                total_removed += int(stats.get("removed_verts", 0))
+                total_input += int(stats.get("input_verts", 0))
+                total_groups += int(stats.get("material_groups", 0))
+                object_count = 1
+            else:
+                objects = [
+                    obj for obj in getattr(context, "selected_objects", [])
+                    if obj is not None and obj.type == "MESH" and obj.data is not None
+                ]
+                active_obj = getattr(context, "active_object", None)
+                if not objects and active_obj is not None and active_obj.type == "MESH":
+                    objects = [active_obj]
+                if not objects:
+                    raise RuntimeError("Select at least one mesh object")
+
+                for obj in objects:
+                    stats = _merge_object_by_distance_keep_materials(obj, merge_distance)
+                    total_removed += int(stats.get("removed_verts", 0))
+                    total_input += int(stats.get("input_verts", 0))
+                    total_groups += int(stats.get("material_groups", 0))
+                object_count = len(objects)
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        self.report(
+            {"INFO"},
+            (
+                f"Material Safe Merge: {object_count} object(s), "
+                f"{total_removed} vertex/vertices removed from {total_input}, "
+                f"{total_groups} material group(s)"
+            ),
+        )
+        return {"FINISHED"}
+
+
 def _is_proxy_object_name(name: str) -> bool:
     return (name or "").strip().lower().startswith("proxy:")
 
@@ -18496,28 +20158,12 @@ class CRAY_OT_CreatePlainAxisPivot(Operator):
 
             context.view_layer.update()
 
-            enabled_axes = (
-                "use_location_x",
-                "use_location_y",
-                "use_location_z",
-                "use_rotation_x",
-                "use_rotation_y",
-                "use_rotation_z",
-                "use_scale_x",
-                "use_scale_y",
-                "use_scale_z",
-            )
-
             for obj in target_objects:
                 try:
                     con = obj.constraints.new(type="CHILD_OF")
                     con.name = _PLAIN_AXIS_CONSTRAINT_NAME
                     con.target = helper_obj
-                    for attr in enabled_axes:
-                        try:
-                            setattr(con, attr, True)
-                        except Exception:
-                            pass
+                    _set_plain_axis_constraint_axes(con)
                     context.view_layer.update()
                     _apply_child_of_inverse_with_fallback(context, obj, con)
                     constrained += 1
@@ -19022,6 +20668,9 @@ class CRAY_PT_SnapPointsPanel(Panel):
         col.separator()
         col.prop(ss, "paired_object", text="V Target")
         col.operator("cray.ensure_memory_lod", text="Create/Find Point clouds > Memory", icon="OUTLINER_OB_MESH")
+        visibility_row = col.row(align=True)
+        visibility_row.operator("cray.snap_set_p3d_visuals_only", text="Visual 0 Only", icon="HIDE_ON")
+        visibility_row.operator("cray.snap_show_all_p3d_collections", text="Show All", icon="HIDE_OFF")
 
         layout.separator()
 
@@ -19245,6 +20894,7 @@ class CRAY_PT_ColliderExpPanel(Panel):
         row = create.row(align=True)
         row.prop_enum(es, "collider_scope", "PER_OBJECT_COMPONENTS", text="per obj comp")
         row.prop_enum(es, "collider_scope", "PER_OBJECTS", text="per objects")
+        create.prop(es, "minimum_size")
         create.label(text="Create Collider", icon="MOD_REMESH")
 
         op = create.operator("cray.generate_box_collider_exp", text="Box", icon="MESH_CUBE")
@@ -19279,6 +20929,7 @@ class CRAY_PT_ColliderExpPanel(Panel):
                 "capsule_radius",
                 "capsule_height",
                 "capsule_cap_size",
+                "capsule_follow_source_angle",
                 "capsule_vertical_align",
             )),
         )
@@ -19386,6 +21037,10 @@ class CRAY_PT_FixesPanel(Panel):
         box.label(text="Shading/Geometry fixes", icon="MOD_SMOOTH")
         box.operator("cray.repair_a3ob_selections", text="Repair Invalid A3OB Selections", icon="GROUP_VERTEX")
         box.separator()
+        box.label(text="Material safe merge", icon="AUTOMERGE_ON")
+        box.prop(ts, "material_safe_merge_distance", text="Distance")
+        box.operator("cray.merge_by_distance_keep_materials", text="Merge By Distance (Keep Materials)", icon="AUTOMERGE_ON")
+        box.separator()
         box.label(text="Hierarchy fix", icon="MOD_REMESH")
         box.prop(ts, "fix_mesh_join_batch")
         box.prop(ts, "fix_mesh_center_to_origin")
@@ -19450,6 +21105,10 @@ class CRAY_PT_ImportExportPlannerPanel(Panel):
         row.operator("cray.ie_add_files", text="Add", icon="ADD")
         row.operator("cray.ie_remove_file", icon="REMOVE")
         row.operator("cray.ie_clear_files", icon="TRASH")
+        add_hint = ibox.row(align=True)
+        add_hint.enabled = False
+        add_hint.alignment = "CENTER"
+        add_hint.label(text="Use Add to queue .p3d files", icon="IMPORT")
         ibox.template_list("CRAY_UL_ie_files", "", st, "import_files", st, "import_active_index", rows=6)
         ibox.operator("cray.ie_import_batch", icon="FILE_REFRESH")
         ibox.separator()
@@ -19496,6 +21155,29 @@ class CRAY_PT_ModelSplitPanel(Panel):
         copy_op.transfer_mode = "COPY"
         move_op = row.operator("cray.model_split_transfer_to_target_category", text="Move", icon="EXPORT")
         move_op.transfer_mode = "MOVE"
+
+        layout.separator()
+
+        merge_box = layout.box()
+        merge_box.label(text="Merge Collections", icon="OUTLINER_COLLECTION")
+        merge_box.prop(st, "named_target_collection", text="Target Model")
+        row = merge_box.row(align=True)
+        row.prop(st, "merge_source_collection", text="Source")
+        row.operator("cray.model_split_merge_add_source", text="", icon="ADD")
+        row = merge_box.row()
+        row.template_list(
+            "CRAY_UL_model_split_merge_sources",
+            "",
+            st,
+            "merge_sources",
+            st,
+            "merge_sources_index",
+            rows=3,
+        )
+        col = row.column(align=True)
+        col.operator("cray.model_split_merge_remove_source", text="", icon="REMOVE")
+        col.operator("cray.model_split_merge_clear_sources", text="", icon="TRASH")
+        merge_box.operator("cray.model_split_merge_selected_collections", text="Merge", icon="OUTLINER_COLLECTION")
 
 class CRAY_PT_TextureReplacePanel(Panel):
     bl_idname = "VIEW3D_PT_cray_texreplace"
@@ -19575,6 +21257,8 @@ classes = (
     CRAY_OT_LoadConfig,
     CRAY_OT_ScatterProxies,
     CRAY_OT_EnsureMemoryLOD,
+    CRAY_OT_SnapSetP3DVisualsOnly,
+    CRAY_OT_SnapShowAllP3DCollections,
     CRAY_OT_CreateSnapPairFromModelEdge,
     CRAY_OT_SnapBatchProcess,
     CRAY_OT_CopySelectedVertsToGeometry,
@@ -19589,6 +21273,7 @@ classes = (
     CRAY_OT_OpenFixListFile,
     CRAY_OT_SelectFixListComponentsOnActiveLOD,
     CRAY_OT_DeleteSelectedComponentsKeepVertices,
+    CRAY_OT_MergeByDistanceKeepMaterials,
     CRAY_OT_FixProxyTriangleMeshes,
     CRAY_OT_SelectIsolatedVertices,
     CRAY_OT_SelectLooseVerticesOutsideMemory,
@@ -19628,6 +21313,7 @@ classes = (
 
     CRAY_PG_IEFileItem,
     CRAY_PG_IEPlannerSettings,
+    CRAY_PG_ModelSplitMergeSourceItem,
     CRAY_PG_ModelSplitSettings,
     CRAY_PG_AssetLibrarySettings,
     CRAY_PG_AssetProxySettings,
@@ -19637,11 +21323,20 @@ classes = (
     CRAY_OT_AssetLibraryBuildFromFiles,
     CRAY_OT_AssetLibraryClear,
     CRAY_OT_IE_AddFiles,
+    CRAY_OT_P3DDropMenu,
+    CRAY_MT_P3DDropMenu,
+    CRAY_OT_P3DDropAddToPlanner,
+    CRAY_OT_P3DDropImportNow,
     CRAY_OT_IE_AddByName,
     CRAY_OT_IE_RemoveFile,
     CRAY_OT_IE_ClearFiles,
     CRAY_OT_IE_ImportBatch,
     CRAY_OT_ModelSplitTransferSelectedToTargetCategory,
+    CRAY_UL_ModelSplitMergeSources,
+    CRAY_OT_ModelSplitMergeAddSource,
+    CRAY_OT_ModelSplitMergeRemoveSource,
+    CRAY_OT_ModelSplitMergeClearSources,
+    CRAY_OT_ModelSplitMergeSelectedCollections,
     CRAY_OT_ConvertSelectedToProxies,
     CRAY_OT_RepairA3OBSelections,
     CRAY_OT_CreatePlainAxisPivot,
@@ -19685,6 +21380,9 @@ def register():
     _patch_a3ob_import_read_file()
     if not bpy.app.timers.is_registered(_ensure_a3ob_import_patch_timer):
         bpy.app.timers.register(_ensure_a3ob_import_patch_timer, first_interval=1.0, persistent=True)
+    _patch_a3ob_p3d_file_handler()
+    if not bpy.app.timers.is_registered(_ensure_a3ob_p3d_file_handler_patch_timer):
+        bpy.app.timers.register(_ensure_a3ob_p3d_file_handler_patch_timer, first_interval=1.0, persistent=True)
     _register_collider_keymaps()
 
 def unregister():
@@ -19698,6 +21396,9 @@ def unregister():
         bpy.app.handlers.load_post.remove(_restore_persisted_ui_state_on_load)
     if bpy.app.timers.is_registered(_ensure_a3ob_import_patch_timer):
         bpy.app.timers.unregister(_ensure_a3ob_import_patch_timer)
+    if bpy.app.timers.is_registered(_ensure_a3ob_p3d_file_handler_patch_timer):
+        bpy.app.timers.unregister(_ensure_a3ob_p3d_file_handler_patch_timer)
+    _unpatch_a3ob_p3d_file_handler()
     _unpatch_a3ob_import_read_file()
     del bpy.types.Scene.cray_asset_proxy_settings
     del bpy.types.Scene.cray_asset_library_settings
