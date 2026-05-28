@@ -1,7 +1,7 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Daryl and Enisam",
-    "version": (0, 5, 2, 22),
+    "version": (0, 5, 2, 29),
     "blender": (5, 1, 1),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "All-in-one Blender toolkit for porting and preparing DayZ/Arma assets: fixes, textures, colliders, proxies, snap points, and P3D workflow helpers.",    
@@ -2256,7 +2256,16 @@ def _iter_a3ob_p3d_file_handlers():
 
 def _nh_p3d_file_handler_poll_drop(cls, context):
     del cls
-    return bool(getattr(context, "area", None))
+    area = getattr(context, "area", None)
+    region = getattr(context, "region", None)
+    return bool(area and (region is None or getattr(region, "type", None) == "WINDOW"))
+
+
+def _is_registered_blender_class(cls):
+    try:
+        return getattr(bpy.types, cls.__name__, None) is cls
+    except Exception:
+        return False
 
 
 def _patch_a3ob_p3d_file_handler():
@@ -2265,14 +2274,33 @@ def _patch_a3ob_p3d_file_handler():
         if any(patched_cls is cls for patched_cls, _, _ in _A3OB_P3D_FILE_HANDLER_PATCHES):
             patched = True
             continue
+        original_import_operator = ""
+        original_poll_drop = None
+        was_registered = False
         try:
             original_import_operator = getattr(cls, "bl_import_operator", "")
             original_poll_drop = cls.__dict__.get("poll_drop", None)
+            was_registered = _is_registered_blender_class(cls)
+            if was_registered:
+                bpy.utils.unregister_class(cls)
             cls.bl_import_operator = "cray.p3d_drop_menu"
             cls.poll_drop = classmethod(_nh_p3d_file_handler_poll_drop)
+            if was_registered:
+                bpy.utils.register_class(cls)
             _A3OB_P3D_FILE_HANDLER_PATCHES.append((cls, original_import_operator, original_poll_drop))
             patched = True
         except Exception as e:
+            try:
+                cls.bl_import_operator = original_import_operator
+                if original_poll_drop is not None:
+                    cls.poll_drop = original_poll_drop
+            except Exception:
+                pass
+            try:
+                if was_registered and not _is_registered_blender_class(cls):
+                    bpy.utils.register_class(cls)
+            except Exception:
+                pass
             print(f"[NH Plugin] Failed to patch A3OB P3D file drop handler: {_fmt_exc(e)}")
     return patched
 
@@ -2280,13 +2308,17 @@ def _patch_a3ob_p3d_file_handler():
 def _unpatch_a3ob_p3d_file_handler():
     while _A3OB_P3D_FILE_HANDLER_PATCHES:
         cls, original_import_operator, original_poll_drop = _A3OB_P3D_FILE_HANDLER_PATCHES.pop()
+        was_registered = _is_registered_blender_class(cls)
         try:
+            if was_registered:
+                bpy.utils.unregister_class(cls)
             cls.bl_import_operator = original_import_operator
-        except Exception:
-            pass
-        try:
             if original_poll_drop is not None:
                 cls.poll_drop = original_poll_drop
+            elif cls.__dict__.get("poll_drop", None) is not None:
+                delattr(cls, "poll_drop")
+            if was_registered:
+                bpy.utils.register_class(cls)
         except Exception:
             pass
 
@@ -3736,7 +3768,12 @@ class _MemoryLodManager:
 
         self.apply_a3ob_props(memory_obj)
         if self.parent_collection is not None:
-            _ensure_plain_axis_constraint_for_new_object(self.context, memory_obj, self.parent_collection)
+            _ensure_plain_axis_constraint_for_new_object(
+                self.context,
+                memory_obj,
+                self.parent_collection,
+                reference_obj=self.source_obj,
+            )
         return memory_obj
 
 def _snap_axis_index_or_none(axis_token: str):
@@ -4098,6 +4135,12 @@ def _is_visuals_collection_name(name: str) -> bool:
     return _strip_blender_numeric_suffix(name).strip().lower() == _VISUALS_COLLECTION_NAME.lower()
 
 
+def _is_point_clouds_collection_name(name: str) -> bool:
+    logical_name = _strip_blender_numeric_suffix(name).strip().lower()
+    allowed_names = (_MEMORY_COLLECTION_NAME, *_MEMORY_COLLECTION_ALIASES)
+    return logical_name in {item.lower() for item in allowed_names}
+
+
 def _is_resolution0_visual_lod_object(obj) -> bool:
     if obj is None:
         return False
@@ -4126,6 +4169,10 @@ def _set_collection_view_visible(layer_map, collection, visible: bool):
     if lc is not None:
         try:
             lc.exclude = False
+        except Exception:
+            pass
+        try:
+            lc.hide_viewport = not visible
         except Exception:
             pass
 
@@ -4165,30 +4212,41 @@ def _set_p3d_visual_collection_visibility(context, *, visuals_only: bool):
     changed = 0
 
     for root_col in roots:
+        _ensure_collection_visible_in_view_layer(context, root_col)
         if visuals_only:
             visual_ptrs = set()
             visual_obj_ptrs = set()
+            point_cloud_ptrs = set()
+            point_cloud_obj_ptrs = set()
             for child in root_col.children:
-                if not _is_visuals_collection_name(child.name):
+                if _is_visuals_collection_name(child.name):
+                    for visual_col in _iter_collection_tree(child):
+                        visual_ptrs.add(visual_col.as_pointer())
+                        for obj in visual_col.objects:
+                            if not _is_resolution0_visual_lod_object(obj):
+                                continue
+                            for visible_obj in _iter_object_tree(obj):
+                                visual_obj_ptrs.add(visible_obj.as_pointer())
                     continue
-                for visual_col in _iter_collection_tree(child):
-                    visual_ptrs.add(visual_col.as_pointer())
-                    for obj in visual_col.objects:
-                        if not _is_resolution0_visual_lod_object(obj):
-                            continue
-                        for visible_obj in _iter_object_tree(obj):
-                            visual_obj_ptrs.add(visible_obj.as_pointer())
+
+                if _is_point_clouds_collection_name(child.name):
+                    for point_col in _iter_collection_tree(child):
+                        point_cloud_ptrs.add(point_col.as_pointer())
+                        for obj in point_col.objects:
+                            point_cloud_obj_ptrs.add(obj.as_pointer())
 
             if not visual_ptrs:
                 continue
 
             for col in _iter_collection_tree(root_col):
-                visible = (col is root_col) or (col.as_pointer() in visual_ptrs)
+                col_ptr = col.as_pointer()
+                visible = (col is root_col) or (col_ptr in visual_ptrs) or (col_ptr in point_cloud_ptrs)
                 _set_collection_view_visible(layer_map, col, visible)
                 changed += 1
 
             for obj in _collect_collection_objects_recursive(root_col):
-                _set_object_view_visible(obj, obj.as_pointer() in visual_obj_ptrs)
+                obj_ptr = obj.as_pointer()
+                _set_object_view_visible(obj, (obj_ptr in visual_obj_ptrs) or (obj_ptr in point_cloud_obj_ptrs))
                 changed += 1
             continue
 
@@ -4205,7 +4263,7 @@ def _set_p3d_visual_collection_visibility(context, *, visuals_only: bool):
 class CRAY_OT_SnapSetP3DVisualsOnly(Operator):
     bl_idname = "cray.snap_set_p3d_visuals_only"
     bl_label = "Visual 0 Only"
-    bl_description = "Show only Resolution 0 inside Visuals for each .p3d collection, hiding lower LODs and non-visual branches"
+    bl_description = "Show only Resolution 0 inside Visuals and keep Point clouds for each .p3d collection"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -15792,6 +15850,10 @@ def _ensure_collection_visible_in_view_layer(context, target_collection):
                 lc.exclude = False
             except Exception:
                 pass
+            try:
+                lc.hide_viewport = False
+            except Exception:
+                pass
 
         try:
             col.hide_viewport = False
@@ -16209,17 +16271,263 @@ def _iter_plain_axis_constraints(obj, helper_ptrs=None):
         if getattr(con, "name", "") == _PLAIN_AXIS_CONSTRAINT_NAME and target is not None and _is_plain_axis_helper(target):
             yield con
 
-def _remove_plain_axis_constraints_from_objects(objects, helper_ptrs=None):
-    removed = 0
-    for obj in objects:
+def _remove_plain_axis_constraints_from_objects(objects, helper_ptrs=None, *, context=None, keep_world_transform=False):
+    entries = []
+    seen = set()
+    for obj in list(objects):
+        if obj is None:
+            continue
+        try:
+            ptr = obj.as_pointer()
+        except Exception:
+            ptr = id(obj)
+        if ptr in seen:
+            continue
+        seen.add(ptr)
+
         constraints = list(_iter_plain_axis_constraints(obj, helper_ptrs=helper_ptrs))
+        if not constraints:
+            continue
+
+        world_matrix = None
+        if keep_world_transform:
+            try:
+                world_matrix = obj.matrix_world.copy()
+            except Exception:
+                world_matrix = None
+
+        entries.append((obj, constraints, world_matrix))
+
+    removed = 0
+    for obj, constraints, _world_matrix in entries:
+        if obj is None or bpy.data.objects.get(obj.name) is not obj:
+            continue
         for con in constraints:
             try:
                 obj.constraints.remove(con)
                 removed += 1
             except Exception:
                 pass
+
+    if keep_world_transform:
+        try:
+            if context is not None:
+                context.view_layer.update()
+        except Exception:
+            pass
+
+        for obj, _constraints, world_matrix in sorted(entries, key=lambda item: _obj_depth(item[0])):
+            if world_matrix is None or obj is None or bpy.data.objects.get(obj.name) is not obj:
+                continue
+            try:
+                obj.matrix_world = world_matrix
+            except Exception:
+                pass
+
+        try:
+            if context is not None:
+                context.view_layer.update()
+        except Exception:
+            pass
+
     return removed
+
+
+def _plain_axis_object_world_center(obj, *, prefer_vertices=False):
+    if obj is None:
+        return Vector((0.0, 0.0, 0.0))
+
+    if prefer_vertices and getattr(obj, "type", None) == "MESH" and getattr(obj, "data", None) is not None:
+        vertices = getattr(obj.data, "vertices", ())
+        count = len(vertices)
+        if count > 0:
+            total = Vector((0.0, 0.0, 0.0))
+            for vert in vertices:
+                total += obj.matrix_world @ vert.co
+            return total / count
+
+    points = []
+    try:
+        points = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+    except Exception:
+        points = []
+
+    if points:
+        total = Vector((0.0, 0.0, 0.0))
+        for point in points:
+            total += point
+        return total / len(points)
+
+    try:
+        return obj.matrix_world.translation.copy()
+    except Exception:
+        return Vector((0.0, 0.0, 0.0))
+
+
+def _object_has_ancestor_in_pointer_set(obj, object_ptrs):
+    parent = getattr(obj, "parent", None)
+    while parent is not None:
+        try:
+            if parent.as_pointer() in object_ptrs:
+                return True
+        except Exception:
+            pass
+        parent = getattr(parent, "parent", None)
+    return False
+
+
+def _plain_axis_constraint_helper_delta(helper_obj, constraints):
+    if helper_obj is None:
+        return None
+    for con in constraints or ():
+        try:
+            return helper_obj.matrix_world @ con.inverse_matrix.copy()
+        except Exception:
+            continue
+    return None
+
+
+def _plain_axis_helper_root_collections(context, helper_obj):
+    roots = []
+    seen = set()
+    for col in getattr(helper_obj, "users_collection", []):
+        try:
+            ptr = col.as_pointer()
+        except Exception:
+            ptr = None
+        if ptr is not None and ptr in seen:
+            continue
+        if ptr is not None:
+            seen.add(ptr)
+        roots.append(col)
+
+    stored_name = ""
+    try:
+        stored_name = helper_obj.get(_PLAIN_AXIS_ROOT_PROP, "") or ""
+    except Exception:
+        stored_name = ""
+    stored_col = bpy.data.collections.get(stored_name) if stored_name else None
+    if stored_col is not None:
+        try:
+            ptr = stored_col.as_pointer()
+        except Exception:
+            ptr = None
+        if ptr is None or ptr not in seen:
+            roots.append(stored_col)
+
+    return roots
+
+
+def _snapshot_plain_axis_memory_restore_state(context, live_helpers):
+    try:
+        context.view_layer.update()
+    except Exception:
+        pass
+
+    states = []
+    for helper_obj in live_helpers:
+        try:
+            helper_ptr = helper_obj.as_pointer()
+        except Exception:
+            continue
+
+        constrained = []
+        constrained_ptrs = set()
+        helper_delta = None
+        for obj in bpy.data.objects:
+            constraints = list(_iter_plain_axis_constraints(obj, helper_ptrs={helper_ptr}))
+            if not constraints:
+                continue
+            if helper_delta is None:
+                helper_delta = _plain_axis_constraint_helper_delta(helper_obj, constraints)
+            try:
+                constrained_ptrs.add(obj.as_pointer())
+            except Exception:
+                pass
+            constrained.append({
+                "object": obj,
+                "before_matrix": obj.matrix_world.copy(),
+                "before_center": _plain_axis_object_world_center(obj),
+            })
+
+        if not constrained:
+            continue
+
+        memory_items = []
+        memory_seen = set()
+        for root_col in _plain_axis_helper_root_collections(context, helper_obj):
+            for obj in _collect_collection_objects_recursive(root_col):
+                if not _is_memory_lod_mesh_object(obj):
+                    continue
+                try:
+                    ptr = obj.as_pointer()
+                except Exception:
+                    continue
+                if ptr in memory_seen or ptr in constrained_ptrs:
+                    continue
+                if _object_has_ancestor_in_pointer_set(obj, constrained_ptrs):
+                    continue
+                if list(_iter_plain_axis_constraints(obj)):
+                    continue
+                memory_seen.add(ptr)
+                memory_items.append({
+                    "object": obj,
+                    "before_matrix": obj.matrix_world.copy(),
+                    "before_center": _plain_axis_object_world_center(obj, prefer_vertices=True),
+                })
+
+        if memory_items:
+            states.append({
+                "constrained": constrained,
+                "helper_delta": helper_delta,
+                "memory": memory_items,
+            })
+
+    return states
+
+
+def _restore_unconstrained_plain_axis_memory_objects(context, restore_states):
+    if not restore_states:
+        return 0
+
+    try:
+        context.view_layer.update()
+    except Exception:
+        pass
+
+    adjusted = 0
+    for state in restore_states:
+        reference = None
+        for item in state.get("constrained", ()):
+            obj = item.get("object")
+            if obj is not None and bpy.data.objects.get(obj.name) is obj:
+                reference = item
+                break
+        if reference is None:
+            continue
+
+        ref_obj = reference["object"]
+        ref_before_matrix = reference["before_matrix"]
+        ref_after_matrix = ref_obj.matrix_world.copy()
+        correction = ref_after_matrix @ ref_before_matrix.inverted_safe()
+
+        for item in state.get("memory", ()):
+            obj = item.get("object")
+            if obj is None or bpy.data.objects.get(obj.name) is not obj:
+                continue
+            try:
+                obj.matrix_world = correction @ obj.matrix_world
+                adjusted += 1
+            except Exception:
+                pass
+
+    if adjusted:
+        try:
+            context.view_layer.update()
+        except Exception:
+            pass
+    return adjusted
+
 
 def _apply_child_of_inverse_with_fallback(context, obj, constraint):
     if obj is None or constraint is None:
@@ -16264,20 +16572,59 @@ def _find_plain_axis_helper_in_collection(root_collection):
     return helpers[-1]
 
 
-def _find_plain_axis_reference_constraint(helper_obj, exclude_obj=None):
+def _plain_axis_reference_priority(obj):
+    name = _strip_blender_numeric_suffix(getattr(obj, "name", "") or "").strip().lower()
+    if name == "resolution 0":
+        return 0
+    if name.startswith("resolution 0"):
+        return 1
+    if name.startswith("resolution"):
+        return 2
+    if not _is_memory_lod_mesh_object(obj):
+        return 3
+    return 4
+
+
+def _find_plain_axis_reference_constraint(helper_obj, exclude_obj=None, reference_obj=None, root_collection=None):
     if helper_obj is None:
         return None
     helper_ptr = helper_obj.as_pointer()
     exclude_ptr = exclude_obj.as_pointer() if exclude_obj is not None else None
-    for obj in bpy.data.objects:
+
+    def constraint_from_object(obj):
+        if obj is None:
+            return None
         if exclude_ptr is not None and obj.as_pointer() == exclude_ptr:
-            continue
+            return None
         for con in _iter_plain_axis_constraints(obj, helper_ptrs={helper_ptr}):
+            return con
+        return None
+
+    con = constraint_from_object(reference_obj)
+    if con is not None:
+        return con
+
+    candidates = []
+    if root_collection is not None:
+        for obj in _collect_collection_objects_recursive(root_collection):
+            if _is_plain_axis_helper(obj):
+                continue
+            con = constraint_from_object(obj)
+            if con is None:
+                continue
+            candidates.append((obj, con))
+        candidates.sort(key=lambda item: (_plain_axis_reference_priority(item[0]), getattr(item[0], "name", "")))
+        if candidates:
+            return candidates[0][1]
+
+    for obj in bpy.data.objects:
+        con = constraint_from_object(obj)
+        if con is not None:
             return con
     return None
 
 
-def _ensure_plain_axis_constraint_for_new_object(context, obj, root_collection):
+def _ensure_plain_axis_constraint_for_new_object(context, obj, root_collection, reference_obj=None):
     if obj is None or root_collection is None:
         return False
 
@@ -16286,15 +16633,26 @@ def _ensure_plain_axis_constraint_for_new_object(context, obj, root_collection):
         return False
 
     helper_ptr = helper_obj.as_pointer()
-    if any(True for _con in _iter_plain_axis_constraints(obj, helper_ptrs={helper_ptr})):
-        return False
+    existing_constraints = list(_iter_plain_axis_constraints(obj, helper_ptrs={helper_ptr}))
 
-    reference_constraint = _find_plain_axis_reference_constraint(helper_obj, exclude_obj=obj)
+    reference_constraint = _find_plain_axis_reference_constraint(
+        helper_obj,
+        exclude_obj=obj,
+        reference_obj=reference_obj,
+        root_collection=root_collection,
+    )
     if reference_constraint is None:
         return False
 
     try:
         desired_world = obj.matrix_world.copy()
+        for existing_constraint in existing_constraints:
+            try:
+                obj.constraints.remove(existing_constraint)
+            except Exception:
+                pass
+        context.view_layer.update()
+
         helper_delta = helper_obj.matrix_world @ reference_constraint.inverse_matrix
         obj.matrix_world = helper_delta.inverted_safe() @ desired_world
         con = obj.constraints.new(type="CHILD_OF")
@@ -16307,6 +16665,18 @@ def _ensure_plain_axis_constraint_for_new_object(context, obj, root_collection):
     except Exception as e:
         print(f"[NH Plugin] Failed to attach new object to Plain Axis: {getattr(obj, 'name', '<object>')}: {_fmt_exc(e)}")
         return False
+
+
+def _repair_plain_axis_memory_constraints(context, helper_objects):
+    repaired = 0
+    for helper_obj in helper_objects:
+        for root_collection in _plain_axis_helper_root_collections(context, helper_obj):
+            for obj in _collect_collection_objects_recursive(root_collection):
+                if not _is_memory_lod_mesh_object(obj):
+                    continue
+                if _ensure_plain_axis_constraint_for_new_object(context, obj, root_collection):
+                    repaired += 1
+    return repaired
 
 
 def _create_plain_axis_helper(context, root_collection, source_obj, world_location):
@@ -16346,8 +16716,16 @@ def _clear_plain_axis_helpers(context, helper_objects):
     if not live_helpers:
         return 0, 0
 
+    repaired_memory = _repair_plain_axis_memory_constraints(context, live_helpers)
+    memory_restore_states = _snapshot_plain_axis_memory_restore_state(context, live_helpers)
     helper_ptrs = {obj.as_pointer() for obj in live_helpers}
-    removed_constraints = _remove_plain_axis_constraints_from_objects(bpy.data.objects, helper_ptrs=helper_ptrs)
+    removed_constraints = _remove_plain_axis_constraints_from_objects(
+        bpy.data.objects,
+        helper_ptrs=helper_ptrs,
+        context=context,
+        keep_world_transform=False,
+    )
+    restored_memory = _restore_unconstrained_plain_axis_memory_objects(context, memory_restore_states)
 
     removed_helpers = 0
     for obj in live_helpers:
@@ -16357,6 +16735,10 @@ def _clear_plain_axis_helpers(context, helper_objects):
         except Exception:
             pass
 
+    if repaired_memory:
+        print(f"[NH Plugin] Repaired {repaired_memory} Memory LOD Plain Axis constraint(s) before deleting Plain Axes")
+    if restored_memory:
+        print(f"[NH Plugin] Restored {restored_memory} unconstrained Memory LOD object(s) after deleting Plain Axes")
     return removed_helpers, removed_constraints
 
 def _clear_plain_axis_helpers_in_collection(context, root_collection):
@@ -17893,11 +18275,15 @@ class CRAY_OT_P3DDropMenu(Operator):
     bl_idname = "cray.p3d_drop_menu"
     bl_label = "P3D Drop"
     bl_description = "Choose how to handle dropped .p3d files"
-    bl_options = {"REGISTER", "UNDO", "INTERNAL"}
+    bl_options = {"REGISTER", "UNDO"}
 
     directory: StringProperty(subtype="DIR_PATH", options={"SKIP_SAVE", "HIDDEN"})
     files: CollectionProperty(type=OperatorFileListElement, options={"SKIP_SAVE", "HIDDEN"})
     filepath: StringProperty(subtype="FILE_PATH", options={"SKIP_SAVE", "HIDDEN"})
+
+    def invoke(self, context, event):
+        del event
+        return self.execute(context)
 
     def execute(self, context):
         paths = _collect_p3d_filepaths_from_operator(
