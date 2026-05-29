@@ -1,7 +1,7 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Daryl and Enisam",
-    "version": (0, 5, 2, 29),
+    "version": (0, 5, 2, 31),
     "blender": (5, 1, 1),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "All-in-one Blender toolkit for porting and preparing DayZ/Arma assets: fixes, textures, colliders, proxies, snap points, and P3D workflow helpers.",    
@@ -15955,6 +15955,17 @@ def _planner_add_import_files_from_operator(settings, *, directory: str = "", fi
     return added, skipped_duplicate, skipped_non_p3d
 
 
+def _p3d_drop_natural_sort_key(filepath: str):
+    path = _norm_path(bpy.path.abspath(filepath)) if filepath else ""
+    folder = os.path.dirname(path).lower()
+    basename = os.path.basename(path).lower()
+    name_parts = [
+        (1, int(part)) if part.isdigit() else (0, part)
+        for part in re.split(r"(\d+)", basename)
+    ]
+    return folder, name_parts, basename
+
+
 def _collect_p3d_filepaths_from_operator(*, directory: str = "", files=None, filepath: str = ""):
     paths = []
     seen = set()
@@ -15967,7 +15978,7 @@ def _collect_p3d_filepaths_from_operator(*, directory: str = "", files=None, fil
             continue
         seen.add(key)
         paths.append(fp)
-    return paths
+    return sorted(paths, key=_p3d_drop_natural_sort_key)
 
 
 def _set_pending_p3d_drop_paths(paths):
@@ -18274,7 +18285,7 @@ class CRAY_OT_IE_AddFiles(Operator):
 class CRAY_OT_P3DDropMenu(Operator):
     bl_idname = "cray.p3d_drop_menu"
     bl_label = "P3D Drop"
-    bl_description = "Choose how to handle dropped .p3d files"
+    bl_description = "Add dropped .p3d files to the Import/Export planner"
     bl_options = {"REGISTER", "UNDO"}
 
     directory: StringProperty(subtype="DIR_PATH", options={"SKIP_SAVE", "HIDDEN"})
@@ -18294,20 +18305,6 @@ class CRAY_OT_P3DDropMenu(Operator):
         if not paths:
             self.report({"WARNING"}, "No .p3d files dropped")
             return {"CANCELLED"}
-
-        _set_pending_p3d_drop_paths(paths)
-
-        can_open_menu = (
-            not getattr(bpy.app, "background", False)
-            and getattr(context, "window", None) is not None
-            and getattr(context, "area", None) is not None
-        )
-        if can_open_menu:
-            try:
-                bpy.ops.wm.call_menu(name=CRAY_MT_P3DDropMenu.bl_idname)
-                return {"FINISHED"}
-            except Exception as e:
-                print(f"[NH Plugin] P3D drop menu could not be opened: {_fmt_exc(e)}")
 
         st = getattr(context.scene, "cray_ie_settings", None)
         if st is None:

@@ -2,6 +2,48 @@
 
 Все заметные изменения проекта фиксируются в этом файле.
 
+## [0.5.2.31] - 2026-05-29
+
+### Изменено
+- Drag-and-drop `.p3d` теперь сразу добавляет dropped-файлы в `Import/Export planner`, без промежуточного меню выбора действия.
+- Список dropped `.p3d` сортируется натурально по папке и имени файла, чтобы `part2.p3d` шёл перед `part10.p3d`.
+- Описание оператора `P3D Drop` уточнено под новый planner-only workflow.
+
+## [0.5.2.29] - 2026-05-29
+
+### Добавлено
+- Добавлен workflow drag-and-drop для `.p3d`: dropped-файлы можно добавить в `Import/Export planner` или импортировать сразу через A3OB.
+- В `Snap Points (Memory LOD)` добавлены кнопки `Visual 0 Only` и `Show All` для быстрого переключения видимости `.p3d`-веток.
+- В `Model Split` добавлен merge workflow: список source-коллекций, `Add/Remove/Clear Merge Source` и `Merge Collections`.
+- Добавлен оператор `Material Safe Merge` для merge-by-distance с сохранением материалов.
+- Добавлен workflow `Plain Axis Pivot`: создание Plain Axis helper-а для сборки частей сцены и кнопка `Delete All Plain Axes` для удаления helper-ов после сборки.
+
+### Изменено
+- `Visual 0 Only` теперь оставляет видимыми `Point clouds > Memory`, чтобы snap points не пропадали во время работы.
+- `Memory` для snap points ищется и создаётся строго внутри соответствующей `.p3d` root-коллекции.
+- При создании `Memory` рядом с Plain Axis он привязывается через constraint выбранного target object, а не через случайный LOD.
+- `Delete All Plain Axes` возвращает объекты из собранной сцены обратно в их обычные позиции и больше не bake-ит собранное положение.
+- Перед удалением Plain Axis автоматически ремонтируются `Memory` constraints, чтобы свежесозданные snap points возвращались вместе со своим `Resolution 0`.
+- Патч A3OB `.p3d` file handler стал безопаснее: class unregister/register выполняется аккуратнее, чтобы drop handler стабильно обновлялся.
+- Управление видимостью коллекций стало надёжнее за счёт синхронизации `hide_viewport` и layer collection state.
+
+### Исправлено
+- Исправлен случай, когда snap points оставались в собранной сцене после удаления Plain Axis.
+- Исправлен случай, когда `Memory` LOD возвращался по другой траектории из-за inverse matrix от неправильного LOD.
+- Исправлено скрытие `Point clouds > Memory` в режиме `Visual 0 Only`.
+- Исправлены случаи, где Blender мог держать старый A3OB drop handler.
+
+### Проверено
+- `python -m py_compile` проходит для:
+  - `NH_Blender.py`;
+  - `NH_Blender/__init__.py`.
+- На `pripyat_sportCenter.blend` проверен workflow Plain Axis/Snap Points:
+  - repaired `7` Memory LOD Plain Axis constraints;
+  - removed `7` Plain Axis helper(s);
+  - removed `63` `NH Plain Axis` constraints;
+  - snap point delta относительно своего `Resolution 0`: `0.0`.
+- Аддон задеплоен в Blender `5.1`.
+
 ## [0.5.2.10] - 2026-05-21
 
 ### Добавлено
