@@ -1,7 +1,7 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Daryl and Enisam",
-    "version": (0, 5, 2, 31),
+    "version": (0, 5, 3, 0),
     "blender": (5, 1, 1),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "All-in-one Blender toolkit for porting and preparing DayZ/Arma assets: fixes, textures, colliders, proxies, snap points, and P3D workflow helpers.",    
@@ -29,6 +29,8 @@ import json
 import sys
 from contextlib import contextmanager
 import uuid
+import hashlib
+import tempfile
 
 # ------------------------------------------------------------------------
 #  Global config storage
@@ -65,7 +67,7 @@ _LINKED_PICK_CONFLICT_KEYMAPS = {
     "3D View Generic",
 }
 _PERSISTED_UI_STATE_FILENAME = "nh_blender_ui_state.json"
-_PERSISTED_UI_STATE_VERSION = 2
+_PERSISTED_UI_STATE_VERSION = 3
 _PERSISTED_UI_STATE_TIMER_INTERVAL = 1.0
 _PERSISTED_UI_STATE_CACHE = None
 _PERSISTED_UI_FORCE_RESTORE_SETTINGS = {"cray_texreplace_settings"}
@@ -169,6 +171,8 @@ _PERSISTED_UI_SETTINGS = {
         "write_expected_missing_paths",
         "source_textures_folder",
         "target_textures_folder",
+        "texture_cache_source_folder",
+        "texture_cache_workers",
         "texture_tools_folder",
         "convert_dds_to_png",
         "dds_backend",
@@ -210,8 +214,25 @@ _PERSISTED_UI_SETTINGS = {
     ),
     "cray_asset_library_settings": (
         "folder",
+        "common_root",
+        "environment_root",
         "import_first_lod_only",
         "clear_previous_temp_library",
+        "rebuild_existing_libraries",
+        "render_textured_previews",
+    ),
+    "cray_ui_panel_settings": (
+        "show_snap_points",
+        "show_asset_library",
+        "show_fixes",
+        "show_import_export",
+        "show_model_split",
+        "show_texture_replace",
+        "show_collider",
+        "show_geometry_lods",
+        "show_object_builder",
+        "show_cache_manager",
+        "show_custom_keybinds",
     ),
 }
 
@@ -535,6 +556,10 @@ def _register_addon_keymap_item(keymap, operator_idname, *, event_type, value="P
     for existing in list(keymap.keymap_items):
         if getattr(existing, "idname", "") != operator_idname:
             continue
+        if getattr(existing, "type", None) != event_type or getattr(existing, "value", None) != value:
+            continue
+        if any(bool(getattr(existing, key, False)) != bool(mods.get(key, False)) for key in ("shift", "ctrl", "alt", "oskey")):
+            continue
         try:
             keymap.keymap_items.remove(existing)
         except Exception:
@@ -546,6 +571,19 @@ def _register_addon_keymap_item(keymap, operator_idname, *, event_type, value="P
             setattr(kmi.properties, prop_name, prop_value)
     _ADDON_KEYMAP_ITEMS.append((keymap, kmi))
     return kmi
+
+
+def _remove_addon_keymap_items_for_operators(keymap, operator_ids):
+    operator_ids = set(operator_ids or ())
+    if not operator_ids:
+        return
+    for existing in list(keymap.keymap_items):
+        if getattr(existing, "idname", "") not in operator_ids:
+            continue
+        try:
+            keymap.keymap_items.remove(existing)
+        except Exception:
+            pass
 
 
 def _register_collider_keymaps():
@@ -565,6 +603,16 @@ def _register_collider_keymaps():
     if keymap is None:
         keymap = addon_keyconfig.keymaps.new(name=_MESH_KEYMAP_NAME, space_type="EMPTY", region_type="WINDOW")
 
+    _remove_addon_keymap_items_for_operators(
+        keymap,
+        {
+            "cray.copy_selected_verts_to_geometry",
+            "cray.select_isolated_vertices",
+            "cray.build_collider",
+            "cray.create_plain_axis_pivot",
+        },
+    )
+
     _register_addon_keymap_item(
         keymap,
         "cray.copy_selected_verts_to_geometry",
@@ -576,19 +624,25 @@ def _register_collider_keymaps():
     _register_addon_keymap_item(
         keymap,
         "cray.select_isolated_vertices",
+        event_type="X",
+        value="PRESS",
+        ctrl=True,
+        shift=True,
+    )
+    _register_addon_keymap_item(
+        keymap,
+        "cray.build_collider",
+        event_type="BUTTON4MOUSE",
+        value="PRESS",
+        properties={"build_mode": "SELECTION_HULL"},
+    )
+    _register_addon_keymap_item(
+        keymap,
+        "cray.build_collider",
         event_type="BUTTON5MOUSE",
         value="PRESS",
+        properties={"build_mode": "SELECTION_BOX"},
     )
-    if _mesh_shortcut_is_free(window_manager, event_type="BUTTON4MOUSE", value="PRESS"):
-        _register_addon_keymap_item(
-            keymap,
-            "cray.build_collider",
-            event_type="BUTTON4MOUSE",
-            value="PRESS",
-            properties={"build_mode": "SELECTION_HULL"},
-        )
-    else:
-        print("[NH Plugin] Mouse4 is already in use, skipping Selection -> Hull shortcut.")
 
     if _mesh_shortcut_is_free(window_manager, event_type="P", value="PRESS", ctrl=True, shift=True):
         _register_addon_keymap_item(
@@ -1962,6 +2016,78 @@ class CRAY_PG_ColliderExpSettings(PropertyGroup):
         precision=5,
         unit="LENGTH",
     )
+
+
+_UI_PANEL_LAYOUT_DEFINITIONS = (
+    ("snap_points", "Snap Points", "CRAY_PT_SnapPointsPanel"),
+    ("asset_library", "P3D Asset Library", "CRAY_PT_AssetProxyPanel"),
+    ("fixes", "Fixes", "CRAY_PT_FixesPanel"),
+    ("import_export", "Import/Export planner", "CRAY_PT_ImportExportPlannerPanel"),
+    ("model_split", "Model Split", "CRAY_PT_ModelSplitPanel"),
+    ("texture_replace", "Texture Replace", "CRAY_PT_TextureReplacePanel"),
+    ("collider", "Collider", "CRAY_PT_ColliderExpPanel"),
+    ("geometry_lods", "Geometry LODs", "CRAY_PT_ColliderPanel"),
+    ("object_builder", "Object Builder / Clutter", "CRAY_PT_ClutterProxiesPanel"),
+    ("cache_manager", "Cache Manager", "CRAY_PT_CacheManagerPanel"),
+)
+
+
+_CUSTOM_KEYBIND_DEFINITIONS = (
+    ("Ctrl+Shift+C", "Copy Selected Verts To Geometry", None),
+    ("Ctrl+Shift+X", "Select Isolated Verts", None),
+    ("Mouse4", "Selection -> Hull", None),
+    ("Mouse5", "Selection -> Box", None),
+    ("Ctrl+Shift+P", "Create Plain Axis Pivot", "plain_axis"),
+)
+
+
+def _ui_panel_settings_from_context(context):
+    scene = getattr(context, "scene", None) if context is not None else None
+    return getattr(scene, "cray_ui_panel_settings", None) if scene is not None else None
+
+
+def _is_ui_panel_visible(context, key: str) -> bool:
+    settings = _ui_panel_settings_from_context(context)
+    if settings is None:
+        return True
+    return bool(getattr(settings, f"show_{key}", True))
+
+
+def _tag_ui_redraw(context=None):
+    try:
+        wm = getattr(bpy.context, "window_manager", None)
+        windows = getattr(wm, "windows", []) if wm is not None else []
+        for window in windows:
+            screen = getattr(window, "screen", None)
+            for area in getattr(screen, "areas", []) or []:
+                if getattr(area, "type", None) == "VIEW_3D":
+                    area.tag_redraw()
+    except Exception:
+        pass
+    try:
+        area = getattr(context, "area", None) if context is not None else None
+        if area is not None:
+            area.tag_redraw()
+    except Exception:
+        pass
+
+
+def _on_ui_panel_layout_setting_changed(self, context):
+    _tag_ui_redraw(context)
+
+
+class CRAY_PG_UIPanelSettings(PropertyGroup):
+    show_snap_points: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_asset_library: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_fixes: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_import_export: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_model_split: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_texture_replace: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_collider: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_geometry_lods: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_object_builder: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_cache_manager: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_custom_keybinds: BoolProperty(name="Custom Keybinds", description="Показывать список кастомных хоткеев аддона", default=False, update=_on_ui_panel_layout_setting_changed)
 
 
 # ------------------------------------------------------------------------
@@ -4618,7 +4744,7 @@ def _is_auto_reusable_collider_target(obj, lod_token=None) -> bool:
     )
 
 
-def _pick_collider_lod_object(context, source_obj, lod_token):
+def _pick_collider_lod_object(context, source_obj, lod_token, exclude_obj=None):
     expected_name = _collider_lod_name(lod_token)
 
     parent = _preferred_collider_parent_collection(context, source_obj)
@@ -4631,10 +4757,12 @@ def _pick_collider_lod_object(context, source_obj, lod_token):
         return None
 
     direct = collider_collection.objects.get(expected_name)
-    if _is_auto_reusable_collider_target(direct, lod_token=lod_token):
+    if direct != exclude_obj and _is_auto_reusable_collider_target(direct, lod_token=lod_token):
         return direct
 
     for obj in collider_collection.objects:
+        if obj == exclude_obj:
+            continue
         if _is_auto_reusable_collider_target(obj, lod_token=lod_token):
             return obj
 
@@ -5085,18 +5213,20 @@ def _is_existing_collider_target_for_lod(obj, lod_token) -> bool:
     expected_name = _logical_collection_name(_collider_lod_name(lod_token))
     return _logical_collection_name(getattr(obj, "name", "") or "") == expected_name
 
-def _ensure_collider_lod_object(context, source_obj, lod_token, preferred_obj=None):
+def _ensure_collider_lod_object(context, source_obj, lod_token, preferred_obj=None, exclude_obj=None):
     collider_collection = _ensure_collider_collection(context, source_obj)
     if collider_collection is None:
         collider_collection = context.scene.collection
 
     if (
+        preferred_obj != exclude_obj
+        and
         _is_existing_collider_target_for_lod(preferred_obj, lod_token)
         and _collection_directly_contains_object(collider_collection, preferred_obj)
     ):
         target_obj = preferred_obj
     else:
-        target_obj = _pick_collider_lod_object(context, source_obj, lod_token)
+        target_obj = _pick_collider_lod_object(context, source_obj, lod_token, exclude_obj=exclude_obj)
 
     if target_obj is None:
         obj_name = _collider_lod_name(lod_token)
@@ -6338,8 +6468,9 @@ class CRAY_OT_ColliderHotkeysInfo(Operator):
         del context, properties
         return (
             "Ctrl+Shift+C: Copy Selected Verts To Geometry\n"
-            "Mouse5: Select Isolated Verts\n"
-            "Mouse4: Selection -> Hull"
+            "Ctrl+Shift+X: Select Isolated Verts\n"
+            "Mouse4: Selection -> Hull\n"
+            "Mouse5: Selection -> Box"
         )
 
     def execute(self, context):
@@ -7612,6 +7743,28 @@ def _set_collider_exp_settings_object_exp(context, obj):
     _tag_redraw_all_areas(context)
 
 
+def _sanitize_collider_exp_geometry_object_exp(context, settings=None):
+    settings = settings or _collider_exp_settings_exp(context)
+    if settings is None:
+        return None
+
+    target_obj = getattr(settings, "geometry_object", None)
+    target_lod = str(getattr(settings, "target_lod", "6") or "6")
+    if target_obj is None or _is_existing_collider_target_for_lod(target_obj, target_lod):
+        return target_obj
+
+    try:
+        settings.geometry_object = None
+    except Exception:
+        pass
+    try:
+        context.view_layer.update()
+    except Exception:
+        pass
+    _tag_redraw_all_areas(context)
+    return None
+
+
 def _copy_collider_exp_settings_to_operator_exp(op, settings, prop_names=None):
     if op is None or settings is None:
         return
@@ -7715,11 +7868,9 @@ def _draw_collider_exp_guide_conversion_panel_exp(layout, op):
 def _resolve_collider_exp_source_object_exp(context, preferred_obj=None):
     active = getattr(getattr(context, "view_layer", None), "objects", None)
     active_obj = getattr(active, "active", None) if active is not None else None
-    settings = _collider_exp_settings_exp(context)
-    target_obj = getattr(settings, "geometry_object", None) if settings is not None else None
 
     def _is_valid_source(obj):
-        return obj is not None and obj.type == "MESH" and obj != target_obj
+        return obj is not None and obj.type == "MESH"
 
     if _is_valid_source(active_obj) and active_obj.mode == "EDIT":
         return active_obj
@@ -7745,7 +7896,11 @@ def _ensure_collider_exp_target_object_exp(context, settings, source_obj, op=Non
         raise RuntimeError("Experimental collider settings are unavailable")
 
     lod_token = str(getattr(op, "target_lod", getattr(settings, "target_lod", "6")) or "6")
-    preferred_obj = getattr(settings, "geometry_object", None)
+    preferred_obj = _sanitize_collider_exp_geometry_object_exp(context, settings)
+    if preferred_obj == source_obj:
+        preferred_obj = None
+    if not _is_existing_collider_target_for_lod(preferred_obj, lod_token):
+        preferred_obj = None
     err = _collider_target_validation_error(preferred_obj, lod_token, source_obj=source_obj)
     if err:
         raise RuntimeError(err)
@@ -7755,6 +7910,7 @@ def _ensure_collider_exp_target_object_exp(context, settings, source_obj, op=Non
         source_obj,
         lod_token,
         preferred_obj=preferred_obj,
+        exclude_obj=source_obj,
     )
     _set_collider_exp_settings_object_exp(context, target_obj)
     try:
@@ -7886,28 +8042,77 @@ def _selected_local_points_and_faces_exp(source_obj):
         raise RuntimeError("Select vertices, edges or faces on the source mesh")
 
     face_centers = []
+    face_normals = []
+    edge_vectors = []
+
+    def _add_edge_vector(v0, v1):
+        vec = v1.co - v0.co
+        if vec.length_squared > 1e-12:
+            edge_vectors.append(vec.copy())
+
+    selected_vert_set = set(selected_verts)
+    for edge in bm.edges:
+        if not edge.is_valid or len(edge.verts) != 2:
+            continue
+        if all(vert.is_valid and vert in selected_vert_set for vert in edge.verts):
+            _add_edge_vector(edge.verts[0], edge.verts[1])
+
+    for edge in selected_edges:
+        if edge.is_valid and len(edge.verts) == 2 and all(vert.is_valid for vert in edge.verts):
+            _add_edge_vector(edge.verts[0], edge.verts[1])
+
     for face in selected_faces:
         if face.is_valid and face.verts:
             face_centers.append(sum((vert.co for vert in face.verts), Vector((0.0, 0.0, 0.0))) / len(face.verts))
+            if face.normal.length_squared > 1e-12:
+                face_normals.append(face.normal.copy())
+            verts = [vert for vert in face.verts if vert.is_valid]
+            for idx, vert in enumerate(verts):
+                _add_edge_vector(vert, verts[(idx + 1) % len(verts)])
 
-    return [vert.co.copy() for vert in selected_verts], face_centers
+    return [vert.co.copy() for vert in selected_verts], face_centers, edge_vectors, face_normals
 
 
-def _object_local_face_centers_exp(source_obj):
+def _object_local_topology_exp(source_obj):
     mesh = source_obj.data
     centers = []
+    edge_vectors = []
+    face_normals = []
     vertices = mesh.vertices
+
+    for edge in mesh.edges:
+        a, b = edge.vertices
+        if 0 <= a < len(vertices) and 0 <= b < len(vertices):
+            vec = vertices[b].co - vertices[a].co
+            if vec.length_squared > 1e-12:
+                edge_vectors.append(vec.copy())
+
     for poly in mesh.polygons:
         if not poly.vertices:
             continue
         center = Vector((0.0, 0.0, 0.0))
         count = 0
+        valid_vertices = []
         for idx in poly.vertices:
             if 0 <= idx < len(vertices):
-                center += vertices[idx].co
+                vertex = vertices[idx]
+                center += vertex.co
+                valid_vertices.append(vertex)
                 count += 1
         if count:
             centers.append(center / count)
+        if poly.normal.length_squared > 1e-12:
+            face_normals.append(poly.normal.copy())
+        if not mesh.edges and len(valid_vertices) >= 2:
+            for idx, vertex in enumerate(valid_vertices):
+                vec = valid_vertices[(idx + 1) % len(valid_vertices)].co - vertex.co
+                if vec.length_squared > 1e-12:
+                    edge_vectors.append(vec.copy())
+    return centers, edge_vectors, face_normals
+
+
+def _object_local_face_centers_exp(source_obj):
+    centers, _edge_vectors, _face_normals = _object_local_topology_exp(source_obj)
     return centers
 
 
@@ -7917,13 +8122,15 @@ def _collect_collider_exp_input_data_exp(context, source_obj, *, bounds_only=Fal
 
     matrix_world = source_obj.matrix_world.copy()
     face_centers = []
+    edge_vectors = []
+    face_normals = []
     if source_obj.mode == "EDIT":
-        local_points, face_centers = _selected_local_points_and_faces_exp(source_obj)
+        local_points, face_centers, edge_vectors, face_normals = _selected_local_points_and_faces_exp(source_obj)
     elif bounds_only:
         local_points = [Vector(corner) for corner in source_obj.bound_box]
     else:
         local_points = [vert.co.copy() for vert in source_obj.data.vertices]
-        face_centers = _object_local_face_centers_exp(source_obj)
+        face_centers, edge_vectors, face_normals = _object_local_topology_exp(source_obj)
         if not local_points:
             local_points = [Vector(corner) for corner in source_obj.bound_box]
 
@@ -7936,7 +8143,10 @@ def _collect_collider_exp_input_data_exp(context, source_obj, *, bounds_only=Fal
         "source_obj": source_obj,
         "matrix_world": matrix_world,
         "local_points": local_points,
+        "world_points": [point.copy() for point in world_points],
         "face_centers_local": face_centers,
+        "edge_vectors_local": [vec.copy() for vec in edge_vectors],
+        "face_normals_local": [normal.copy() for normal in face_normals],
         "min": min_v,
         "max": max_v,
         "center": (min_v + max_v) * 0.5,
@@ -7958,7 +8168,10 @@ def _collider_exp_data_from_local_points_exp(source_obj, local_points, *, face_c
         "source_obj": source_obj,
         "matrix_world": matrix_world,
         "local_points": [point.copy() for point in local_points],
+        "world_points": [point.copy() for point in world_points],
         "face_centers_local": list(face_centers or []),
+        "edge_vectors_local": [],
+        "face_normals_local": [],
         "min": min_v,
         "max": max_v,
         "center": (min_v + max_v) * 0.5,
@@ -7972,25 +8185,37 @@ def _collider_exp_all_object_data_exp(source_obj):
         raise RuntimeError("Source Object must be a mesh")
 
     face_centers = []
+    edge_vectors = []
+    face_normals = []
     if source_obj.mode == "EDIT":
         bm = bmesh.from_edit_mesh(source_obj.data)
         bm.verts.ensure_lookup_table()
         bm.faces.ensure_lookup_table()
         local_points = [vert.co.copy() for vert in bm.verts if vert.is_valid]
+        for edge in bm.edges:
+            if edge.is_valid and len(edge.verts) == 2 and all(vert.is_valid for vert in edge.verts):
+                vec = edge.verts[1].co - edge.verts[0].co
+                if vec.length_squared > 1e-12:
+                    edge_vectors.append(vec.copy())
         for face in bm.faces:
             if face.is_valid and face.verts:
                 face_centers.append(sum((vert.co for vert in face.verts), Vector((0.0, 0.0, 0.0))) / len(face.verts))
+                if face.normal.length_squared > 1e-12:
+                    face_normals.append(face.normal.copy())
     else:
         local_points = [vert.co.copy() for vert in source_obj.data.vertices]
-        face_centers = _object_local_face_centers_exp(source_obj)
+        face_centers, edge_vectors, face_normals = _object_local_topology_exp(source_obj)
         if not local_points:
             local_points = [Vector(corner) for corner in source_obj.bound_box]
 
-    return _collider_exp_data_from_local_points_exp(source_obj, local_points, face_centers=face_centers)
+    data = _collider_exp_data_from_local_points_exp(source_obj, local_points, face_centers=face_centers)
+    data["edge_vectors_local"] = [vec.copy() for vec in edge_vectors]
+    data["face_normals_local"] = [normal.copy() for normal in face_normals]
+    return data
 
 
 def _collider_exp_selected_source_objects_exp(context, settings):
-    target_obj = getattr(settings, "geometry_object", None) if settings is not None else None
+    target_obj = _sanitize_collider_exp_geometry_object_exp(context, settings)
     active = getattr(getattr(context, "view_layer", None), "objects", None)
     active_obj = getattr(active, "active", None) if active is not None else None
 
@@ -8315,32 +8540,373 @@ def _transform_collider_exp_local_points_exp(data, op):
     return world_points
 
 
+def _collider_exp_data_world_points_exp(data):
+    points = data.get("world_points") or []
+    if points:
+        return [point.copy() for point in points]
+    matrix_world = data["matrix_world"]
+    return [matrix_world @ point for point in data.get("local_points", [])]
+
+
+def _collider_exp_safe_normalized_exp(vec):
+    if vec is None:
+        return None
+    try:
+        if vec.length_squared <= 1e-12:
+            return None
+        out = vec.copy()
+        out.normalize()
+        if all(math.isfinite(float(out[axis])) for axis in range(3)):
+            return out
+    except Exception:
+        return None
+    return None
+
+
+def _collider_exp_orthogonal_axis_exp(axis):
+    axis = _collider_exp_safe_normalized_exp(axis) or Vector((0.0, 0.0, 1.0))
+    candidates = (
+        Vector((1.0, 0.0, 0.0)),
+        Vector((0.0, 1.0, 0.0)),
+        Vector((0.0, 0.0, 1.0)),
+    )
+    seed = min(candidates, key=lambda candidate: abs(axis.dot(candidate)))
+    ortho = seed - axis * seed.dot(axis)
+    return _collider_exp_safe_normalized_exp(ortho) or Vector((1.0, 0.0, 0.0))
+
+
+def _collider_exp_matrix_basis_world_exp(matrix_world):
+    mat3 = matrix_world.to_3x3()
+    axis_x = _collider_exp_safe_normalized_exp(mat3 @ Vector((1.0, 0.0, 0.0)))
+    if axis_x is None:
+        axis_x = Vector((1.0, 0.0, 0.0))
+
+    raw_y = mat3 @ Vector((0.0, 1.0, 0.0))
+    axis_y = _collider_exp_safe_normalized_exp(raw_y - axis_x * raw_y.dot(axis_x))
+    if axis_y is None:
+        axis_y = _collider_exp_orthogonal_axis_exp(axis_x)
+
+    axis_z = _collider_exp_safe_normalized_exp(axis_x.cross(axis_y))
+    if axis_z is None:
+        axis_z = Vector((0.0, 0.0, 1.0))
+        axis_y = _collider_exp_safe_normalized_exp(axis_z.cross(axis_x)) or axis_y
+
+    raw_z = _collider_exp_safe_normalized_exp(mat3 @ Vector((0.0, 0.0, 1.0)))
+    if raw_z is not None and axis_z.dot(raw_z) < 0.0:
+        axis_y = -axis_y
+        axis_z = -axis_z
+
+    return axis_x, axis_y, axis_z
+
+
+def _collider_exp_world_normal_from_data_exp(data, world_points):
+    matrix_world = data["matrix_world"]
+    try:
+        normal_matrix = matrix_world.to_3x3().inverted_safe().transposed()
+    except Exception:
+        normal_matrix = matrix_world.to_3x3()
+
+    normal = None
+    for local_normal in data.get("face_normals_local", []) or []:
+        world_normal = _collider_exp_safe_normalized_exp(normal_matrix @ local_normal)
+        if world_normal is None:
+            continue
+        if normal is None:
+            normal = world_normal.copy()
+        elif normal.dot(world_normal) < 0.0:
+            normal -= world_normal
+        else:
+            normal += world_normal
+
+    normal = _collider_exp_safe_normalized_exp(normal)
+    if normal is not None:
+        return normal
+    return _estimate_world_points_normal(world_points)
+
+
+def _collider_exp_project_axis_on_plane_exp(axis, normal):
+    projected = axis - normal * axis.dot(normal)
+    return _collider_exp_safe_normalized_exp(projected)
+
+
+def _collider_exp_add_parallel_unique_axis_exp(axes, axis):
+    axis = _collider_exp_safe_normalized_exp(axis)
+    if axis is None:
+        return
+    for existing in axes:
+        if abs(existing.dot(axis)) > 0.999:
+            return
+    axes.append(axis)
+
+
+def _collider_exp_plane_basis_exp(normal, fallback_basis):
+    normal = _collider_exp_safe_normalized_exp(normal) or Vector((0.0, 0.0, 1.0))
+    axis_u = None
+    for fallback_axis in fallback_basis:
+        axis_u = _collider_exp_project_axis_on_plane_exp(fallback_axis, normal)
+        if axis_u is not None:
+            break
+    if axis_u is None:
+        axis_u = _collider_exp_orthogonal_axis_exp(normal)
+    axis_v = _collider_exp_safe_normalized_exp(normal.cross(axis_u))
+    if axis_v is None:
+        axis_v = _collider_exp_orthogonal_axis_exp(axis_u)
+    return axis_u, axis_v
+
+
+def _collider_exp_projected_unique_2d_points_exp(world_points, axis_u, axis_v, tolerance=1e-6):
+    scale = 1.0 / max(float(tolerance), 1e-12)
+    seen = set()
+    points = []
+    for point in world_points:
+        u = float(point.dot(axis_u))
+        v = float(point.dot(axis_v))
+        key = (round(u * scale), round(v * scale))
+        if key in seen:
+            continue
+        seen.add(key)
+        points.append((u, v))
+    points.sort()
+    return points
+
+
+def _collider_exp_cross_2d_exp(origin, a, b):
+    return (a[0] - origin[0]) * (b[1] - origin[1]) - (a[1] - origin[1]) * (b[0] - origin[0])
+
+
+def _collider_exp_convex_hull_2d_exp(points):
+    if len(points) <= 1:
+        return list(points)
+
+    lower = []
+    for point in points:
+        while len(lower) >= 2 and _collider_exp_cross_2d_exp(lower[-2], lower[-1], point) <= 1e-12:
+            lower.pop()
+        lower.append(point)
+
+    upper = []
+    for point in reversed(points):
+        while len(upper) >= 2 and _collider_exp_cross_2d_exp(upper[-2], upper[-1], point) <= 1e-12:
+            upper.pop()
+        upper.append(point)
+
+    hull = lower[:-1] + upper[:-1]
+    return hull if hull else list(points)
+
+
+def _collider_exp_axis_from_2d_delta_exp(axis_u, axis_v, delta_u, delta_v):
+    return _collider_exp_safe_normalized_exp(axis_u * float(delta_u) + axis_v * float(delta_v))
+
+
+def _collider_exp_best_planar_box_axis_exp(data, world_points, normal, fallback_basis):
+    del data
+    basis_u, basis_v = _collider_exp_plane_basis_exp(normal, fallback_basis)
+    points_2d = _collider_exp_projected_unique_2d_points_exp(world_points, basis_u, basis_v)
+    if len(points_2d) <= 1:
+        return basis_u
+
+    hull = _collider_exp_convex_hull_2d_exp(points_2d)
+    axes = []
+    if len(hull) == 2:
+        axis = _collider_exp_axis_from_2d_delta_exp(
+            basis_u,
+            basis_v,
+            hull[1][0] - hull[0][0],
+            hull[1][1] - hull[0][1],
+        )
+        _collider_exp_add_parallel_unique_axis_exp(axes, axis)
+    else:
+        for idx, point in enumerate(hull):
+            nxt = hull[(idx + 1) % len(hull)]
+            axis = _collider_exp_axis_from_2d_delta_exp(
+                basis_u,
+                basis_v,
+                nxt[0] - point[0],
+                nxt[1] - point[1],
+            )
+            _collider_exp_add_parallel_unique_axis_exp(axes, axis)
+
+    best_axis = None
+    best_score = None
+    for axis_u in axes:
+        axis_v = _collider_exp_safe_normalized_exp(normal.cross(axis_u))
+        if axis_v is None:
+            continue
+        u_values = [point.dot(axis_u) for point in world_points]
+        v_values = [point.dot(axis_v) for point in world_points]
+        span_u = max(u_values) - min(u_values)
+        span_v = max(v_values) - min(v_values)
+        score = (span_u * span_v, span_u + span_v)
+        if best_score is None or score < best_score:
+            best_score = score
+            best_axis = axis_u
+
+    if best_axis is not None:
+        return best_axis
+    return _collider_exp_orthogonal_axis_exp(normal)
+
+
+def _collider_exp_box_axis_candidates_from_data_exp(data, fallback_basis, max_axes=48):
+    axes = []
+    mat3 = data["matrix_world"].to_3x3()
+
+    edge_vectors = []
+    for local_edge in data.get("edge_vectors_local", []) or []:
+        try:
+            length_sq = float(local_edge.length_squared)
+        except Exception:
+            length_sq = 0.0
+        if length_sq > 1e-12:
+            edge_vectors.append((length_sq, local_edge))
+
+    for _length_sq, local_edge in sorted(edge_vectors, key=lambda item: item[0], reverse=True):
+        _collider_exp_add_parallel_unique_axis_exp(axes, mat3 @ local_edge)
+        if len(axes) >= max_axes:
+            break
+
+    try:
+        normal_matrix = mat3.inverted_safe().transposed()
+    except Exception:
+        normal_matrix = mat3
+    for local_normal in data.get("face_normals_local", []) or []:
+        _collider_exp_add_parallel_unique_axis_exp(axes, normal_matrix @ local_normal)
+        if len(axes) >= max_axes:
+            break
+
+    for fallback_axis in fallback_basis:
+        _collider_exp_add_parallel_unique_axis_exp(axes, fallback_axis)
+
+    return axes
+
+
+def _collider_exp_box_basis_score_exp(world_points, axis_u, axis_v, axis_w):
+    u_values = [point.dot(axis_u) for point in world_points]
+    v_values = [point.dot(axis_v) for point in world_points]
+    w_values = [point.dot(axis_w) for point in world_points]
+    span_u = max(u_values) - min(u_values)
+    span_v = max(v_values) - min(v_values)
+    span_w = max(w_values) - min(w_values)
+    volume = max(span_u, 0.0) * max(span_v, 0.0) * max(span_w, 0.0)
+    surface = (
+        max(span_u, 0.0) * max(span_v, 0.0)
+        + max(span_u, 0.0) * max(span_w, 0.0)
+        + max(span_v, 0.0) * max(span_w, 0.0)
+    )
+    longest = max(span_u, span_v, span_w)
+    return volume, surface, longest
+
+
+def _collider_exp_best_oriented_box_frame_exp(data, world_points, fallback_basis):
+    axes = _collider_exp_box_axis_candidates_from_data_exp(data, fallback_basis)
+    if len(axes) < 2:
+        return fallback_basis
+
+    best_basis = None
+    best_score = None
+    for idx, axis_u in enumerate(axes):
+        axis_u = _collider_exp_safe_normalized_exp(axis_u)
+        if axis_u is None:
+            continue
+        for axis_candidate in axes[idx + 1:]:
+            axis_v = axis_candidate - axis_u * axis_candidate.dot(axis_u)
+            axis_v = _collider_exp_safe_normalized_exp(axis_v)
+            if axis_v is None:
+                continue
+            axis_w = _collider_exp_safe_normalized_exp(axis_u.cross(axis_v))
+            if axis_w is None:
+                continue
+            score = _collider_exp_box_basis_score_exp(world_points, axis_u, axis_v, axis_w)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_basis = (axis_u, axis_v, axis_w)
+
+    return best_basis or fallback_basis
+
+
+def _collider_exp_box_frame_from_data_exp(data):
+    world_points = _dedupe_world_points(_collider_exp_data_world_points_exp(data))
+    if not world_points:
+        raise RuntimeError("No source points available to build a box")
+
+    axis_x, axis_y, axis_z = _collider_exp_matrix_basis_world_exp(data["matrix_world"])
+    if len(world_points) == 1:
+        return world_points, axis_x, axis_y, axis_z
+
+    if len(world_points) == 2:
+        axis_u = _collider_exp_safe_normalized_exp(world_points[1] - world_points[0])
+        axis_v = None
+        if axis_u is not None:
+            for fallback_axis in (axis_x, axis_y, axis_z):
+                axis_v = _collider_exp_safe_normalized_exp(
+                    fallback_axis - axis_u * fallback_axis.dot(axis_u)
+                )
+                if axis_v is not None:
+                    break
+        if axis_u is not None and axis_v is not None:
+            axis_w = _collider_exp_safe_normalized_exp(axis_u.cross(axis_v))
+            if axis_w is not None:
+                return world_points, axis_u, axis_v, axis_w
+
+    normal = _collider_exp_world_normal_from_data_exp(data, world_points)
+    if normal is not None:
+        min_w, max_w = _bounds_from_points_exp(world_points)
+        flat_epsilon = max(1e-5, (max_w - min_w).length * 1e-5)
+        if len(world_points) <= 3 or _points_are_flat(world_points, normal, epsilon=flat_epsilon):
+            axis_w = normal
+            axis_u = _collider_exp_best_planar_box_axis_exp(
+                data,
+                world_points,
+                axis_w,
+                (axis_x, axis_y, axis_z),
+            )
+            axis_v = _collider_exp_safe_normalized_exp(axis_w.cross(axis_u))
+            if axis_v is not None:
+                return world_points, axis_u, axis_v, axis_w
+
+    axis_u, axis_v, axis_w = _collider_exp_best_oriented_box_frame_exp(
+        data,
+        world_points,
+        (axis_x, axis_y, axis_z),
+    )
+    return world_points, axis_u, axis_v, axis_w
+
+
 def _box_vertices_from_bounds_data_exp(data, op):
-    min_v, max_v = data["min"], data["max"]
-    center = (min_v + max_v) * 0.5
-    size = max_v - min_v
+    world_points, axis_u, axis_v, axis_w = _collider_exp_box_frame_from_data_exp(data)
+    u_values = [point.dot(axis_u) for point in world_points]
+    v_values = [point.dot(axis_v) for point in world_points]
+    w_values = [point.dot(axis_w) for point in world_points]
+    min_u, max_u = min(u_values), max(u_values)
+    min_v, max_v = min(v_values), max(v_values)
+    min_w, max_w = min(w_values), max(w_values)
+
     minimum_size = max(float(getattr(op, "minimum_size", 0.0)), 1e-6)
     scale_vec = _collider_exp_scale_vec_exp(op)
     offset_vec = _collider_exp_vec_from_props_exp(op, "offset")
     half = Vector((
-        max(size.x, minimum_size) * scale_vec.x * 0.5,
-        max(size.y, minimum_size) * scale_vec.y * 0.5,
-        max(size.z, minimum_size) * scale_vec.z * 0.5,
+        max(max_u - min_u, minimum_size) * scale_vec.x * 0.5,
+        max(max_v - min_v, minimum_size) * scale_vec.y * 0.5,
+        max(max_w - min_w, minimum_size) * scale_vec.z * 0.5,
     ))
-    matrix_world = data["matrix_world"]
 
-    local_center = center + offset_vec
-    local_verts = [
-        local_center + Vector((-half.x, -half.y, -half.z)),
-        local_center + Vector(( half.x, -half.y, -half.z)),
-        local_center + Vector(( half.x,  half.y, -half.z)),
-        local_center + Vector((-half.x,  half.y, -half.z)),
-        local_center + Vector((-half.x, -half.y,  half.z)),
-        local_center + Vector(( half.x, -half.y,  half.z)),
-        local_center + Vector(( half.x,  half.y,  half.z)),
-        local_center + Vector((-half.x,  half.y,  half.z)),
+    center = (
+        axis_u * ((min_u + max_u) * 0.5)
+        + axis_v * ((min_v + max_v) * 0.5)
+        + axis_w * ((min_w + max_w) * 0.5)
+        + axis_u * offset_vec.x
+        + axis_v * offset_vec.y
+        + axis_w * offset_vec.z
+    )
+    world_verts = [
+        center - axis_u * half.x - axis_v * half.y - axis_w * half.z,
+        center + axis_u * half.x - axis_v * half.y - axis_w * half.z,
+        center + axis_u * half.x + axis_v * half.y - axis_w * half.z,
+        center - axis_u * half.x + axis_v * half.y - axis_w * half.z,
+        center - axis_u * half.x - axis_v * half.y + axis_w * half.z,
+        center + axis_u * half.x - axis_v * half.y + axis_w * half.z,
+        center + axis_u * half.x + axis_v * half.y + axis_w * half.z,
+        center - axis_u * half.x + axis_v * half.y + axis_w * half.z,
     ]
-    world_verts = [matrix_world @ point for point in local_verts]
     if bool(getattr(op, "floor_contact", False)) and world_verts:
         current_floor_z = min(point.z for point in world_verts)
         delta_z = float(data.get("world_floor_z", current_floor_z)) - current_floor_z
@@ -14249,9 +14815,328 @@ def _resolve_a3ob_texture_path(texture_path: str) -> str:
 
     return ""
 
+def _nh_blender_shared_cache_base(create=False) -> str:
+    base_dir = os.environ.get("LOCALAPPDATA") or ""
+    if not base_dir:
+        try:
+            base_dir = bpy.utils.user_resource("CONFIG") or ""
+        except Exception:
+            base_dir = ""
+    if not base_dir:
+        base_dir = bpy.app.tempdir or os.path.expanduser("~")
+    path = os.path.join(base_dir, "NH_Blender")
+    if create:
+        os.makedirs(path, exist_ok=True)
+    return path
+
+def _nh_texture_cache_root(create=False) -> str:
+    path = os.path.join(_nh_blender_shared_cache_base(create=create), _NH_TEXTURE_CACHE_FOLDER_NAME)
+    if create:
+        os.makedirs(path, exist_ok=True)
+    return path
+
+def _texture_cache_key_for_path(path_abs: str) -> str:
+    try:
+        normalized = os.path.normcase(os.path.abspath(bpy.path.abspath(path_abs))).replace("/", "\\")
+    except Exception:
+        normalized = os.path.normcase(os.path.abspath(path_abs or "")).replace("/", "\\")
+    return hashlib.sha1(normalized.encode("utf-8", errors="replace")).hexdigest()
+
 def _paa_preview_cache_path(paa_abs_path: str) -> str:
-    root, _ = os.path.splitext(paa_abs_path)
-    return root + ".png"
+    key = _texture_cache_key_for_path(paa_abs_path)
+    basename = os.path.splitext(os.path.basename(paa_abs_path or "texture"))[0] or "texture"
+    safe_basename = re.sub(r'[<>:"/\\|?*]+', "_", basename).strip(" .") or "texture"
+    folder = os.path.join(_nh_texture_cache_root(create=True), key[:2], key[2:4])
+    return os.path.join(folder, f"{safe_basename}__{key[:12]}.png")
+
+def _texture_cache_is_valid(source_abs_path: str, cache_path: str) -> bool:
+    if not source_abs_path or not cache_path or not os.path.isfile(source_abs_path) or not os.path.isfile(cache_path):
+        return False
+    try:
+        return os.path.getmtime(cache_path) >= os.path.getmtime(source_abs_path)
+    except Exception:
+        return True
+
+def _iter_paa_files_recursive(root_abs: str):
+    root_abs = os.path.abspath(bpy.path.abspath(root_abs or ""))
+    if not root_abs or not os.path.isdir(root_abs):
+        return
+    cache_root = os.path.normcase(os.path.abspath(_nh_texture_cache_root(create=False)))
+    for dirpath, dirnames, filenames in os.walk(root_abs):
+        try:
+            dirpath_abs = os.path.abspath(dirpath)
+            if os.path.normcase(dirpath_abs).startswith(cache_root):
+                dirnames[:] = []
+                continue
+        except Exception:
+            pass
+        dirnames[:] = [d for d in dirnames if d not in {"_NH_previews", "__pycache__"}]
+        for filename in filenames:
+            if os.path.splitext(filename)[1].lower() == ".paa":
+                yield os.path.join(dirpath, filename)
+
+
+def _texture_cache_worker_count(settings=None, item_count=0) -> int:
+    try:
+        configured = int(getattr(settings, "texture_cache_workers", 4) or 1)
+    except Exception:
+        configured = 4
+    try:
+        cpu_count = int(os.cpu_count() or configured or 1)
+    except Exception:
+        cpu_count = configured or 1
+    item_count = max(1, int(item_count or 1))
+    return max(1, min(configured, cpu_count, item_count, 8))
+
+
+def _chunk_sequence_evenly(items, chunk_count: int):
+    items = list(items or [])
+    chunk_count = max(1, int(chunk_count or 1))
+    return [items[idx::chunk_count] for idx in range(chunk_count) if items[idx::chunk_count]]
+
+
+def _blender_binary_for_texture_workers() -> str:
+    try:
+        binary = getattr(bpy.app, "binary_path", "") or ""
+        if binary and os.path.isfile(binary):
+            return binary
+    except Exception:
+        pass
+    return sys.executable
+
+
+def _texture_cache_worker_script_source() -> str:
+    return r'''
+import importlib.util
+import json
+import os
+import sys
+import traceback
+
+def _write_output(path, payload):
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+def main():
+    args = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else sys.argv[1:]
+    addon_path, input_path, output_path = args[:3]
+    spec = importlib.util.spec_from_file_location("nh_blender_texture_cache_worker_addon", addon_path)
+    addon = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(addon)
+    with open(input_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    files = list(payload.get("files", []) or [])
+    force_rebuild = bool(payload.get("force_rebuild", False))
+    stats = {"created": 0, "rebuilt": 0, "skipped": 0, "failed": [], "processed": 0}
+
+    for paa_path in files:
+        try:
+            cache_path = addon._paa_preview_cache_path(paa_path)
+            existed_before = os.path.isfile(cache_path)
+            if (not force_rebuild) and addon._texture_cache_is_valid(paa_path, cache_path):
+                stats["skipped"] += 1
+                stats["processed"] += 1
+                continue
+            out_cache, _source_kind, _resolved = addon._ensure_texture_cache_for_paa(paa_path, force_rebuild=force_rebuild)
+            if not out_cache:
+                raise RuntimeError("cache PNG was not created")
+            if existed_before:
+                stats["rebuilt"] += 1
+            else:
+                stats["created"] += 1
+            stats["processed"] += 1
+        except Exception as exc:
+            stats["failed"].append("{}: {}\n{}".format(paa_path, exc, traceback.format_exc(limit=4)))
+
+    _write_output(output_path, stats)
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def _run_texture_cache_workers(paa_files, *, force_rebuild: bool = False, settings=None, context=None):
+    unique_files = []
+    seen = set()
+    for fp in paa_files or []:
+        try:
+            fp_abs = os.path.abspath(bpy.path.abspath(fp))
+        except Exception:
+            fp_abs = os.path.abspath(fp or "")
+        if not fp_abs or not os.path.isfile(fp_abs):
+            continue
+        key = os.path.normcase(fp_abs)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_files.append(fp_abs)
+
+    stats = {"created": 0, "rebuilt": 0, "skipped": 0, "failed": [], "workers": 0, "processed": 0}
+    if not unique_files:
+        return stats
+
+    worker_count = _texture_cache_worker_count(settings, len(unique_files))
+    stats["workers"] = worker_count
+
+    if worker_count <= 1:
+        try:
+            if context is not None:
+                context.window_manager.progress_begin(0, len(unique_files))
+        except Exception:
+            pass
+        try:
+            for index, paa_path in enumerate(unique_files, start=1):
+                try:
+                    if context is not None:
+                        context.window_manager.progress_update(index)
+                except Exception:
+                    pass
+                try:
+                    cache_path = _paa_preview_cache_path(paa_path)
+                    existed_before = os.path.isfile(cache_path)
+                    if (not force_rebuild) and _texture_cache_is_valid(paa_path, cache_path):
+                        stats["skipped"] += 1
+                        stats["processed"] += 1
+                        continue
+                    out_cache, _source_kind, _resolved = _ensure_texture_cache_for_paa(paa_path, force_rebuild=force_rebuild)
+                    if not out_cache:
+                        raise RuntimeError("cache PNG was not created")
+                    if existed_before:
+                        stats["rebuilt"] += 1
+                    else:
+                        stats["created"] += 1
+                    stats["processed"] += 1
+                except Exception as e:
+                    stats["failed"].append(f"{paa_path}: {_fmt_exc(e)}")
+        finally:
+            try:
+                if context is not None:
+                    context.window_manager.progress_end()
+            except Exception:
+                pass
+        return stats
+
+    work_dir = tempfile.mkdtemp(prefix="nh_texture_cache_workers_")
+    script_path = os.path.join(work_dir, "texture_cache_worker.py")
+    addon_path = os.path.abspath(__file__)
+    try:
+        with open(script_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(_texture_cache_worker_script_source())
+
+        blender_binary = _blender_binary_for_texture_workers()
+        chunks = _chunk_sequence_evenly(unique_files, worker_count)
+        processes = []
+        for idx, chunk in enumerate(chunks, start=1):
+            input_path = os.path.join(work_dir, f"worker_{idx:02d}.json")
+            output_path = os.path.join(work_dir, f"worker_{idx:02d}.out.json")
+            log_path = os.path.join(work_dir, f"worker_{idx:02d}.log")
+            with open(input_path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"files": chunk, "force_rebuild": bool(force_rebuild)}, f, ensure_ascii=False)
+            log_file = open(log_path, "w", encoding="utf-8", newline="\n")
+            cmd = [blender_binary, "--background", "--python", script_path, "--", addon_path, input_path, output_path]
+            proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+            processes.append({
+                "proc": proc,
+                "log_file": log_file,
+                "log_path": log_path,
+                "output_path": output_path,
+                "chunk_size": len(chunk),
+                "done": False,
+            })
+
+        completed = 0
+        try:
+            if context is not None:
+                context.window_manager.progress_begin(0, len(unique_files))
+        except Exception:
+            pass
+        try:
+            while any(not item["done"] for item in processes):
+                for item in processes:
+                    if item["done"]:
+                        continue
+                    proc = item["proc"]
+                    if proc.poll() is None:
+                        continue
+                    item["done"] = True
+                    completed += int(item["chunk_size"])
+                    try:
+                        item["log_file"].close()
+                    except Exception:
+                        pass
+                    try:
+                        if context is not None:
+                            context.window_manager.progress_update(min(completed, len(unique_files)))
+                    except Exception:
+                        pass
+                if any(not item["done"] for item in processes):
+                    time_sleep = getattr(bpy.app, "sleep", None)
+                    if callable(time_sleep):
+                        try:
+                            time_sleep(0.1)
+                            continue
+                        except Exception:
+                            pass
+                    import time
+                    time.sleep(0.1)
+        finally:
+            try:
+                if context is not None:
+                    context.window_manager.progress_end()
+            except Exception:
+                pass
+
+        for item in processes:
+            proc = item["proc"]
+            try:
+                if not item["log_file"].closed:
+                    item["log_file"].close()
+            except Exception:
+                pass
+            if proc.returncode not in (0, None):
+                log_tail = ""
+                try:
+                    with open(item["log_path"], "r", encoding="utf-8", errors="replace") as f:
+                        log_tail = "".join(f.readlines()[-30:]).strip()
+                except Exception:
+                    pass
+                stats["failed"].append(f"Worker failed with code {proc.returncode}: {log_tail}")
+                continue
+            if not os.path.isfile(item["output_path"]):
+                stats["failed"].append("Worker finished without writing output")
+                continue
+            try:
+                with open(item["output_path"], "r", encoding="utf-8") as f:
+                    worker_stats = json.load(f)
+                stats["created"] += int(worker_stats.get("created", 0) or 0)
+                stats["rebuilt"] += int(worker_stats.get("rebuilt", 0) or 0)
+                stats["skipped"] += int(worker_stats.get("skipped", 0) or 0)
+                stats["processed"] += int(worker_stats.get("processed", 0) or 0)
+                stats["failed"].extend(worker_stats.get("failed", []) or [])
+            except Exception as e:
+                stats["failed"].append(f"Could not read worker output: {_fmt_exc(e)}")
+    finally:
+        try:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    return stats
+
+
+def _ensure_texture_cache_for_paa(paa_abs_path: str, force_rebuild: bool = False):
+    image, _has_alpha, resolved_path, source_kind, cache_path = _load_material_preview_image(
+        paa_abs_path,
+        keep_converted_textures=True,
+        color_space="SRGB",
+        force_rebuild_cache=bool(force_rebuild),
+    )
+    try:
+        _remove_image_if_unused(image)
+    except Exception:
+        pass
+    return cache_path if cache_path and os.path.isfile(cache_path) else "", source_kind, resolved_path
 
 def _save_image_as_png(image, filepath: str):
     folder = os.path.dirname(filepath)
@@ -14264,7 +15149,6 @@ def _save_image_as_png(image, filepath: str):
 
     try:
         image.filepath_raw = filepath
-        image.filepath = filepath
         if prev_file_format is not None:
             image.file_format = "PNG"
         image.save()
@@ -14288,7 +15172,13 @@ def _load_external_image(filepath: str, color_space: str = "SRGB"):
     _apply_image_color_space(image, color_space)
     return image
 
-def _load_material_preview_image(texture_path: str, keep_converted_textures: bool, color_space: str = "SRGB"):
+def _load_material_preview_image(
+    texture_path: str,
+    keep_converted_textures: bool,
+    color_space: str = "SRGB",
+    force_rebuild_cache: bool = False,
+    cache_missing_textures: bool = True,
+):
     resolved_path = _resolve_a3ob_texture_path(texture_path)
     if not resolved_path:
         return None, False, "", "missing", ""
@@ -14321,13 +15211,8 @@ def _load_material_preview_image(texture_path: str, keep_converted_textures: boo
         load_file = _fallback_load_file
 
     cache_path = _paa_preview_cache_path(resolved_path)
-    if keep_converted_textures and os.path.isfile(cache_path):
-        cache_valid = True
-        try:
-            cache_valid = os.path.getmtime(cache_path) >= os.path.getmtime(resolved_path)
-        except Exception:
-            cache_valid = True
-
+    if not force_rebuild_cache and os.path.isfile(cache_path):
+        cache_valid = _texture_cache_is_valid(resolved_path, cache_path)
         if cache_valid:
             try:
                 image = _load_external_image(cache_path, color_space)
@@ -14337,6 +15222,9 @@ def _load_material_preview_image(texture_path: str, keep_converted_textures: boo
                     os.remove(cache_path)
                 except Exception:
                     pass
+
+    if keep_converted_textures and not cache_missing_textures:
+        return None, False, resolved_path, "cache_missing", cache_path
 
     try:
         image, tex = load_file(resolved_path, color_space)
@@ -14404,12 +15292,22 @@ def _setup_import_preview_nodes(material: bpy.types.Material, image, texture_lab
 
     return True
 
-def _postprocess_imported_material_previews(context, imported_objs, *, show_materials: bool, keep_converted_textures: bool):
+def _postprocess_imported_material_previews(
+    context,
+    imported_objs,
+    *,
+    show_materials: bool,
+    keep_converted_textures: bool,
+    pack_runtime_images: bool = False,
+    force_rebuild_cache: bool = False,
+    cache_missing_textures: bool = True,
+):
     result = {
         "materials_total": 0,
         "textured_candidates": 0,
         "previewed": 0,
         "missing": 0,
+        "packed": 0,
         "cache_hits": 0,
         "cache_created": 0,
         "errors": [],
@@ -14431,6 +15329,8 @@ def _postprocess_imported_material_previews(context, imported_objs, *, show_mate
             paa_path,
             keep_converted_textures,
             color_space="SRGB",
+            force_rebuild_cache=force_rebuild_cache,
+            cache_missing_textures=cache_missing_textures,
         )
         if image is None:
             result["missing"] += 1
@@ -14443,6 +15343,13 @@ def _postprocess_imported_material_previews(context, imported_objs, *, show_mate
                     result["cache_hits"] += 1
                 elif source_kind == "cache_created":
                     result["cache_created"] += 1
+                elif pack_runtime_images and source_kind == "paa_runtime":
+                    try:
+                        if getattr(image, "packed_file", None) is None:
+                            image.pack()
+                        result["packed"] += 1
+                    except Exception as e:
+                        result["errors"].append(f"{mat.name}: pack preview image: {_fmt_exc(e)}")
         except Exception as e:
             result["errors"].append(f"{mat.name}: {_fmt_exc(e)}")
 
@@ -14468,7 +15375,7 @@ def _get_import_preview_settings(context, operator=None):
         except Exception:
             pass
 
-    keep_converted_textures = bool(getattr(settings, "import_keep_converted_textures", False))
+    keep_converted_textures = bool(getattr(settings, "import_keep_converted_textures", True))
     return show_materials, keep_converted_textures
 
 def _log_import_preview_summary(filepath: str, stats):
@@ -14477,22 +15384,24 @@ def _log_import_preview_summary(filepath: str, stats):
 
     previewed = int(stats.get("previewed", 0) or 0)
     missing = int(stats.get("missing", 0) or 0)
+    packed = int(stats.get("packed", 0) or 0)
     cache_hits = int(stats.get("cache_hits", 0) or 0)
     cache_created = int(stats.get("cache_created", 0) or 0)
     errors = list(stats.get("errors", []) or [])
 
-    if previewed == 0 and missing == 0 and cache_hits == 0 and cache_created == 0 and not errors:
+    if previewed == 0 and missing == 0 and packed == 0 and cache_hits == 0 and cache_created == 0 and not errors:
         return
 
     print("=== Import/Export planner: material previews ===")
     print(f"{os.path.basename(filepath) or filepath}")
     print(
         "materials: {materials_total}, textured: {textured_candidates}, previewed: {previewed}, "
-        "missing: {missing}, cache hits: {cache_hits}, cache created: {cache_created}".format(
+        "missing: {missing}, packed: {packed}, cache hits: {cache_hits}, cache created: {cache_created}".format(
             materials_total=int(stats.get("materials_total", 0) or 0),
             textured_candidates=int(stats.get("textured_candidates", 0) or 0),
             previewed=previewed,
             missing=missing,
+            packed=packed,
             cache_hits=cache_hits,
             cache_created=cache_created,
         )
@@ -14531,6 +15440,27 @@ class CRAY_PG_TexReplaceSettings(PropertyGroup):
         name="Target Textures Folder",
         subtype="DIR_PATH",
         default="P:\\NH_ObjectTextures\\",
+    )
+    texture_cache_source_folder: StringProperty(
+        name="Texture Cache Source",
+        subtype="DIR_PATH",
+        default=r"P:\NH_ObjectTextures",
+        description="Корневая папка с .paa текстурами для общего PNG-кеша Blender",
+    )
+    texture_cache_workers: IntProperty(
+        name="Cache Workers",
+        default=4,
+        min=1,
+        max=8,
+        description="Количество фоновых Blender worker-процессов для параллельной сборки PNG-кеша текстур",
+    )
+    texture_cache_last_summary: StringProperty(
+        default="",
+        options={"SKIP_SAVE"},
+    )
+    texture_cache_last_report_path: StringProperty(
+        default="",
+        options={"SKIP_SAVE"},
     )
     texture_tools_folder: StringProperty(
         name="Texture Tools Folder",
@@ -15076,6 +16006,19 @@ class CRAY_OT_ReplaceTexturesFromDB(Operator):
             for d in sorted(dup_names):
                 print(d)
 
+        try:
+            preview_stats = _postprocess_imported_material_previews(
+                context,
+                [obj],
+                show_materials=True,
+                keep_converted_textures=True,
+                pack_runtime_images=False,
+            )
+            _log_import_preview_summary(obj.name, preview_stats)
+        except Exception as e:
+            print("=== Texture Replace: material preview refresh failed ===")
+            print(_fmt_exc(e))
+
         _save_texreplace_settings_now(context)
         return {"FINISHED"}
 
@@ -15327,6 +16270,10 @@ class CRAY_OT_ExportMissingTexturesFromSources(Operator):
                     _tex_export_set_progress(context, ts, self.index, len(self.requests), material_base, f"PNG -> PAA {mode_label}")
                     _tex_export_workspace_status(context, f"NH Texture Export: {self.index}/{len(self.requests)} {material_base} - PNG -> PAA {mode_label}")
                     _convert_png_to_paa_external(png_path, paa_path, exe_path, events=self.events, label=label, material_base=material_base)
+                    try:
+                        _ensure_texture_cache_for_paa(paa_path, force_rebuild=True)
+                    except Exception as cache_e:
+                        self.warnings.append(f"Could not update texture preview cache: {paa_path}: {_fmt_exc(cache_e)}")
                     self.stats["paa_converted"] += 1
                     self._add_created("paa", material_base, png_path, paa_path)
                     return paa_path
@@ -15387,6 +16334,10 @@ class CRAY_OT_ExportMissingTexturesFromSources(Operator):
                 _tex_export_set_progress(context, ts, self.index, len(self.requests), material_base, f"PNG -> PAA {mode_label}")
                 _tex_export_workspace_status(context, f"NH Texture Export: {self.index}/{len(self.requests)} {material_base} - PNG -> PAA {mode_label}")
                 _convert_png_to_paa_external(png_path, paa_path, exe_path, events=self.events, label=label, material_base=material_base)
+                try:
+                    _ensure_texture_cache_for_paa(paa_path, force_rebuild=True)
+                except Exception as cache_e:
+                    self.warnings.append(f"Could not update texture preview cache: {paa_path}: {_fmt_exc(cache_e)}")
                 self.stats["paa_converted"] += 1
                 final_path = paa_path
                 self._add_created("paa", material_base, png_path, paa_path)
@@ -15752,6 +16703,382 @@ class CRAY_OT_CleanTextureConverterTestOutputs(Operator):
             self.report({"INFO"}, f"Removed {len(removed)} test output(s)")
         return {"FINISHED"}
 
+class CRAY_OT_TextureCacheBuild(Operator):
+    bl_idname = "cray.texture_cache_build"
+    bl_label = "Build Texture PNG Cache"
+    bl_description = "Сканирует выбранную папку текстур. Update добавляет только отсутствующие или устаревшие PNG, Rebuild All пересоздает весь кеш"
+    bl_options = {"REGISTER", "UNDO"}
+
+    missing_only: BoolProperty(
+        name="Только новые/устаревшие",
+        default=False,
+        description="Пропускать уже валидные PNG и конвертировать только отсутствующие или устаревшие .paa",
+    )
+
+    def execute(self, context):
+        ts = context.scene.cray_texreplace_settings
+        _save_texreplace_settings_now(context)
+        root = _tex_export_resolve_path(getattr(ts, "texture_cache_source_folder", ""), fallback=getattr(ts, "folder", ""))
+        if not root or not os.path.isdir(root):
+            self.report({"ERROR"}, "Texture cache source folder is not set or does not exist")
+            return {"CANCELLED"}
+
+        paa_files = list(_iter_paa_files_recursive(root))
+        if not paa_files:
+            ts.texture_cache_last_summary = "No .paa files found"
+            self.report({"WARNING"}, "No .paa files found in texture cache source")
+            return {"CANCELLED"}
+
+        root_abs = os.path.abspath(bpy.path.abspath(root))
+        force_rebuild = not bool(self.missing_only)
+
+        cache_stats = _run_texture_cache_workers(
+            paa_files,
+            force_rebuild=force_rebuild,
+            settings=ts,
+            context=context,
+        )
+        created = int(cache_stats.get("created", 0) or 0)
+        rebuilt = int(cache_stats.get("rebuilt", 0) or 0)
+        skipped = int(cache_stats.get("skipped", 0) or 0)
+        failed = list(cache_stats.get("failed", []) or [])
+        workers_used = int(cache_stats.get("workers", 1) or 1)
+
+        cache_root = _nh_texture_cache_root(create=True)
+        summary = f"Created {created}, rebuilt {rebuilt}, skipped {skipped}, failed {len(failed)}, workers {workers_used}"
+        ts.texture_cache_last_summary = summary
+        report_path = os.path.join(cache_root, "_nh_texture_cache_last_report.txt")
+        try:
+            with open(report_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("=== NH Texture PNG Cache Report ===\n")
+                f.write(f"Source root: {root_abs}\n")
+                f.write(f"Cache root: {cache_root}\n")
+                f.write(f"Mode: {'add new/outdated only' if self.missing_only else 'full rebuild'}\n")
+                f.write(f"Workers: {workers_used}\n")
+                f.write(f"Scanned .paa: {len(paa_files)}\n")
+                f.write(f"Created: {created}\n")
+                f.write(f"Rebuilt: {rebuilt}\n")
+                f.write(f"Skipped valid: {skipped}\n")
+                f.write(f"Failed: {len(failed)}\n")
+                if failed:
+                    f.write("\n=== Failed ===\n")
+                    for item in failed:
+                        f.write(item + "\n")
+            ts.texture_cache_last_report_path = report_path
+        except Exception as e:
+            print(f"Could not write texture cache report: {_fmt_exc(e)}")
+
+        print("=== NH Texture PNG Cache ===")
+        print(f"Source root: {root_abs}")
+        print(f"Cache root: {cache_root}")
+        print(summary)
+        if failed:
+            print("=== Texture cache failed ===")
+            for item in failed[:100]:
+                print(item)
+            if len(failed) > 100:
+                print(f"... {len(failed) - 100} more failure(s) not shown")
+            self.report({"WARNING"}, summary + " (see System Console)")
+        else:
+            self.report({"INFO"}, summary)
+        _save_texreplace_settings_now(context)
+        return {"FINISHED"}
+
+def _cleanup_imported_data_since(pre_obj_ptrs, pre_col_ptrs, pre_mat_ptrs=None, pre_img_ptrs=None):
+    pre_obj_ptrs = set(pre_obj_ptrs or set())
+    pre_col_ptrs = set(pre_col_ptrs or set())
+    pre_mat_ptrs = set(pre_mat_ptrs or set())
+    pre_img_ptrs = set(pre_img_ptrs or set())
+
+    new_collection_names = [
+        col.name for col in list(bpy.data.collections)
+        if col.as_pointer() not in pre_col_ptrs
+    ]
+    for name in reversed(new_collection_names):
+        col = bpy.data.collections.get(name)
+        if col is None:
+            continue
+        try:
+            _remove_collection_tree(col)
+        except Exception:
+            pass
+
+    for obj in list(bpy.data.objects):
+        try:
+            if obj.as_pointer() not in pre_obj_ptrs:
+                bpy.data.objects.remove(obj, do_unlink=True)
+        except Exception:
+            pass
+
+    for mat in list(bpy.data.materials):
+        try:
+            if mat.as_pointer() not in pre_mat_ptrs and int(getattr(mat, "users", 0) or 0) == 0:
+                bpy.data.materials.remove(mat)
+        except Exception:
+            pass
+
+    for image in list(bpy.data.images):
+        try:
+            if image.as_pointer() not in pre_img_ptrs and int(getattr(image, "users", 0) or 0) == 0:
+                bpy.data.images.remove(image)
+        except Exception:
+            pass
+
+
+def _write_texture_cache_report(source_label: str, mode_label: str, scanned: int, created: int, rebuilt: int, skipped: int, failed):
+    cache_root = _nh_texture_cache_root(create=True)
+    summary = f"Created {created}, rebuilt {rebuilt}, skipped {skipped}, failed {len(failed or [])}"
+    report_path = os.path.join(cache_root, "_nh_texture_cache_last_report.txt")
+    try:
+        with open(report_path, "w", encoding="utf-8", newline="\n") as f:
+            f.write("=== NH Texture PNG Cache Report ===\n")
+            f.write(f"Source: {source_label}\n")
+            f.write(f"Cache root: {cache_root}\n")
+            f.write(f"Mode: {mode_label}\n")
+            f.write(f"Scanned .p3d/.paa: {scanned}\n")
+            f.write(f"Created: {created}\n")
+            f.write(f"Rebuilt: {rebuilt}\n")
+            f.write(f"Skipped valid: {skipped}\n")
+            f.write(f"Failed: {len(failed or [])}\n")
+            if failed:
+                f.write("\n=== Failed ===\n")
+                for item in failed:
+                    f.write(str(item) + "\n")
+    except Exception as e:
+        print(f"Could not write texture cache report: {_fmt_exc(e)}")
+        report_path = ""
+    return summary, report_path
+
+
+def _cache_nh_library_used_textures(op, context, *, force_rebuild: bool = False):
+    settings = context.scene.cray_asset_library_settings
+    ts = context.scene.cray_texreplace_settings
+    if not _has_any_a3ob_import_ops():
+        op.report({"ERROR"}, "Arma 3 Object Builder import operators not found")
+        return {"CANCELLED"}
+
+    configured_roots = [
+        ("Common", _nh_objects_common_root(settings)),
+        ("Environment", _nh_objects_environment_root(settings)),
+    ]
+    missing_configured = [f"{label}: {path}" for label, path in configured_roots if not os.path.isdir(path)]
+    if missing_configured:
+        op.report({"ERROR"}, "Set valid Common and Environment folders")
+        print("=== NH Library Texture Cache: Missing configured roots ===")
+        for item in missing_configured:
+            print(item)
+        return {"CANCELLED"}
+
+    folders = list(_iter_nh_objects_asset_source_folders(settings))
+    p3d_files = []
+    for folder_abs in folders:
+        p3d_files.extend(_iter_p3d_files_direct(folder_abs, settings))
+    p3d_files = sorted({os.path.normcase(fp): fp for fp in p3d_files if fp and os.path.isfile(fp)}.values(), key=lambda item: item.lower())
+    if not p3d_files:
+        op.report({"ERROR"}, "No .p3d files found in NH_Objects Common/Environment")
+        return {"CANCELLED"}
+
+    used_paa_paths = set()
+    textured_candidates = 0
+    failed = []
+    mode_label = "rebuild used NH library textures" if force_rebuild else "cache missing/outdated NH library textures"
+
+    try:
+        context.window_manager.progress_begin(0, len(p3d_files))
+    except Exception:
+        pass
+    try:
+        for index, fp in enumerate(p3d_files, start=1):
+            try:
+                context.window_manager.progress_update(index)
+            except Exception:
+                pass
+            pre_obj_ptrs = {o.as_pointer() for o in bpy.data.objects}
+            pre_col_ptrs = {c.as_pointer() for c in bpy.data.collections}
+            pre_mat_ptrs = {m.as_pointer() for m in bpy.data.materials}
+            pre_img_ptrs = {i.as_pointer() for i in bpy.data.images}
+            try:
+                with _suppress_a3ob_import_tracking():
+                    res, _op_id, err = _call_first_available(
+                        _A3OB_IMPORT_CANDIDATES,
+                        filepath=fp,
+                        first_lod_only=True,
+                        absolute_paths=True,
+                        enclose=True,
+                        groupby="TYPE",
+                        additional_data_allowed=True,
+                        additional_data={"PROPS", "SELECTIONS", "UV", "MATERIALS"},
+                        validate_meshes=False,
+                        proxy_action="SEPARATE",
+                        translate_selections=False,
+                        cleanup_empty_selections=False,
+                        load_textures=False,
+                    )
+                if res is None:
+                    failed.append(f"{fp}: {_fmt_exc(err) if err else 'import failed'}")
+                    continue
+                imported_objs = [o for o in bpy.data.objects if o.as_pointer() not in pre_obj_ptrs]
+                for mat in _iter_unique_materials_from_objects(imported_objs):
+                    paa_path, _rvmat_path = _get_a3ob_material_paths(mat)
+                    if not paa_path:
+                        continue
+                    textured_candidates += 1
+                    resolved_path = _resolve_a3ob_texture_path(paa_path)
+                    if not resolved_path or os.path.splitext(resolved_path)[1].lower() != ".paa":
+                        failed.append(f"{fp}: could not resolve .paa texture: {paa_path}")
+                        continue
+                    used_paa_paths.add(resolved_path)
+            except Exception as e:
+                failed.append(f"{fp}: {_fmt_exc(e)}")
+            finally:
+                _cleanup_imported_data_since(pre_obj_ptrs, pre_col_ptrs, pre_mat_ptrs, pre_img_ptrs)
+    finally:
+        try:
+            context.window_manager.progress_end()
+        except Exception:
+            pass
+
+    cache_stats = _run_texture_cache_workers(
+        sorted(used_paa_paths, key=lambda item: item.lower()),
+        force_rebuild=force_rebuild,
+        settings=ts,
+        context=context,
+    )
+    created = int(cache_stats.get("created", 0) or 0)
+    rebuilt = int(cache_stats.get("rebuilt", 0) or 0)
+    skipped = int(cache_stats.get("skipped", 0) or 0)
+    workers_used = int(cache_stats.get("workers", 1) or 1)
+    failed.extend(cache_stats.get("failed", []) or [])
+
+    summary, report_path = _write_texture_cache_report(
+        "NH Objects Common/Environment libraries",
+        f"{mode_label}; workers {workers_used}",
+        len(used_paa_paths),
+        created,
+        rebuilt,
+        skipped,
+        failed,
+    )
+    ts.texture_cache_last_summary = f"{summary}, used textures {len(used_paa_paths)}/{textured_candidates}, workers {workers_used}"
+    ts.texture_cache_last_report_path = report_path
+    _save_texreplace_settings_now(context)
+
+    print("=== NH Library Used Texture Cache ===")
+    print(f"Scanned .p3d: {len(p3d_files)}")
+    print(f"Used textures: {len(used_paa_paths)}/{textured_candidates}")
+    print(f"Workers: {workers_used}")
+    print(summary)
+    if failed:
+        print("=== NH Library Used Texture Cache: Failures ===")
+        for item in failed[:100]:
+            print(item)
+        if len(failed) > 100:
+            print(f"... {len(failed) - 100} more failure(s) not shown")
+        op.report({"WARNING"}, f"{summary}, used textures {len(used_paa_paths)}/{textured_candidates} (see System Console)")
+    else:
+        op.report({"INFO"}, f"{summary}, used textures {len(used_paa_paths)}/{textured_candidates}")
+    return {"FINISHED"}
+
+
+class CRAY_OT_TextureCacheBuildNHLibraryUsed(Operator):
+    bl_idname = "cray.texture_cache_build_nh_library_used"
+    bl_label = "Cache NH Library Textures"
+    bl_description = "Импортирует .p3d из NH библиотек и кеширует только те .paa текстуры, которые реально используются этими ассетами"
+    bl_options = {"REGISTER", "UNDO"}
+
+    force_rebuild: BoolProperty(
+        name="Пересоздать существующие PNG",
+        default=False,
+        description="Пересоздать PNG для используемых текстур NH библиотеки вместо использования валидного кеша",
+    )
+
+    def execute(self, context):
+        return _cache_nh_library_used_textures(self, context, force_rebuild=bool(self.force_rebuild))
+
+
+class CRAY_OT_OpenTexturePreviewCacheFolder(Operator):
+    bl_idname = "cray.open_texture_preview_cache_folder"
+    bl_label = "Open Texture PNG Cache"
+    bl_description = "Открывает папку общего PNG-кеша, куда складываются превью для .paa текстур"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        folder = _nh_texture_cache_root(create=True)
+        try:
+            _open_folder_in_system(folder)
+        except Exception as e:
+            self.report({"ERROR"}, f"Could not open texture cache folder: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+        self.report({"INFO"}, "Opened texture cache folder")
+        return {"FINISHED"}
+
+class CRAY_OT_OpenTextureCacheLastReport(Operator):
+    bl_idname = "cray.open_texture_cache_last_report"
+    bl_label = "Open Texture Cache Report"
+    bl_description = "Открывает последний отчет по сборке PNG-кеша текстур"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        ts = context.scene.cray_texreplace_settings
+        path = _tex_export_resolve_path(getattr(ts, "texture_cache_last_report_path", ""))
+        if not path or not os.path.isfile(path):
+            self.report({"WARNING"}, "Texture cache report was not found")
+            return {"CANCELLED"}
+        try:
+            _open_folder_in_system(path)
+        except Exception as e:
+            self.report({"ERROR"}, f"Could not open texture cache report: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+        self.report({"INFO"}, "Opened texture cache report")
+        return {"FINISHED"}
+
+class CRAY_OT_OpenNHAssetCacheFolder(Operator):
+    bl_idname = "cray.open_nh_asset_cache_folder"
+    bl_label = "Open NH Library Cache"
+    bl_description = "Открывает папку, где лежат кешированные .blend asset libraries и их превью"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        folder = _nh_objects_asset_cache_base(create=True)
+        try:
+            _open_folder_in_system(folder)
+        except Exception as e:
+            self.report({"ERROR"}, f"Could not open NH library cache folder: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+        self.report({"INFO"}, "Opened NH library cache folder")
+        return {"FINISHED"}
+
+class CRAY_OT_AssetLibraryRebuildIconCache(Operator):
+    bl_idname = "cray.asset_library_rebuild_icon_cache"
+    bl_label = "Rebuild Textured Library Icons"
+    bl_description = "Пересобирает NH asset libraries и заново создает иконки ассетов с текущими настройками превью"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = context.scene.cray_asset_library_settings
+        old_rebuild = bool(getattr(settings, "rebuild_existing_libraries", False))
+        old_render = bool(getattr(settings, "render_textured_previews", False))
+        try:
+            settings.rebuild_existing_libraries = True
+            settings.render_textured_previews = True
+            return _build_nh_objects_persistent_asset_libraries(self, context)
+        finally:
+            try:
+                settings.rebuild_existing_libraries = old_rebuild
+                settings.render_textured_previews = old_render
+            except Exception:
+                pass
+
+
+class CRAY_OT_TextureCacheRebuildNHLibraryUsed(Operator):
+    bl_idname = "cray.texture_cache_rebuild_nh_library_used"
+    bl_label = "Rebuild NH Library Texture Cache"
+    bl_description = "Пересоздает PNG-кеш только для текстур, которые используются ассетами NH библиотек"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        return _cache_nh_library_used_textures(self, context, force_rebuild=True)
+
 # ------------------------------------------------------------------------
 #  Batch Import (A3OB)
 # ------------------------------------------------------------------------
@@ -16107,7 +17434,7 @@ def _find_existing_scene_p3d_root(scene, model_name_or_path: str):
     return None
 
 
-def _find_p3d_paths_by_name(search_root: str, model_name: str):
+def _find_p3d_paths_by_name(search_root: str, model_name: str, settings=None):
     root_abs = bpy.path.abspath(search_root) if search_root else ""
     root_abs = os.path.abspath(root_abs) if root_abs else ""
     wanted = _normalize_p3d_lookup_key(model_name)
@@ -16115,7 +17442,13 @@ def _find_p3d_paths_by_name(search_root: str, model_name: str):
         return []
 
     matches = []
-    for root, _, files in os.walk(root_abs):
+    for root, dirs, files in os.walk(root_abs):
+        dirs[:] = [
+            name for name in dirs
+                if not _is_ignored_nh_objects_asset_path(os.path.join(root, name), settings)
+            ]
+        if _is_ignored_nh_objects_asset_path(root, settings):
+            continue
         for fn in files:
             if not fn.lower().endswith(".p3d"):
                 continue
@@ -17910,6 +19243,19 @@ def _resolve_object_source_p3d(obj):
     if obj is None:
         return ""
 
+    def _source_from_item(item):
+        if item is None:
+            return ""
+        if isinstance(item, bpy.types.Collection):
+            return _resolve_collection_source_path(item)
+        try:
+            src = item.get(_IE_SOURCE_PATH_KEY)
+        except Exception:
+            src = None
+        if isinstance(src, str) and src.strip():
+            return _norm_path(bpy.path.abspath(src))
+        return ""
+
     candidates = [obj]
     if getattr(obj, "instance_collection", None) is not None:
         candidates.append(obj.instance_collection)
@@ -17922,18 +19268,59 @@ def _resolve_object_source_p3d(obj):
         parent = parent.parent
 
     for item in candidates:
-        try:
-            src = item.get(_IE_SOURCE_PATH_KEY)
-        except Exception:
-            src = None
-        if isinstance(src, str) and src.strip():
-            return _norm_path(bpy.path.abspath(src))
+        src = _source_from_item(item)
+        if src:
+            return src
 
     for col in getattr(obj, "users_collection", []):
         src = _resolve_collection_source_path(col)
         if src:
             return src
 
+    for name in _iter_object_asset_source_name_candidates(obj):
+        src = _find_nh_objects_p3d_path_by_name(name)
+        if src:
+            return src
+
+    return ""
+
+
+def _iter_object_asset_source_name_candidates(obj):
+    seen = set()
+
+    def _add(value):
+        value = (value or "").strip()
+        if not value:
+            return
+        value = _strip_blender_numeric_suffix(value)
+        key = _normalize_p3d_lookup_key(value)
+        if not key or key in seen:
+            return
+        seen.add(key)
+        yield value
+
+    for item in (obj, getattr(obj, "instance_collection", None)):
+        if item is not None:
+            yield from _add(getattr(item, "name", "") or "")
+
+    parent = getattr(obj, "parent", None)
+    while parent is not None:
+        yield from _add(getattr(parent, "name", "") or "")
+        inst = getattr(parent, "instance_collection", None)
+        if inst is not None:
+            yield from _add(getattr(inst, "name", "") or "")
+        parent = getattr(parent, "parent", None)
+
+    for col in getattr(obj, "users_collection", []) or []:
+        yield from _add(getattr(col, "name", "") or "")
+
+
+def _find_nh_objects_p3d_path_by_name(model_name: str):
+    settings = _nh_asset_library_settings()
+    for _name, root_abs in _iter_nh_objects_source_roots(settings):
+        matches = _find_p3d_paths_by_name(root_abs, model_name, settings=settings)
+        if matches:
+            return matches[0]
     return ""
 
 
@@ -17971,22 +19358,32 @@ def _next_proxy_index_for_parent(parent_obj) -> int:
 
 def _build_proxy_from_object_instance(proxy_obj, source_obj, parent_obj, proxy_index: int):
     proxy_obj.matrix_world = source_obj.matrix_world.copy()
-    proxy_obj.parent = parent_obj
-    try:
-        proxy_obj.matrix_parent_inverse = parent_obj.matrix_world.inverted()
-    except Exception:
-        pass
+    if parent_obj is not None:
+        proxy_obj.parent = parent_obj
+        try:
+            proxy_obj.matrix_parent_inverse = parent_obj.matrix_world.inverted()
+        except Exception:
+            pass
     proxy_obj.name = f"proxy_{source_obj.name}_{proxy_index}"
 
 
 def _pick_proxy_target_object(context, explicit_obj=None):
     if explicit_obj is not None and explicit_obj.type == "MESH":
         return explicit_obj
+
+    source_objs = set()
+    for obj in getattr(context, "selected_objects", []) or []:
+        try:
+            if _resolve_object_source_p3d(obj):
+                source_objs.add(obj)
+        except Exception:
+            pass
+
     active = context.view_layer.objects.active
-    if active is not None and active.type == "MESH":
+    if active is not None and active.type == "MESH" and active not in source_objs:
         return active
     for obj in context.selected_objects:
-        if obj.type == "MESH":
+        if obj.type == "MESH" and obj not in source_objs:
             return obj
     return None
 
@@ -18163,9 +19560,9 @@ class CRAY_PG_IEPlannerSettings(PropertyGroup):
         description="Create Image Texture preview nodes for imported A3OB materials so textures are visible in Blender immediately",
     )
     import_keep_converted_textures: BoolProperty(
-        name="Keep converted .png next to source .paa",
-        default=False,
-        description="Save Blender-friendly .png copies near imported .paa files and reuse them on later imports instead of converting again",
+        name="Use shared .paa -> .png cache",
+        default=True,
+        description="Save/reuse Blender-friendly PNG copies in the shared NH texture preview cache instead of decoding .paa again",
     )
     disable_collections_after_import: BoolProperty(
         name="Disable all collections after import",
@@ -18850,10 +20247,219 @@ class CRAY_PG_AssetProxySettings(PropertyGroup):
 
 _NH_TEMP_ASSET_LIBRARY_NAME = "NH Temp Asset Library"
 _NH_TEMP_ASSET_SCENE_NAME = "NH Asset Library Scene"
+_NH_OBJECTS_DEFAULT_COMMON_ROOT = r"P:\NH_Objects\Common"
+_NH_OBJECTS_DEFAULT_ENVIRONMENT_ROOT = r"P:\NH_Objects\Environment"
+_NH_OBJECTS_ASSET_BLEND_NAME = "_NH_AssetLibrary.blend"
+_NH_OBJECTS_ASSET_MANIFEST_NAME = "_NH_AssetLibrary.manifest.json"
+_NH_OBJECTS_CACHE_FOLDER_NAME = "NH_Objects_AssetLibraries"
+_NH_OBJECTS_ASSET_PREVIEWS_FOLDER_NAME = "_NH_previews"
+_NH_TEXTURE_CACHE_FOLDER_NAME = "NH_TexturePreviewCache"
+_NH_OBJECTS_ASSET_CATALOG_FILE_NAME = "blender_assets.cats.txt"
+_NH_OBJECTS_ASSET_CATALOG_NAMESPACE = uuid.UUID("c91f1215-9261-4d7e-8df4-4bb81567b6a8")
+_NH_OBJECTS_ASSET_MANIFEST_VERSION = 7
+
+def _path_is_under_or_equal(path: str, root: str) -> bool:
+    if not path or not root:
+        return False
+    try:
+        path_abs = os.path.abspath(bpy.path.abspath(path))
+        root_abs = os.path.abspath(bpy.path.abspath(root))
+        return os.path.normcase(os.path.commonpath([path_abs, root_abs])) == os.path.normcase(root_abs)
+    except Exception:
+        return False
+
+def _nh_asset_library_settings(context=None):
+    scene = getattr(context, "scene", None) if context is not None else getattr(bpy.context, "scene", None)
+    return getattr(scene, "cray_asset_library_settings", None) if scene is not None else None
+
+def _nh_objects_common_root(settings=None) -> str:
+    settings = settings or _nh_asset_library_settings()
+    path = getattr(settings, "common_root", "") if settings is not None else ""
+    return os.path.abspath(bpy.path.abspath(path or _NH_OBJECTS_DEFAULT_COMMON_ROOT))
+
+def _nh_objects_environment_root(settings=None) -> str:
+    settings = settings or _nh_asset_library_settings()
+    path = getattr(settings, "environment_root", "") if settings is not None else ""
+    return os.path.abspath(bpy.path.abspath(path or _NH_OBJECTS_DEFAULT_ENVIRONMENT_ROOT))
+
+def _is_ignored_nh_objects_asset_path(path: str, settings=None) -> bool:
+    common_root = _nh_objects_common_root(settings)
+    buildings_root = os.path.join(common_root, "Buildings")
+    return _path_is_under_or_equal(path, buildings_root)
+
+def _nh_objects_asset_cache_base(create=False) -> str:
+    base_dir = os.environ.get("LOCALAPPDATA") or ""
+    if not base_dir:
+        try:
+            base_dir = bpy.utils.user_resource("CONFIG") or ""
+        except Exception:
+            base_dir = ""
+    if not base_dir:
+        base_dir = bpy.app.tempdir or os.path.expanduser("~")
+    path = os.path.join(base_dir, "NH_Blender", _NH_OBJECTS_CACHE_FOLDER_NAME)
+    if create:
+        os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _nh_objects_asset_cache_root(label: str, create=False) -> str:
+    safe_label = re.sub(r'[<>:"/\\|?*]+', "_", str(label or "Library")).strip(" .") or "Library"
+    path = os.path.join(_nh_objects_asset_cache_base(create=create), safe_label)
+    if create:
+        os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _iter_nh_objects_source_roots(settings=None):
+    roots = (
+        ("Common", _nh_objects_common_root(settings)),
+        ("Environment", _nh_objects_environment_root(settings)),
+    )
+    for label, path in roots:
+        path_abs = os.path.abspath(bpy.path.abspath(path))
+        if os.path.isdir(path_abs) and not _is_ignored_nh_objects_asset_path(path_abs, settings):
+            yield label, path_abs
+
+
+def _iter_nh_objects_asset_roots(settings=None):
+    for label, _source_abs in _iter_nh_objects_source_roots(settings):
+        yield f"NH Objects - {label}", _nh_objects_asset_cache_root(label, create=True)
+
+
+def _safe_cache_relpath(path_abs: str, root_abs: str) -> list[str]:
+    try:
+        rel = os.path.relpath(path_abs, root_abs)
+    except Exception:
+        rel = os.path.basename(path_abs)
+    rel = "" if rel in {"", "."} else rel
+    parts = []
+    for part in re.split(r"[\\/]+", rel):
+        if not part or part in {".", ".."}:
+            continue
+        safe = re.sub(r'[<>:"/\\|?*]+', "_", part).strip(" .")
+        if safe:
+            parts.append(safe)
+    return parts
+
+
+def _nh_asset_cache_folder_for_source_folder(source_folder_abs: str, settings=None, create=False) -> str:
+    source_folder_abs = os.path.abspath(bpy.path.abspath(source_folder_abs))
+    for label, root_abs in _iter_nh_objects_source_roots(settings):
+        if _path_is_under_or_equal(source_folder_abs, root_abs):
+            root = _nh_objects_asset_cache_root(label, create=create)
+            cache_folder = os.path.join(root, *_safe_cache_relpath(source_folder_abs, root_abs))
+            if create:
+                os.makedirs(cache_folder, exist_ok=True)
+            return cache_folder
+
+    fallback_root = _nh_objects_asset_cache_root("Other", create=create)
+    cache_folder = os.path.join(fallback_root, re.sub(r'[<>:"/\\|?*]+', "_", source_folder_abs).strip(" ."))
+    if create:
+        os.makedirs(cache_folder, exist_ok=True)
+    return cache_folder
+
+
+def _nh_asset_catalog_path_for_source_folder(source_folder_abs: str, settings=None) -> str:
+    source_folder_abs = os.path.abspath(bpy.path.abspath(source_folder_abs))
+    for _label, root_abs in _iter_nh_objects_source_roots(settings):
+        if _path_is_under_or_equal(source_folder_abs, root_abs):
+            parts = _safe_cache_relpath(source_folder_abs, root_abs)
+            return "/".join(parts) if parts else "Root"
+    return "Other"
+
+
+def _nh_asset_catalog_id(library_name: str, catalog_path: str) -> str:
+    return str(uuid.uuid5(_NH_OBJECTS_ASSET_CATALOG_NAMESPACE, f"{library_name}:{catalog_path}"))
+
+
+def _nh_asset_catalog_paths_by_cache_root(source_folders, settings=None):
+    out = {}
+    for folder_abs in source_folders or []:
+        cache_root = None
+        library_name = None
+        folder_abs = os.path.abspath(bpy.path.abspath(folder_abs))
+        for label, root_abs in _iter_nh_objects_source_roots(settings):
+            if _path_is_under_or_equal(folder_abs, root_abs):
+                library_name = f"NH Objects - {label}"
+                cache_root = _nh_objects_asset_cache_root(label, create=True)
+                break
+        if not cache_root:
+            library_name = "NH Objects - Other"
+            cache_root = _nh_objects_asset_cache_root("Other", create=True)
+        catalog_path = _nh_asset_catalog_path_for_source_folder(folder_abs, settings)
+        out.setdefault(cache_root, {})[catalog_path] = _nh_asset_catalog_id(library_name, catalog_path)
+    return out
+
+
+def _write_nh_asset_catalog_file(cache_root: str, catalog_paths_to_ids):
+    if not cache_root or not catalog_paths_to_ids:
+        return ""
+    os.makedirs(cache_root, exist_ok=True)
+    catalog_file = os.path.join(cache_root, _NH_OBJECTS_ASSET_CATALOG_FILE_NAME)
+    lines = [
+        "# This is an Asset Catalog Definition file for Blender.",
+        "#",
+        "# Empty lines and lines starting with `#` will be ignored.",
+        "# The first non-ignored line should be the version indicator.",
+        "# Other lines are of the format \"UUID:catalog/path/for/assets:simple catalog name\".",
+        "",
+        "VERSION 1",
+        "",
+    ]
+    for catalog_path, catalog_id in sorted((catalog_paths_to_ids or {}).items(), key=lambda item: item[0].lower()):
+        simple_name = catalog_path.split("/")[-1] if catalog_path else "Root"
+        lines.append(f"{catalog_id}:{catalog_path}:{simple_name}")
+    with open(catalog_file, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
+    return catalog_file
+
+
+def _nh_asset_blend_path_for_folder(folder_abs: str) -> str:
+    return os.path.join(folder_abs, _NH_OBJECTS_ASSET_BLEND_NAME)
+
+def _nh_asset_manifest_path_for_folder(folder_abs: str) -> str:
+    return os.path.join(folder_abs, _NH_OBJECTS_ASSET_MANIFEST_NAME)
+
+def _iter_p3d_files_direct(folder_abs: str, settings=None):
+    if not folder_abs or not os.path.isdir(folder_abs) or _is_ignored_nh_objects_asset_path(folder_abs, settings):
+        return []
+    out = []
+    try:
+        for fn in os.listdir(folder_abs):
+            fp = os.path.join(folder_abs, fn)
+            if os.path.isfile(fp) and fn.lower().endswith(".p3d"):
+                out.append(fp)
+    except Exception:
+        return []
+    out.sort(key=lambda x: x.lower())
+    return out
+
+def _iter_nh_objects_asset_source_folders(settings=None):
+    seen = set()
+    for _label, root_abs in _iter_nh_objects_source_roots(settings):
+        for current, dirs, _files in os.walk(root_abs):
+            dirs[:] = [
+                name for name in dirs
+                if not _is_ignored_nh_objects_asset_path(os.path.join(current, name), settings)
+            ]
+            if _is_ignored_nh_objects_asset_path(current, settings):
+                continue
+            key = os.path.normcase(os.path.abspath(current))
+            if key in seen:
+                continue
+            seen.add(key)
+            if _iter_p3d_files_direct(current, settings):
+                yield current
 
 def _iter_p3d_files_in_folder(folder_abs: str):
     out = []
-    for root, _, files in os.walk(folder_abs):
+    for root, dirs, files in os.walk(folder_abs):
+        dirs[:] = [
+            name for name in dirs
+            if not _is_ignored_nh_objects_asset_path(os.path.join(root, name))
+        ]
+        if _is_ignored_nh_objects_asset_path(root):
+            continue
         for fn in files:
             if fn.lower().endswith('.p3d'):
                 out.append(os.path.join(root, fn))
@@ -18943,6 +20549,23 @@ def _clear_temp_asset_library(context):
             pass
     return child_count
 
+def _load_custom_asset_preview_safe(id_data, filepath: str):
+    if id_data is None or not filepath or not os.path.isfile(filepath):
+        return False
+    try:
+        with bpy.context.temp_override(id=id_data):
+            result = bpy.ops.ed.lib_id_load_custom_preview(filepath=filepath)
+        return "FINISHED" in set(result or [])
+    except Exception:
+        try:
+            override = bpy.context.copy()
+            override["id"] = id_data
+            result = bpy.ops.ed.lib_id_load_custom_preview(override, filepath=filepath)
+            return "FINISHED" in set(result or [])
+        except Exception:
+            return False
+
+
 def _generate_asset_preview_safe(id_data):
     if id_data is None:
         return
@@ -18953,29 +20576,524 @@ def _generate_asset_preview_safe(id_data):
             return
     except Exception:
         pass
-    try:
-        with bpy.context.temp_override(id=id_data):
-            bpy.ops.ed.lib_id_generate_preview()
-    except Exception:
-        try:
-            override = bpy.context.copy()
-            override["id"] = id_data
-            bpy.ops.ed.lib_id_generate_preview(override)
-        except Exception:
-            pass
 
 
-def _mark_object_as_asset_safe(obj):
+def _mark_object_as_asset_safe(obj, catalog_id=None, preview_path=None):
     if obj is None:
         return
     try:
         obj.asset_mark()
     except Exception:
         pass
-    _generate_asset_preview_safe(obj)
+    if catalog_id:
+        try:
+            asset_data = getattr(obj, "asset_data", None)
+            if asset_data is not None:
+                asset_data.catalog_id = str(catalog_id)
+            else:
+                obj["catalog_id"] = str(catalog_id)
+        except Exception:
+            pass
+    if not _load_custom_asset_preview_safe(obj, preview_path or ""):
+        _generate_asset_preview_safe(obj)
 
 
-def _mark_collection_as_asset_safe(collection, catalog_id=None):
+def _asset_preview_filename(name: str) -> str:
+    base = os.path.splitext(str(name or "asset"))[0]
+    base = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", base).strip(" .") or "asset"
+    return base[:120] + ".png"
+
+
+def _image_filepath_if_loadable(image):
+    raw_path = getattr(image, "filepath_raw", "") or getattr(image, "filepath", "")
+    if not raw_path:
+        return ""
+    try:
+        path = os.path.abspath(bpy.path.abspath(raw_path))
+    except Exception:
+        path = os.path.abspath(raw_path)
+    if not os.path.isfile(path):
+        return ""
+    if os.path.splitext(path)[1].lower() in {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".tif", ".tiff", ".webp"}:
+        return path
+    return ""
+
+
+def _first_image_from_collection_materials(collection):
+    if collection is None:
+        return None
+    for obj in _collect_collection_objects_recursive(collection):
+        if obj is None or getattr(obj, "type", None) != "MESH":
+            continue
+        for slot in getattr(obj, "material_slots", []) or []:
+            mat = getattr(slot, "material", None)
+            if mat is None or not getattr(mat, "use_nodes", False) or getattr(mat, "node_tree", None) is None:
+                continue
+            for node in getattr(mat.node_tree, "nodes", []) or []:
+                if getattr(node, "type", None) != "TEX_IMAGE":
+                    continue
+                image = getattr(node, "image", None)
+                if image is not None:
+                    return image
+    return None
+
+
+def _collection_bounds_world(collection):
+    if collection is None:
+        return None, None
+
+    coords = []
+    for obj in _collect_collection_objects_recursive(collection):
+        if obj is None or getattr(obj, "type", None) != "MESH":
+            continue
+        try:
+            matrix_world = obj.matrix_world.copy()
+            for corner in getattr(obj, "bound_box", []) or []:
+                coords.append(matrix_world @ Vector(corner))
+        except Exception:
+            continue
+
+    if not coords:
+        return None, None
+
+    min_v = Vector((
+        min(v.x for v in coords),
+        min(v.y for v in coords),
+        min(v.z for v in coords),
+    ))
+    max_v = Vector((
+        max(v.x for v in coords),
+        max(v.y for v in coords),
+        max(v.z for v in coords),
+    ))
+    return min_v, max_v
+
+
+def _set_camera_look_at(camera_obj, target):
+    if camera_obj is None:
+        return
+    try:
+        direction = Vector(target) - camera_obj.location
+        if direction.length_squared <= 1e-12:
+            return
+        camera_obj.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
+    except Exception:
+        pass
+
+
+def _set_preview_render_engine_safe(scene):
+    if scene is None:
+        return
+    for engine in ("BLENDER_EEVEE_NEXT", "BLENDER_EEVEE", "BLENDER_WORKBENCH"):
+        try:
+            scene.render.engine = engine
+            break
+        except Exception:
+            continue
+
+    try:
+        scene.render.film_transparent = True
+    except Exception:
+        pass
+    try:
+        scene.view_settings.view_transform = "Filmic"
+        scene.view_settings.look = "Medium High Contrast"
+        scene.view_settings.exposure = 0
+        scene.view_settings.gamma = 1
+    except Exception:
+        pass
+    try:
+        scene.eevee.taa_render_samples = 32
+    except Exception:
+        pass
+    try:
+        scene.eevee.taa_samples = 32
+    except Exception:
+        pass
+
+
+def _render_scene_preview_safe(scene, filepath: str) -> bool:
+    if scene is None or not filepath:
+        return False
+    try:
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    except Exception:
+        pass
+
+    old_filepath = ""
+    try:
+        old_filepath = scene.render.filepath
+    except Exception:
+        old_filepath = ""
+
+    old_window_scene = None
+    window = getattr(bpy.context, "window", None)
+    if window is not None:
+        try:
+            old_window_scene = window.scene
+            window.scene = scene
+        except Exception:
+            old_window_scene = None
+
+    try:
+        scene.render.filepath = filepath
+        try:
+            result = bpy.ops.render.render(write_still=True, scene=scene.name)
+        except TypeError:
+            result = bpy.ops.render.render(write_still=True)
+        return "FINISHED" in set(result or []) and os.path.isfile(filepath)
+    except Exception:
+        return False
+    finally:
+        try:
+            scene.render.filepath = old_filepath
+        except Exception:
+            pass
+        if window is not None and old_window_scene is not None:
+            try:
+                window.scene = old_window_scene
+            except Exception:
+                pass
+
+
+def _asset_rendered_preview_path_for_collection(collection, preview_dir: str, size: int = 256):
+    if collection is None or not preview_dir:
+        return ""
+    if _first_image_from_collection_materials(collection) is None:
+        return ""
+
+    min_v, max_v = _collection_bounds_world(collection)
+    if min_v is None or max_v is None:
+        return ""
+
+    try:
+        os.makedirs(preview_dir, exist_ok=True)
+        preview_path = os.path.join(preview_dir, _asset_preview_filename(getattr(collection, "name", "") or "asset"))
+
+        scene = bpy.data.scenes.new(f"NH Asset Preview {getattr(collection, 'name', 'asset')}")
+        camera_data = bpy.data.cameras.new(f"NH Asset Preview Camera {getattr(collection, 'name', 'asset')}")
+        camera_obj = bpy.data.objects.new(camera_data.name, camera_data)
+        light_data = bpy.data.lights.new(f"NH Asset Preview Light {getattr(collection, 'name', 'asset')}", "AREA")
+        light_obj = bpy.data.objects.new(light_data.name, light_data)
+
+        try:
+            scene.collection.children.link(collection)
+        except Exception:
+            pass
+        try:
+            scene.collection.objects.link(camera_obj)
+        except Exception:
+            pass
+        try:
+            scene.collection.objects.link(light_obj)
+        except Exception:
+            pass
+
+        center = (min_v + max_v) * 0.5
+        dims = max_v - min_v
+        max_dim = max(float(dims.x), float(dims.y), float(dims.z), 0.25)
+        view_dir = Vector((1.7, -2.2, 1.35)).normalized()
+
+        try:
+            camera_data.type = "ORTHO"
+            camera_data.ortho_scale = max_dim * 1.35
+        except Exception:
+            pass
+        camera_obj.location = center + view_dir * max(max_dim * 2.2, 2.0)
+        _set_camera_look_at(camera_obj, center)
+
+        try:
+            light_data.energy = 450.0
+            light_data.size = max(max_dim * 2.2, 3.0)
+        except Exception:
+            pass
+        light_obj.location = center + view_dir * max(max_dim * 1.2, 1.0) + Vector((0.0, 0.0, max(max_dim * 1.8, 2.0)))
+
+        scene.camera = camera_obj
+        scene.render.resolution_x = int(size)
+        scene.render.resolution_y = int(size)
+        scene.render.resolution_percentage = 100
+        _set_preview_render_engine_safe(scene)
+
+        ok = _render_scene_preview_safe(scene, preview_path)
+        return preview_path if ok and os.path.isfile(preview_path) else ""
+    except Exception:
+        return ""
+    finally:
+        try:
+            if scene is not None and any(ch == collection for ch in scene.collection.children):
+                scene.collection.children.unlink(collection)
+        except Exception:
+            pass
+        for obj in (locals().get("camera_obj"), locals().get("light_obj")):
+            try:
+                if obj is not None and bpy.data.objects.get(obj.name) is not None:
+                    bpy.data.objects.remove(obj, do_unlink=True)
+            except Exception:
+                pass
+        for datablock in (locals().get("camera_data"), locals().get("light_data")):
+            try:
+                if datablock is not None and datablock.users == 0:
+                    if hasattr(bpy.data, "cameras") and getattr(datablock, "__class__", None).__name__ == "Camera":
+                        bpy.data.cameras.remove(datablock)
+                    elif hasattr(bpy.data, "lights"):
+                        bpy.data.lights.remove(datablock)
+            except Exception:
+                pass
+        try:
+            if scene is not None and bpy.data.scenes.get(scene.name) is not None:
+                bpy.data.scenes.remove(scene)
+        except Exception:
+            pass
+
+
+def _asset_preview_path_for_collection(collection, preview_dir: str, render_textured_previews: bool = False):
+    if render_textured_previews:
+        rendered_preview = _asset_rendered_preview_path_for_collection(collection, preview_dir)
+        if rendered_preview:
+            return rendered_preview
+
+    geometry_preview = _asset_geometry_preview_path_for_collection(collection, preview_dir)
+    if geometry_preview:
+        return geometry_preview
+
+    image = _first_image_from_collection_materials(collection)
+    if image is None:
+        return ""
+    existing = _image_filepath_if_loadable(image)
+    if existing:
+        return existing
+    if not preview_dir:
+        return ""
+    try:
+        os.makedirs(preview_dir, exist_ok=True)
+        preview_path = os.path.join(preview_dir, _asset_preview_filename(getattr(collection, "name", "") or getattr(image, "name", "")))
+        _save_image_as_png(image, preview_path)
+        return preview_path if os.path.isfile(preview_path) else ""
+    except Exception:
+        return ""
+
+
+def _stable_preview_color(name: str):
+    seed = sum((idx + 1) * ord(ch) for idx, ch in enumerate(str(name or "")))
+    palette = (
+        (0.62, 0.67, 0.63),
+        (0.65, 0.62, 0.56),
+        (0.56, 0.63, 0.69),
+        (0.67, 0.58, 0.57),
+        (0.58, 0.64, 0.58),
+    )
+    return palette[seed % len(palette)]
+
+
+def _preview_material_color(obj, material_index: int):
+    mat = None
+    slots = getattr(obj, "material_slots", []) or []
+    if 0 <= material_index < len(slots):
+        mat = getattr(slots[material_index], "material", None)
+    if mat is not None:
+        try:
+            color = tuple(float(v) for v in getattr(mat, "diffuse_color", ()))
+            if len(color) >= 3 and max(color[:3]) > 0.02:
+                return color[:3]
+        except Exception:
+            pass
+    return _stable_preview_color(getattr(obj, "name", ""))
+
+
+def _collect_collection_preview_geometry(collection, max_faces=900, max_edges=2600):
+    vertices = []
+    triangles = []
+    edges = []
+    face_count = 0
+
+    for obj in _collect_collection_objects_recursive(collection):
+        if obj is None or getattr(obj, "type", None) != "MESH" or getattr(obj, "data", None) is None:
+            continue
+        mesh = obj.data
+        try:
+            matrix_world = obj.matrix_world.copy()
+        except Exception:
+            matrix_world = Matrix.Identity(4)
+        try:
+            world_vertices = [matrix_world @ vert.co for vert in mesh.vertices]
+        except Exception:
+            continue
+        if not world_vertices:
+            continue
+        vertices.extend(world_vertices)
+
+        polys = list(getattr(mesh, "polygons", []) or [])
+        step = max(1, math.ceil(len(polys) / max(1, max_faces - face_count))) if face_count < max_faces else len(polys) + 1
+        for poly in polys[::step]:
+            if face_count >= max_faces:
+                break
+            indices = list(getattr(poly, "vertices", []) or [])
+            if len(indices) < 3:
+                continue
+            color = _preview_material_color(obj, int(getattr(poly, "material_index", 0) or 0))
+            for idx in range(1, len(indices) - 1):
+                try:
+                    p0 = world_vertices[indices[0]]
+                    p1 = world_vertices[indices[idx]]
+                    p2 = world_vertices[indices[idx + 1]]
+                except Exception:
+                    continue
+                normal = (p1 - p0).cross(p2 - p0)
+                if normal.length_squared <= 1e-14:
+                    continue
+                triangles.append((p0, p1, p2, normal.normalized(), color))
+            face_count += 1
+
+        mesh_edges = list(getattr(mesh, "edges", []) or [])
+        edge_step = max(1, math.ceil(len(mesh_edges) / max(1, max_edges - len(edges)))) if len(edges) < max_edges else len(mesh_edges) + 1
+        for edge in mesh_edges[::edge_step]:
+            if len(edges) >= max_edges:
+                break
+            try:
+                a, b = edge.vertices
+                edges.append((world_vertices[a], world_vertices[b]))
+            except Exception:
+                continue
+
+    return vertices, triangles, edges
+
+
+def _preview_projection_axes():
+    view_dir = Vector((1.7, -2.2, 1.35)).normalized()
+    right = Vector((0.0, 0.0, 1.0)).cross(view_dir)
+    if right.length_squared <= 1e-12:
+        right = Vector((1.0, 0.0, 0.0))
+    right.normalize()
+    up = view_dir.cross(right)
+    if up.length_squared <= 1e-12:
+        up = Vector((0.0, 1.0, 0.0))
+    up.normalize()
+    return right, up, view_dir
+
+
+def _set_preview_pixel(pixels, size, x, y, color, alpha=1.0):
+    x = int(x)
+    y = int(y)
+    if x < 0 or y < 0 or x >= size or y >= size:
+        return
+    offset = (y * size + x) * 4
+    alpha = max(0.0, min(1.0, float(alpha)))
+    inv = 1.0 - alpha
+    pixels[offset] = pixels[offset] * inv + color[0] * alpha
+    pixels[offset + 1] = pixels[offset + 1] * inv + color[1] * alpha
+    pixels[offset + 2] = pixels[offset + 2] * inv + color[2] * alpha
+    pixels[offset + 3] = 1.0
+
+
+def _draw_preview_line(pixels, size, a, b, color, alpha=0.75):
+    x0, y0 = a
+    x1, y1 = b
+    steps = int(max(abs(x1 - x0), abs(y1 - y0), 1))
+    for i in range(steps + 1):
+        t = i / steps
+        x = x0 + (x1 - x0) * t
+        y = y0 + (y1 - y0) * t
+        _set_preview_pixel(pixels, size, round(x), round(y), color, alpha)
+        if size >= 160:
+            _set_preview_pixel(pixels, size, round(x) + 1, round(y), color, alpha * 0.45)
+            _set_preview_pixel(pixels, size, round(x), round(y) + 1, color, alpha * 0.45)
+
+
+def _fill_preview_triangle(pixels, size, p0, p1, p2, color):
+    x0, y0 = p0
+    x1, y1 = p1
+    x2, y2 = p2
+    min_x = max(0, int(math.floor(min(x0, x1, x2))))
+    max_x = min(size - 1, int(math.ceil(max(x0, x1, x2))))
+    min_y = max(0, int(math.floor(min(y0, y1, y2))))
+    max_y = min(size - 1, int(math.ceil(max(y0, y1, y2))))
+    denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
+    if abs(denom) <= 1e-8:
+        return
+    for y in range(min_y, max_y + 1):
+        py = y + 0.5
+        for x in range(min_x, max_x + 1):
+            px = x + 0.5
+            a = ((y1 - y2) * (px - x2) + (x2 - x1) * (py - y2)) / denom
+            b = ((y2 - y0) * (px - x2) + (x0 - x2) * (py - y2)) / denom
+            c = 1.0 - a - b
+            if a >= -1e-5 and b >= -1e-5 and c >= -1e-5:
+                _set_preview_pixel(pixels, size, x, y, color, 0.94)
+
+
+def _asset_geometry_preview_path_for_collection(collection, preview_dir: str, size: int = 160):
+    if collection is None or not preview_dir:
+        return ""
+    vertices, triangles, edges = _collect_collection_preview_geometry(collection)
+    if not vertices:
+        return ""
+
+    right, up, view_dir = _preview_projection_axes()
+    center = sum(vertices, Vector((0.0, 0.0, 0.0))) / len(vertices)
+
+    projected_vertices = [((v - center).dot(right), (v - center).dot(up)) for v in vertices]
+    min_x = min(p[0] for p in projected_vertices)
+    max_x = max(p[0] for p in projected_vertices)
+    min_y = min(p[1] for p in projected_vertices)
+    max_y = max(p[1] for p in projected_vertices)
+    span = max(max_x - min_x, max_y - min_y, 1e-6)
+    scale = (size * 0.76) / span
+    offset_x = size * 0.5 - (min_x + max_x) * 0.5 * scale
+    offset_y = size * 0.5 + (min_y + max_y) * 0.5 * scale
+
+    def project(point):
+        rel = point - center
+        return (
+            rel.dot(right) * scale + offset_x,
+            -rel.dot(up) * scale + offset_y,
+            rel.dot(view_dir),
+        )
+
+    pixels = [0.105, 0.112, 0.118, 1.0] * (size * size)
+    light_dir = Vector((0.35, -0.45, 0.82)).normalized()
+    projected_tris = []
+    for p0, p1, p2, normal, base_color in triangles:
+        shade = 0.45 + 0.55 * max(0.0, abs(normal.dot(light_dir)))
+        color = tuple(max(0.0, min(1.0, c * shade)) for c in base_color)
+        q0 = project(p0)
+        q1 = project(p1)
+        q2 = project(p2)
+        depth = (q0[2] + q1[2] + q2[2]) / 3.0
+        projected_tris.append((depth, q0[:2], q1[:2], q2[:2], color))
+
+    for _depth, q0, q1, q2, color in sorted(projected_tris, key=lambda item: item[0]):
+        _fill_preview_triangle(pixels, size, q0, q1, q2, color)
+
+    wire_color = (0.02, 0.025, 0.025)
+    for p0, p1 in edges:
+        q0 = project(p0)
+        q1 = project(p1)
+        _draw_preview_line(pixels, size, q0[:2], q1[:2], wire_color, alpha=0.72)
+
+    try:
+        os.makedirs(preview_dir, exist_ok=True)
+        preview_path = os.path.join(preview_dir, _asset_preview_filename(getattr(collection, "name", "") or "asset"))
+        image_name = f"NH preview {getattr(collection, 'name', 'asset')}"
+        try:
+            image = bpy.data.images.new(image_name, size, size, alpha=True, float_buffer=False)
+        except TypeError:
+            image = bpy.data.images.new(image_name, size, size, alpha=True)
+        try:
+            image.pixels.foreach_set(pixels)
+            try:
+                image.update()
+            except Exception:
+                pass
+            _save_image_as_png(image, preview_path)
+        finally:
+            _remove_image_if_unused(image)
+        return preview_path if os.path.isfile(preview_path) else ""
+    except Exception:
+        return ""
+
+
+def _mark_collection_as_asset_safe(collection, catalog_id=None, preview_path=None):
     if collection is None:
         return
     try:
@@ -18991,7 +21109,56 @@ def _mark_collection_as_asset_safe(collection, catalog_id=None):
                 collection["catalog_id"] = str(catalog_id)
         except Exception:
             pass
-    _generate_asset_preview_safe(collection)
+    if not _load_custom_asset_preview_safe(collection, preview_path or ""):
+        _generate_asset_preview_safe(collection)
+
+
+def _clear_asset_mark_safe(id_data):
+    if id_data is None:
+        return
+    try:
+        if getattr(id_data, "asset_data", None) is not None:
+            id_data.asset_clear()
+    except Exception:
+        pass
+
+
+def _asset_instancer_name_for_collection(collection, filepath: str):
+    base = os.path.splitext(os.path.basename(filepath or ""))[0]
+    if not base:
+        base = getattr(collection, "name", "") or "Asset"
+    if not base.lower().endswith(".p3d"):
+        base += ".p3d"
+    return base
+
+
+def _create_asset_instancer_for_collection(asset_root, collection, filepath: str, catalog_id=None, preview_dir=None, render_textured_previews=False):
+    if asset_root is None or collection is None:
+        return None
+    name = _asset_instancer_name_for_collection(collection, filepath)
+    instancer = bpy.data.objects.new(name, None)
+    try:
+        instancer.empty_display_type = "CUBE"
+        instancer.empty_display_size = 1.0
+    except Exception:
+        pass
+    try:
+        instancer.instance_type = "COLLECTION"
+        instancer.instance_collection = collection
+    except Exception:
+        pass
+    try:
+        instancer[_IE_SOURCE_PATH_KEY] = _norm_path(bpy.path.abspath(filepath))
+    except Exception:
+        pass
+    try:
+        asset_root.objects.link(instancer)
+    except Exception:
+        pass
+    preview_path = _asset_preview_path_for_collection(collection, preview_dir or "", render_textured_previews=render_textured_previews)
+    _clear_asset_mark_safe(collection)
+    _mark_object_as_asset_safe(instancer, catalog_id=catalog_id, preview_path=preview_path)
+    return instancer
 
 
 def _mark_objects_in_collection_as_assets_safe(collection):
@@ -19009,7 +21176,7 @@ def _mark_objects_in_collection_as_assets_safe(collection):
             continue
         _mark_object_as_asset_safe(obj)
 
-def _move_import_result_into_asset_library(context, filepath, pre_obj_ptrs, pre_col_ptrs, asset_root, catalog_id=None):
+def _move_import_result_into_asset_library(context, filepath, pre_obj_ptrs, pre_col_ptrs, asset_root, catalog_id=None, preview_dir=None, render_textured_previews=False):
     imported_objs = [o for o in bpy.data.objects if o.as_pointer() not in pre_obj_ptrs]
     _tag_import_source_on_imported_data(
         context=context,
@@ -19055,7 +21222,7 @@ def _move_import_result_into_asset_library(context, filepath, pre_obj_ptrs, pre_
                 col[_IE_SOURCE_PATH_KEY] = _norm_path(bpy.path.abspath(filepath))
             except Exception:
                 pass
-            _mark_collection_as_asset_safe(col, catalog_id=catalog_id)
+            _create_asset_instancer_for_collection(asset_root, col, filepath, catalog_id=catalog_id, preview_dir=preview_dir, render_textured_previews=render_textured_previews)
             moved += 1
     else:
         name = os.path.splitext(os.path.basename(filepath))[0]
@@ -19075,7 +21242,7 @@ def _move_import_result_into_asset_library(context, filepath, pre_obj_ptrs, pre_
             col[_IE_SOURCE_PATH_KEY] = _norm_path(bpy.path.abspath(filepath))
         except Exception:
             pass
-        _mark_collection_as_asset_safe(col, catalog_id=catalog_id)
+        _create_asset_instancer_for_collection(asset_root, col, filepath, catalog_id=catalog_id, preview_dir=preview_dir, render_textured_previews=render_textured_previews)
         moved = 1
 
     return moved, len(imported_objs)
@@ -19083,6 +21250,18 @@ def _move_import_result_into_asset_library(context, filepath, pre_obj_ptrs, pre_
 
 class CRAY_PG_AssetLibrarySettings(PropertyGroup):
     folder: StringProperty(name="P3D Folder", default="", subtype="DIR_PATH")
+    common_root: StringProperty(
+        name="Common Folder",
+        default=_NH_OBJECTS_DEFAULT_COMMON_ROOT,
+        subtype="DIR_PATH",
+        description="Папка Common с .p3d ассетами; подпапка Buildings игнорируется",
+    )
+    environment_root: StringProperty(
+        name="Environment Folder",
+        default=_NH_OBJECTS_DEFAULT_ENVIRONMENT_ROOT,
+        subtype="DIR_PATH",
+        description="Папка Environment с .p3d ассетами",
+    )
     import_first_lod_only: BoolProperty(
         name="Import first LOD only",
         default=True,
@@ -19090,6 +21269,16 @@ class CRAY_PG_AssetLibrarySettings(PropertyGroup):
     clear_previous_temp_library: BoolProperty(
         name="Clear previous temp library",
         default=True,
+    )
+    rebuild_existing_libraries: BoolProperty(
+        name="Rebuild existing NH libraries",
+        default=False,
+        description="Заново импортировать папки, даже если кешированная _NH_AssetLibrary.blend библиотека уже актуальна",
+    )
+    render_textured_previews: BoolProperty(
+        name="Textured rendered previews",
+        default=False,
+        description="Рендерить иконки Asset Browser с уже кешированными текстурами. Если PNG для .paa еще нет в кеше, иконка быстро создается как geometry preview без конвертации текстуры",
     )
 
 class CRAY_OT_AssetLibraryBuildFromFolder(Operator):
@@ -19154,6 +21343,416 @@ class CRAY_OT_AssetLibraryClear(Operator):
     def execute(self, context):
         removed = _clear_temp_asset_library(context)
         self.report({"INFO"}, f"Cleared temp asset library ({removed} collection(s))")
+        return {"FINISHED"}
+
+
+def _find_registered_asset_library_by_path(path_abs: str):
+    libraries = getattr(getattr(bpy.context, "preferences", None), "filepaths", None)
+    libraries = getattr(libraries, "asset_libraries", None)
+    if libraries is None:
+        return None, -1
+
+    wanted = os.path.normcase(os.path.abspath(bpy.path.abspath(path_abs)))
+    for idx, lib in enumerate(libraries):
+        try:
+            lib_path = os.path.normcase(os.path.abspath(bpy.path.abspath(getattr(lib, "path", "") or "")))
+        except Exception:
+            lib_path = ""
+        if lib_path == wanted:
+            return lib, idx
+    return None, -1
+
+
+def _find_registered_asset_library_by_name(name: str):
+    libraries = getattr(getattr(bpy.context, "preferences", None), "filepaths", None)
+    libraries = getattr(libraries, "asset_libraries", None)
+    if libraries is None:
+        return None, -1
+
+    wanted = str(name or "").strip()
+    if not wanted:
+        return None, -1
+    for idx, lib in enumerate(libraries):
+        try:
+            lib_name = str(getattr(lib, "name", "") or "").strip()
+        except Exception:
+            lib_name = ""
+        if lib_name == wanted:
+            return lib, idx
+    return None, -1
+
+
+def _ensure_blender_asset_library_registered(name: str, path_abs: str):
+    if not path_abs or not os.path.isdir(path_abs):
+        return False
+
+    lib, _idx = _find_registered_asset_library_by_path(path_abs)
+    if lib is None:
+        lib, _idx = _find_registered_asset_library_by_name(name)
+    if lib is None:
+        try:
+            result = bpy.ops.preferences.asset_library_add(directory=path_abs)
+        except Exception:
+            result = {"CANCELLED"}
+        if "FINISHED" not in set(result or []):
+            return False
+        lib, _idx = _find_registered_asset_library_by_path(path_abs)
+
+    if lib is None:
+        return False
+
+    try:
+        lib.name = name
+    except Exception:
+        pass
+    try:
+        lib.path = path_abs
+    except Exception:
+        pass
+    try:
+        lib.enabled = True
+    except Exception:
+        pass
+    try:
+        lib.import_method = "APPEND_REUSE"
+    except Exception:
+        pass
+    try:
+        lib.use_relative_path = False
+    except Exception:
+        pass
+    return True
+
+
+def _register_nh_objects_blender_asset_libraries():
+    registered = 0
+    missing = []
+    settings = _nh_asset_library_settings()
+    for name, root_abs in _iter_nh_objects_asset_roots(settings):
+        if _ensure_blender_asset_library_registered(name, root_abs):
+            registered += 1
+        else:
+            missing.append(root_abs)
+    try:
+        bpy.ops.wm.save_userpref()
+    except Exception:
+        pass
+    return registered, missing
+
+
+def _p3d_file_manifest_entry(folder_abs: str, filepath: str):
+    stat = os.stat(filepath)
+    try:
+        rel_path = os.path.relpath(filepath, folder_abs)
+    except Exception:
+        rel_path = os.path.basename(filepath)
+    rel_path = rel_path.replace(os.sep, "/")
+    return {
+        "path": rel_path,
+        "size": int(getattr(stat, "st_size", 0) or 0),
+        "mtime_ns": int(getattr(stat, "st_mtime_ns", int(getattr(stat, "st_mtime", 0.0) * 1000000000))),
+    }
+
+
+def _p3d_folder_manifest(source_folder_abs: str, p3d_files, settings=None):
+    entries = []
+    for fp in sorted((p3d_files or []), key=lambda item: item.lower()):
+        if not fp or not os.path.isfile(fp):
+            continue
+        try:
+            entries.append(_p3d_file_manifest_entry(source_folder_abs, fp))
+        except Exception:
+            continue
+    preview_mode = "rendered_textured_cached_only" if bool(getattr(settings, "render_textured_previews", False)) else "geometry"
+    return {
+        "version": _NH_OBJECTS_ASSET_MANIFEST_VERSION,
+        "asset_blend": _NH_OBJECTS_ASSET_BLEND_NAME,
+        "source_folder": _norm_path(source_folder_abs),
+        "preview_mode": preview_mode,
+        "files": entries,
+    }
+
+
+def _read_json_file(filepath: str):
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _write_persistent_asset_library_manifest(cache_folder_abs: str, source_folder_abs: str, p3d_files, blend_path: str, asset_entries: int, settings=None):
+    os.makedirs(cache_folder_abs, exist_ok=True)
+    manifest = _p3d_folder_manifest(source_folder_abs, p3d_files, settings=settings)
+    manifest["asset_blend"] = os.path.basename(blend_path or _NH_OBJECTS_ASSET_BLEND_NAME)
+    manifest["asset_entries"] = int(asset_entries or 0)
+    manifest_path = _nh_asset_manifest_path_for_folder(cache_folder_abs)
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2, sort_keys=True)
+    return manifest_path
+
+
+def _persistent_asset_library_is_current(source_folder_abs: str, p3d_files, settings=None):
+    cache_folder_abs = _nh_asset_cache_folder_for_source_folder(source_folder_abs, settings, create=False)
+    blend_path = _nh_asset_blend_path_for_folder(cache_folder_abs)
+    if not os.path.isfile(blend_path):
+        return False
+    manifest_path = _nh_asset_manifest_path_for_folder(cache_folder_abs)
+    saved_manifest = _read_json_file(manifest_path)
+    if not isinstance(saved_manifest, dict):
+        return False
+    current_manifest = _p3d_folder_manifest(source_folder_abs, p3d_files, settings=settings)
+    if int(saved_manifest.get("version", 0) or 0) != int(current_manifest.get("version", 0) or 0):
+        return False
+    if str(saved_manifest.get("preview_mode", "") or "") != str(current_manifest.get("preview_mode", "") or ""):
+        return False
+    return list(saved_manifest.get("files", []) or []) == list(current_manifest.get("files", []) or [])
+
+
+def _write_persistent_asset_library_blend(folder_abs: str, asset_root):
+    asset_objects = [
+        obj for obj in list(getattr(asset_root, "objects", []) or [])
+        if obj is not None and getattr(obj, "asset_data", None) is not None
+    ]
+    if not asset_objects:
+        raise RuntimeError("No imported asset objects to write")
+
+    os.makedirs(folder_abs, exist_ok=True)
+    blend_path = _nh_asset_blend_path_for_folder(folder_abs)
+    datablocks = set(asset_objects)
+    try:
+        bpy.data.libraries.write(blend_path, datablocks, fake_user=True, compress=True)
+    except TypeError:
+        bpy.data.libraries.write(blend_path, datablocks, fake_user=True)
+    return blend_path, len(asset_objects)
+
+
+def _build_persistent_asset_library_for_folder(context, folder_abs: str, p3d_files, settings):
+    _clear_temp_asset_library(context)
+    asset_root = _ensure_temp_asset_library_root(context)
+    cache_folder_abs = _nh_asset_cache_folder_for_source_folder(folder_abs, settings, create=True)
+    preview_dir = os.path.join(cache_folder_abs, _NH_OBJECTS_ASSET_PREVIEWS_FOLDER_NAME)
+    catalog_path = _nh_asset_catalog_path_for_source_folder(folder_abs, settings)
+    library_label = "NH Objects"
+    for name, root_abs in _iter_nh_objects_asset_roots(settings):
+        if _path_is_under_or_equal(cache_folder_abs, root_abs):
+            library_label = name
+            break
+    catalog_id = _nh_asset_catalog_id(library_label, catalog_path)
+
+    imported = 0
+    moved_collections = 0
+    previewed = 0
+    textured_candidates = 0
+    packed_preview_images = 0
+    failed = []
+    preview_errors = []
+    try:
+        for fp in p3d_files:
+            pre_obj_ptrs = {o.as_pointer() for o in bpy.data.objects}
+            pre_col_ptrs = {c.as_pointer() for c in bpy.data.collections}
+            with _suppress_a3ob_import_tracking():
+                res, _op_id, err = _call_first_available(
+                    _A3OB_IMPORT_CANDIDATES,
+                    filepath=fp,
+                    first_lod_only=True,
+                    absolute_paths=True,
+                    enclose=True,
+                    groupby="TYPE",
+                    additional_data_allowed=True,
+                    additional_data={"PROPS", "SELECTIONS", "UV", "MATERIALS"},
+                    validate_meshes=False,
+                    proxy_action="SEPARATE",
+                    translate_selections=False,
+                    cleanup_empty_selections=False,
+                    load_textures=False,
+                )
+            if res is None:
+                failed.append(f"{os.path.basename(fp)}: {_fmt_exc(err) if err else 'import failed'}")
+                continue
+            imported += 1
+            imported_objs = [o for o in bpy.data.objects if o.as_pointer() not in pre_obj_ptrs]
+            try:
+                preview_stats = _postprocess_imported_material_previews(
+                    context,
+                    imported_objs,
+                    show_materials=True,
+                    keep_converted_textures=True,
+                    pack_runtime_images=False,
+                    cache_missing_textures=False,
+                )
+                previewed += int(preview_stats.get("previewed", 0) or 0)
+                textured_candidates += int(preview_stats.get("textured_candidates", 0) or 0)
+                packed_preview_images += int(preview_stats.get("packed", 0) or 0)
+                for item in preview_stats.get("errors", []) or []:
+                    preview_errors.append(f"{os.path.basename(fp)}: {item}")
+            except Exception as e:
+                preview_errors.append(f"{os.path.basename(fp)}: {_fmt_exc(e)}")
+            moved, _obj_count = _move_import_result_into_asset_library(
+                context,
+                fp,
+                pre_obj_ptrs,
+                pre_col_ptrs,
+                asset_root,
+                catalog_id=catalog_id,
+                preview_dir=preview_dir,
+                render_textured_previews=bool(getattr(settings, "render_textured_previews", False)),
+            )
+            moved_collections += moved
+
+        if imported <= 0:
+            raise RuntimeError("No .p3d files imported")
+
+        blend_path, asset_entries = _write_persistent_asset_library_blend(cache_folder_abs, asset_root)
+        manifest_path = _write_persistent_asset_library_manifest(cache_folder_abs, folder_abs, p3d_files, blend_path, asset_entries, settings=settings)
+        return {
+            "folder": folder_abs,
+            "cache_folder": cache_folder_abs,
+            "blend_path": blend_path,
+            "manifest_path": manifest_path,
+            "imported": imported,
+            "asset_entries": asset_entries,
+            "moved_collections": moved_collections,
+            "previewed": previewed,
+            "textured_candidates": textured_candidates,
+            "packed_preview_images": packed_preview_images,
+            "failed": failed,
+            "preview_errors": preview_errors,
+        }
+    finally:
+        _clear_temp_asset_library(context)
+
+
+def _build_nh_objects_persistent_asset_libraries(op, context):
+    settings = context.scene.cray_asset_library_settings
+    if not _has_any_a3ob_import_ops():
+        op.report({"ERROR"}, "Arma 3 Object Builder import operators not found")
+        return {"CANCELLED"}
+
+    registered, missing_roots = _register_nh_objects_blender_asset_libraries()
+    configured_roots = [
+        ("Common", _nh_objects_common_root(settings)),
+        ("Environment", _nh_objects_environment_root(settings)),
+    ]
+    missing_configured = [f"{label}: {path}" for label, path in configured_roots if not os.path.isdir(path)]
+    if missing_configured:
+        op.report({"ERROR"}, "Set valid Common and Environment folders")
+        print("=== NH Objects Asset Libraries: Missing configured roots ===")
+        for item in missing_configured:
+            print(item)
+        return {"CANCELLED"}
+
+    folders = list(_iter_nh_objects_asset_source_folders(settings))
+    if not folders:
+        op.report({"ERROR"}, "No .p3d folders found in NH_Objects Common/Environment")
+        return {"CANCELLED"}
+    for cache_root, catalog_paths in _nh_asset_catalog_paths_by_cache_root(folders, settings).items():
+        try:
+            _write_nh_asset_catalog_file(cache_root, catalog_paths)
+        except Exception as e:
+            print(f"NH Objects Asset Catalogs: {cache_root}: {_fmt_exc(e)}")
+
+    built = 0
+    skipped_current = 0
+    imported_total = 0
+    asset_entries_total = 0
+    previewed_total = 0
+    textured_candidates_total = 0
+    packed_preview_images_total = 0
+    failed = []
+    preview_errors = []
+    rebuild = bool(getattr(settings, "rebuild_existing_libraries", False))
+    try:
+        settings.import_first_lod_only = True
+    except Exception:
+        pass
+
+    for folder_abs in folders:
+        p3d_files = _iter_p3d_files_direct(folder_abs, settings)
+        if not p3d_files:
+            continue
+        if not rebuild and _persistent_asset_library_is_current(folder_abs, p3d_files, settings):
+            skipped_current += 1
+            continue
+        try:
+            stats = _build_persistent_asset_library_for_folder(context, folder_abs, p3d_files, settings)
+        except Exception as e:
+            failed.append(f"{folder_abs}: {_fmt_exc(e)}")
+            continue
+        built += 1
+        imported_total += int(stats.get("imported", 0))
+        asset_entries_total += int(stats.get("asset_entries", 0))
+        previewed_total += int(stats.get("previewed", 0))
+        textured_candidates_total += int(stats.get("textured_candidates", 0))
+        packed_preview_images_total += int(stats.get("packed_preview_images", 0))
+        for item in stats.get("failed", []) or []:
+            failed.append(f"{folder_abs}: {item}")
+        for item in stats.get("preview_errors", []) or []:
+            preview_errors.append(f"{folder_abs}: {item}")
+
+    if failed:
+        print("=== NH Objects Persistent Asset Libraries: Failures ===")
+        for item in failed:
+            print(item)
+    if preview_errors:
+        print("=== NH Objects Persistent Asset Libraries: Material preview warnings ===")
+        for item in preview_errors:
+            print(item)
+    if missing_roots:
+        print("=== NH Objects Asset Libraries: Missing roots ===")
+        for item in missing_roots:
+            print(item)
+
+    if built == 0 and skipped_current == 0:
+        op.report({"ERROR"}, "No NH asset libraries built (see System Console)")
+        return {"CANCELLED"}
+
+    _open_nh_objects_asset_browser(context, settings)
+
+    msg = (
+        f"NH libraries ready: registered {registered}, built {built}, "
+        f"skipped up-to-date {skipped_current}, imported {imported_total}, assets {asset_entries_total}"
+    )
+    if textured_candidates_total > 0:
+        msg += f", texture previews {previewed_total}/{textured_candidates_total}"
+    if packed_preview_images_total > 0:
+        msg += f", packed {packed_preview_images_total}"
+    if failed:
+        op.report({"WARNING"}, msg + f", failed {len(failed)} (see System Console)")
+    elif preview_errors:
+        op.report({"WARNING"}, msg + f", preview warnings {len(preview_errors)} (see System Console)")
+    else:
+        op.report({"INFO"}, msg)
+    return {"FINISHED"}
+
+
+class CRAY_OT_AssetLibraryBuildNHObjects(Operator):
+    bl_idname = "cray.asset_library_build_nh_objects"
+    bl_label = "Build NH Libraries"
+    bl_description = (
+        "Создает или обновляет Blender asset libraries из выбранных папок Common и Environment, "
+        "включая подпапки и исключая Common\\Buildings"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        return _build_nh_objects_persistent_asset_libraries(self, context)
+
+
+class CRAY_OT_AssetLibraryOpenNHBrowser(Operator):
+    bl_idname = "cray.asset_library_open_nh_browser"
+    bl_label = "Open NH Asset Browser"
+    bl_description = "Open the Asset Browser and show the registered NH Objects asset libraries"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        settings = context.scene.cray_asset_library_settings
+        _register_nh_objects_blender_asset_libraries()
+        area = _open_nh_objects_asset_browser(context, settings)
+        if area is None:
+            self.report({"WARNING"}, "Open an Asset Browser and select NH Objects - Common or NH Objects - Environment")
+        else:
+            self.report({"INFO"}, "NH Asset Browser opened")
         return {"FINISHED"}
 
 
@@ -19241,7 +21840,7 @@ def _ensure_asset_catalog_and_activate(context, area, catalog_name=_ASSET_CATALO
     return str(catalog_id)
 
 
-def _switch_bottom_area_to_asset_browser(context):
+def _switch_bottom_area_to_asset_browser(context, asset_library_reference="LOCAL"):
     window = getattr(context, "window", None)
     screen = getattr(window, "screen", None) if window else None
     if screen is None:
@@ -19301,13 +21900,24 @@ def _switch_bottom_area_to_asset_browser(context):
                     params.display_type = "THUMBNAIL"
                 except Exception:
                     pass
-                for attr_name, attr_value in (
-                    ("asset_library_reference", "LOCAL"),
-                    ("catalog_id", ""),
-                    ("import_method", "APPEND_REUSE"),
+                library_ref = str(asset_library_reference or "LOCAL")
+                library_refs = [library_ref]
+                if library_ref not in {"LOCAL", "ESSENTIALS", "ALL"}:
+                    library_refs.extend(["ALL", "LOCAL"])
+
+                for attr_name, attr_values in (
+                    ("asset_library_reference", library_refs),
+                    ("asset_library_ref", library_refs),
+                    ("catalog_id", [""]),
+                    ("import_method", ["APPEND_REUSE"]),
                 ):
                     try:
-                        setattr(params, attr_name, attr_value)
+                        for attr_value in attr_values:
+                            try:
+                                setattr(params, attr_name, attr_value)
+                                break
+                            except Exception:
+                                continue
                     except Exception:
                         pass
             ok = True
@@ -19321,6 +21931,25 @@ def _switch_bottom_area_to_asset_browser(context):
     except Exception:
         pass
     return area if ok else None
+
+
+def _first_nh_objects_asset_library_reference(settings=None):
+    for name, root_abs in _iter_nh_objects_asset_roots(settings):
+        lib, _idx = _find_registered_asset_library_by_path(root_abs)
+        if lib is not None:
+            try:
+                return str(getattr(lib, "name", "") or name)
+            except Exception:
+                return name
+    for name, _root_abs in _iter_nh_objects_asset_roots(settings):
+        return name
+    return "ALL"
+
+
+def _open_nh_objects_asset_browser(context, settings=None):
+    library_ref = _first_nh_objects_asset_library_reference(settings)
+    return _switch_bottom_area_to_asset_browser(context, asset_library_reference=library_ref)
+
 
 def _build_temp_asset_library_from_paths(op, context, filepaths):
     st = context.scene.cray_asset_library_settings
@@ -19403,13 +22032,13 @@ class CRAY_OT_ConvertSelectedToProxies(Operator):
     def execute(self, context):
         st = context.scene.cray_asset_proxy_settings
         target_obj = _pick_proxy_target_object(context, st.target_object)
-        if target_obj is None or target_obj.type != "MESH":
-            self.report({"ERROR"}, "Target object must be a mesh")
-            return {"CANCELLED"}
 
-        selected = [o for o in context.selected_objects if o != target_obj]
+        selected = [
+            o for o in context.selected_objects
+            if o != target_obj and _resolve_object_source_p3d(o)
+        ]
         if not selected:
-            self.report({"ERROR"}, "Select placed asset objects together with target object")
+            self.report({"ERROR"}, "Select placed asset objects")
             return {"CANCELLED"}
 
         if context.mode != "OBJECT":
@@ -19420,8 +22049,10 @@ class CRAY_OT_ConvertSelectedToProxies(Operator):
                 return {"CANCELLED"}
 
         target_collection = None
-        if target_obj.users_collection:
+        if target_obj is not None and target_obj.users_collection:
             target_collection = target_obj.users_collection[0]
+        elif selected and selected[0].users_collection:
+            target_collection = selected[0].users_collection[0]
         else:
             target_collection = context.scene.collection
 
@@ -19474,7 +22105,10 @@ class CRAY_OT_ConvertSelectedToProxies(Operator):
             self.report({"ERROR"}, "No proxies created (see System Console)")
             return {"CANCELLED"}
 
-        msg = f"Created {created} proxy(s) for '{target_obj.name}'"
+        if target_obj is not None:
+            msg = f"Created {created} proxy(s) for '{target_obj.name}'"
+        else:
+            msg = f"Created {created} unparented proxy(s)"
         if st.delete_originals:
             msg += f", removed {removed} original(s)"
         if skipped:
@@ -20978,6 +23612,10 @@ class CRAY_PT_ClutterProxiesPanel(Panel):
     bl_order = 22
     bl_options = {"DEFAULT_CLOSED"}
 
+    @classmethod
+    def poll(cls, context):
+        return _is_ui_panel_visible(context, "object_builder")
+
     def draw(self, context):
         layout = self.layout
         s = context.scene.cray_settings
@@ -21021,7 +23659,7 @@ class CRAY_PT_SnapPointsPanel(Panel):
 
     @classmethod
     def poll(cls, context):
-        return True
+        return _is_ui_panel_visible(context, "snap_points")
 
     def draw(self, context):
         layout = self.layout
@@ -21091,7 +23729,7 @@ class CRAY_PT_SnapPointsPanel(Panel):
 
 class CRAY_PT_ColliderPanel(Panel):
     bl_idname = "VIEW3D_PT_cray_collider"
-    bl_label = "Geometry Collider"
+    bl_label = "Geometry LODs"
     bl_category = "NH Plugin"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -21100,88 +23738,11 @@ class CRAY_PT_ColliderPanel(Panel):
 
     @classmethod
     def poll(cls, context):
-        return True
+        return _is_ui_panel_visible(context, "geometry_lods")
 
     def draw(self, context):
         layout = self.layout
         cs = context.scene.cray_collider_settings
-        active_obj = context.view_layer.objects.active
-        active_source_name = active_obj.name if active_obj is not None and active_obj.type == "MESH" else "<active mesh>"
-
-        col = layout.column(align=True)
-        col.label(text="Target")
-        col.label(text=f"Source: {active_source_name}", icon="MESH_DATA")
-        col.prop(cs, "target_lod")
-        row = col.row(align=True)
-        row.prop(cs, "geometry_object")
-        op = row.operator("cray.set_collider_target_from_active", text="", icon="EYEDROPPER")
-        op.target_attr = "GEOMETRY"
-        col.operator("cray.ensure_collider_lod", icon="OUTLINER_OB_MESH")
-        col.prop(cs, "merge_distance")
-        col.prop(cs, "recalc_normals")
-
-        layout.separator()
-
-        hotkeys = layout.box()
-        row = hotkeys.row(align=True)
-        row.label(text="Hotkeys", icon="EVENT_K")
-        row.operator("cray.collider_hotkeys_info", text="", icon="INFO")
-        row.prop(
-            cs,
-            "show_hotkey_button_fallbacks",
-            text="Buttons",
-            emboss=False,
-            icon="TRIA_DOWN" if cs.show_hotkey_button_fallbacks else "TRIA_RIGHT",
-        )
-
-        if cs.show_hotkey_button_fallbacks:
-            box = hotkeys.box()
-            box.operator(
-                "cray.copy_selected_verts_to_geometry",
-                text="Copy Selected Verts To Geometry  [Ctrl+Shift+C]",
-                icon="VERTEXSEL",
-            )
-            box.operator(
-                "cray.select_isolated_vertices",
-                text="Select Isolated Verts  [Mouse5]",
-                icon="VERTEXSEL",
-            )
-            op = box.operator(
-                "cray.build_collider",
-                text="Selection -> Hull  [Mouse4]",
-                icon="MESH_ICOSPHERE",
-            )
-            op.build_mode = "SELECTION_HULL"
-            box.operator(
-                "cray.hull_loose_geometry_verts",
-                text="Selected Loose Geometry Verts -> Hull",
-                icon="MESH_ICOSPHERE",
-            )
-
-        layout.separator()
-
-        adv = layout.box()
-        row = adv.row(align=True)
-        row.label(text="Extra Build", icon="MOD_REMESH")
-        row.prop(
-            cs,
-            "show_advanced_build_buttons",
-            text="Open",
-            emboss=False,
-            icon="TRIA_DOWN" if cs.show_advanced_build_buttons else "TRIA_RIGHT",
-        )
-
-        if cs.show_advanced_build_buttons:
-            adv.prop(cs, "box_thickness")
-            adv.prop(cs, "bounds_padding")
-
-            row = adv.row(align=True)
-            op = row.operator("cray.build_collider", text="Selection -> Box", icon="MESH_CUBE")
-            op.build_mode = "SELECTION_BOX"
-            op = row.operator("cray.build_collider", text="Object -> Bounds", icon="CUBE")
-            op.build_mode = "OBJECT_BOUNDS"
-
-        layout.separator()
 
         fire = layout.box()
         row = fire.row(align=True)
@@ -21231,7 +23792,7 @@ class CRAY_PT_ColliderPanel(Panel):
 
 class CRAY_PT_ColliderExpPanel(Panel):
     bl_idname = "VIEW3D_PT_cray_collider_exp"
-    bl_label = "Geometry Collider (exp)"
+    bl_label = "Collider"
     bl_category = "NH Plugin"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -21240,7 +23801,7 @@ class CRAY_PT_ColliderExpPanel(Panel):
 
     @classmethod
     def poll(cls, context):
-        return True
+        return _is_ui_panel_visible(context, "collider")
 
     def draw(self, context):
         layout = self.layout
@@ -21248,11 +23809,6 @@ class CRAY_PT_ColliderExpPanel(Panel):
         es = getattr(scene, "cray_collider_exp_settings", None)
         if es is None:
             layout.label(text="Experimental collider settings are unavailable.", icon="ERROR")
-            return
-
-        layout.prop(es, "enabled")
-        if not es.enabled:
-            layout.label(text="Experimental tools are disabled. Enable to use.", icon="ERROR")
             return
 
         target = layout.box()
@@ -21377,20 +23933,24 @@ class CRAY_PT_AssetProxyPanel(Panel):
     bl_region_type = "UI"
     bl_options = {"DEFAULT_CLOSED"}
 
+    @classmethod
+    def poll(cls, context):
+        return _is_ui_panel_visible(context, "asset_library")
+
     def draw(self, context):
         layout = self.layout
         lib = context.scene.cray_asset_library_settings
         st = context.scene.cray_asset_proxy_settings
 
         box = layout.box()
-        box.label(text="Temporary Asset Library", icon="ASSET_MANAGER")
-        box.prop(lib, "folder")
-        box.prop(lib, "import_first_lod_only")
-        box.prop(lib, "clear_previous_temp_library")
+        box.label(text="NH Objects Libraries", icon="ASSET_MANAGER")
+        box.prop(lib, "common_root")
+        box.prop(lib, "environment_root")
+        box.prop(lib, "rebuild_existing_libraries")
         row = box.row(align=True)
-        row.operator("cray.asset_library_build_folder", icon="FILE_FOLDER")
-        row.operator("cray.asset_library_build_files", icon="FILEBROWSER")
-        box.operator("cray.asset_library_clear", icon="TRASH")
+        row.operator("cray.asset_library_build_nh_objects", icon="ASSET_MANAGER")
+        row.operator("cray.asset_library_open_nh_browser", text="", icon="FILEBROWSER")
+        box.operator("cray.texture_cache_build_nh_library_used", text="Cache Used Library Textures", icon="TEXTURE")
 
         box = layout.box()
         box.label(text="Placed Assets -> A3OB Proxies", icon="CONSTRAINT")
@@ -21406,6 +23966,10 @@ class CRAY_PT_FixesPanel(Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return _is_ui_panel_visible(context, "fixes")
 
     def draw(self, context):
         layout = self.layout
@@ -21473,6 +24037,10 @@ class CRAY_PT_ImportExportPlannerPanel(Panel):
     bl_region_type = "UI"
     bl_options = {"DEFAULT_CLOSED"}
 
+    @classmethod
+    def poll(cls, context):
+        return _is_ui_panel_visible(context, "import_export")
+
     def draw(self, context):
         layout = self.layout
         st = context.scene.cray_ie_settings
@@ -21525,6 +24093,10 @@ class CRAY_PT_ModelSplitPanel(Panel):
     bl_region_type = "UI"
     bl_options = {"DEFAULT_CLOSED"}
 
+    @classmethod
+    def poll(cls, context):
+        return _is_ui_panel_visible(context, "model_split")
+
     def draw(self, context):
         layout = self.layout
         st = context.scene.cray_model_split_settings
@@ -21562,6 +24134,63 @@ class CRAY_PT_ModelSplitPanel(Panel):
         col.operator("cray.model_split_merge_clear_sources", text="", icon="TRASH")
         merge_box.operator("cray.model_split_merge_selected_collections", text="Merge", icon="OUTLINER_COLLECTION")
 
+class CRAY_PT_CacheManagerPanel(Panel):
+    bl_idname = "VIEW3D_PT_cray_cache_manager"
+    bl_label = "Cache Manager"
+    bl_category = "NH Plugin"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_order = 9999
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return _is_ui_panel_visible(context, "cache_manager")
+
+    def draw(self, context):
+        layout = self.layout
+        ts = context.scene.cray_texreplace_settings
+        lib = context.scene.cray_asset_library_settings
+
+        tbox = layout.box()
+        tbox.label(text="Texture PNG Cache (.paa -> .png)", icon="TEXTURE")
+        row = tbox.row(align=True)
+        op = row.operator("cray.texture_cache_build_nh_library_used", text="Cache NH Used", icon="TEXTURE")
+        op.force_rebuild = False
+        row.operator("cray.texture_cache_rebuild_nh_library_used", text="Rebuild NH Used", icon="FILE_REFRESH")
+        tbox.prop(ts, "texture_cache_source_folder")
+        tbox.prop(ts, "texture_cache_workers")
+        row = tbox.row(align=True)
+        op = row.operator("cray.texture_cache_build", text="Update All Folder", icon="ADD")
+        op.missing_only = True
+        op = row.operator("cray.texture_cache_build", text="Rebuild All (slow)", icon="ERROR")
+        op.missing_only = False
+        row = tbox.row(align=True)
+        row.operator("cray.open_texture_preview_cache_folder", text="Open Texture PNG Cache", icon="FILE_FOLDER")
+        if ts.texture_cache_last_report_path:
+            row.operator("cray.open_texture_cache_last_report", text="Report", icon="TEXT")
+        try:
+            cache_root = _nh_texture_cache_root(create=False)
+            tbox.label(text=f"Cache: {cache_root}")
+        except Exception:
+            pass
+        if ts.texture_cache_last_summary:
+            tbox.label(text=f"Last: {ts.texture_cache_last_summary}")
+
+        lbox = layout.box()
+        lbox.label(text="NH Library / Icon Cache", icon="ASSET_MANAGER")
+        lbox.prop(lib, "render_textured_previews", text="Use textured icons")
+        row = lbox.row(align=True)
+        row.operator("cray.asset_library_build_nh_objects", text="Build / Update Libraries", icon="ASSET_MANAGER")
+        row.operator("cray.asset_library_rebuild_icon_cache", text="Rebuild Icons", icon="IMAGE_DATA")
+        lbox.operator("cray.open_nh_asset_cache_folder", text="Open NH Library Cache", icon="FILE_FOLDER")
+        try:
+            asset_cache = _nh_objects_asset_cache_base(create=False)
+            lbox.label(text=f"Cache: {asset_cache}")
+        except Exception:
+            pass
+
+
 class CRAY_PT_TextureReplacePanel(Panel):
     bl_idname = "VIEW3D_PT_cray_texreplace"
     bl_label = "Texture Replace"
@@ -21569,6 +24198,10 @@ class CRAY_PT_TextureReplacePanel(Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return _is_ui_panel_visible(context, "texture_replace")
 
     def draw(self, context):
         layout = self.layout
@@ -21628,6 +24261,54 @@ class CRAY_PT_TextureReplacePanel(Panel):
             ebox.operator("cray.export_missing_textures_from_sources", icon="FILE_TICK")
 
 
+class CRAY_PT_MenuSettingsPanel(Panel):
+    bl_idname = "VIEW3D_PT_cray_menu_settings"
+    bl_label = "Menu Settings"
+    bl_category = "NH Plugin"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_order = 10000
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.cray_ui_panel_settings
+
+        box = layout.box()
+        box.label(text="Panel Visibility", icon="PREFERENCES")
+        box.label(text="Drag panel handles to reorder", icon="INFO")
+
+        for key, label, _class_name in _UI_PANEL_LAYOUT_DEFINITIONS:
+            row = box.row(align=True)
+            row.prop(settings, f"show_{key}", text="")
+            row.label(text=label)
+
+        layout.separator()
+        keybind_box = layout.box()
+        row = keybind_box.row(align=True)
+        row.prop(
+            settings,
+            "show_custom_keybinds",
+            text="Custom Keybinds",
+            icon="TRIA_DOWN" if settings.show_custom_keybinds else "TRIA_RIGHT",
+            emboss=False,
+        )
+
+        if settings.show_custom_keybinds:
+            for shortcut, action, status_key in _CUSTOM_KEYBIND_DEFINITIONS:
+                action_text = action
+                enabled = True
+                if status_key == "plain_axis" and not _PLAIN_AXIS_HOTKEY_REGISTERED:
+                    action_text = f"{action} (shortcut busy)"
+                    enabled = False
+
+                row = keybind_box.row(align=True)
+                row.enabled = enabled
+                split = row.split(factor=0.36, align=True)
+                split.label(text=shortcut)
+                split.label(text=action_text)
+
+
 # ------------------------------------------------------------------------
 #  Registration
 # ------------------------------------------------------------------------
@@ -21637,6 +24318,7 @@ classes = (
     CRAY_PG_SnapSettings,
     CRAY_PG_ColliderSettings,
     CRAY_PG_ColliderExpSettings,
+    CRAY_PG_UIPanelSettings,
     CRAY_OT_LoadConfig,
     CRAY_OT_ScatterProxies,
     CRAY_OT_EnsureMemoryLOD,
@@ -21693,6 +24375,13 @@ classes = (
     CRAY_OT_CleanTextureConverterTestOutputs,
     CRAY_OT_CancelTextureExport,
     CRAY_OT_ExportMissingTexturesFromSources,
+    CRAY_OT_TextureCacheBuild,
+    CRAY_OT_TextureCacheBuildNHLibraryUsed,
+    CRAY_OT_OpenTexturePreviewCacheFolder,
+    CRAY_OT_OpenTextureCacheLastReport,
+    CRAY_OT_OpenNHAssetCacheFolder,
+    CRAY_OT_AssetLibraryRebuildIconCache,
+    CRAY_OT_TextureCacheRebuildNHLibraryUsed,
 
     CRAY_PG_IEFileItem,
     CRAY_PG_IEPlannerSettings,
@@ -21705,6 +24394,8 @@ classes = (
     CRAY_OT_AssetLibraryBuildFromFolder,
     CRAY_OT_AssetLibraryBuildFromFiles,
     CRAY_OT_AssetLibraryClear,
+    CRAY_OT_AssetLibraryBuildNHObjects,
+    CRAY_OT_AssetLibraryOpenNHBrowser,
     CRAY_OT_IE_AddFiles,
     CRAY_OT_P3DDropMenu,
     CRAY_MT_P3DDropMenu,
@@ -21735,6 +24426,8 @@ classes = (
     CRAY_PT_ImportExportPlannerPanel,
     CRAY_PT_ModelSplitPanel,
     CRAY_PT_TextureReplacePanel,
+    CRAY_PT_CacheManagerPanel,
+    CRAY_PT_MenuSettingsPanel,
 )
 
 def register():
@@ -21751,6 +24444,7 @@ def register():
     bpy.types.Scene.cray_model_split_settings = PointerProperty(type=CRAY_PG_ModelSplitSettings)
     bpy.types.Scene.cray_asset_library_settings = PointerProperty(type=CRAY_PG_AssetLibrarySettings)
     bpy.types.Scene.cray_asset_proxy_settings = PointerProperty(type=CRAY_PG_AssetProxySettings)
+    bpy.types.Scene.cray_ui_panel_settings = PointerProperty(type=CRAY_PG_UIPanelSettings)
     _PERSISTED_UI_STATE_CACHE = _read_persisted_ui_state()
     _apply_persisted_ui_state_to_all_scenes(only_if_default=True)
     _PERSISTED_UI_STATE_CACHE = _collect_persisted_ui_state(getattr(bpy.context, "scene", None))
@@ -21783,6 +24477,7 @@ def unregister():
         bpy.app.timers.unregister(_ensure_a3ob_p3d_file_handler_patch_timer)
     _unpatch_a3ob_p3d_file_handler()
     _unpatch_a3ob_import_read_file()
+    del bpy.types.Scene.cray_ui_panel_settings
     del bpy.types.Scene.cray_asset_proxy_settings
     del bpy.types.Scene.cray_asset_library_settings
     del bpy.types.Scene.cray_model_split_settings
