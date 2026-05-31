@@ -4,9 +4,9 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 
 Расположение в Blender: `3D Viewport -> N Panel -> NH Plugin`
 
-Текущая релизная версия: **0.4.9.1**
+Текущая релизная версия: **0.5.3.0**
 
-Состояние ветки: актуальный релиз `0.4.9.1`; подробности изменений описаны в [CHANGELOG.md](CHANGELOG.md).
+Состояние ветки: актуальный релиз `0.5.3.0`; подробности изменений описаны в [CHANGELOG.md](CHANGELOG.md).
 
 ## Возможности
 
@@ -15,22 +15,28 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 - Collider LOD workflow для `Geometry` / `View Geometry` / `Fire Geometry`
 - `Misc / Roadway` workflow для подготовки walkway-LOD мешей
 - `Texture Replace` через A3OB material properties (`.paa` / `.rvmat`)
+- общий PNG-кеш превью для `.paa`, чтобы импорт, карточки материалов и asset icons не конвертировали одни и те же текстуры заново
 - Batch import/export `.p3d`
 - `Import/Export planner` с быстрым добавлением моделей по имени из `NH_Objects`
 - `Model Split` для part-моделей и named standalone-моделей
-- Temporary `P3D Asset Library` и конвертация размещённых объектов в A3OB proxy
+- `P3D Asset Library`: temporary library, persistent `NH_Objects` asset libraries для `Common` / `Environment`, кастомные иконки Asset Browser и конвертация размещённых объектов в A3OB proxy
+- `Cache Manager` для обновления кеша текстур, пересборки NH-библиотек и открытия папок кеша
+- `Menu Settings` для включения/скрытия панелей `NH Plugin` и просмотра кастомных хоткеев
 - `Fixes` для shading, иерархии, component-fix списков и чистки проблемной геометрии
 
 ## Основные панели
 
-- `Geometry Collider`
+- `Collider`
+- `Geometry LODs`
 - `Clutter Proxies (DayZ)`
 - `Snap Points (Memory LOD)`
 - `P3D Asset Library`
 - `Fixes`
 - `Import/Export planner`
 - `Model Split`
+- `Cache Manager`
 - `Texture Replace`
+- `Menu Settings`
 
 ## Snap Points
 
@@ -67,8 +73,9 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 Основные хоткеи:
 
 - `Ctrl+Shift+C` — `Copy Selected Verts To Geometry`
-- `Mouse5` — `Select Isolated Verts`
+- `Ctrl+Shift+X` — `Select Isolated Verts`
 - `Mouse4` — `Selection -> Hull`
+- `Mouse5` — `Selection -> Box`
 
 ### Misc / Roadway
 
@@ -161,7 +168,22 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 
 - временно импортировать набор `.p3d`
 - собирать temporary asset library
+- собирать persistent Blender asset libraries из `NH_Objects/Common` и `NH_Objects/Environment`
+- регистрировать библиотеки `NH Objects - Common` и `NH Objects - Environment` в Asset Browser
+- создавать быстрые geometry-preview и, при включенном `Use textured icons`, textured rendered previews по уже готовому кешу текстур
+- пропускать уже актуальные библиотеки по manifest-файлу и пересобирать только изменившиеся папки
 - конвертировать расставленные объекты в A3OB proxies
+
+Для `NH_Objects` workflow укажите корни `Common` и `Environment`, затем нажмите `Build NH Libraries`. После сборки можно открыть Asset Browser кнопкой рядом с build-кнопкой или через `Cache Manager`.
+
+## Cache Manager
+
+Панель `Cache Manager` собирает операции с кешами в одном месте:
+
+- `Cache NH Used` / `Rebuild NH Used` обновляют PNG-кеш только для текстур, реально использованных в NH-библиотеках
+- `Update All Folder` / `Rebuild All (slow)` работают с выбранной папкой текстур целиком
+- `Open Texture PNG Cache` и `Report` открывают папку кеша и последний отчет
+- `Build / Update Libraries`, `Rebuild Icons` и `Open NH Library Cache` управляют кешируемыми `.blend`-библиотеками и их иконками
 
 ## Texture Replace
 
@@ -170,6 +192,19 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 - собирать базу `.paa` / `.rvmat` из папки
 - находить материалы объекта
 - заменять texture/material paths через A3OB-compatible material properties
+- обновлять material preview nodes и переиспользовать общий PNG-кеш `.paa -> .png`
+
+## Menu Settings
+
+Панель `Menu Settings` позволяет скрывать редко используемые блоки `NH Plugin`, оставляя в `N-panel` только нужный workflow.
+
+В блоке `Custom Keybinds` можно быстро посмотреть актуальные привязки:
+
+- `Ctrl+Shift+C` — `Copy Selected Verts To Geometry`
+- `Ctrl+Shift+X` — `Select Isolated Verts`
+- `Mouse4` — `Selection -> Hull`
+- `Mouse5` — `Selection -> Box`
+- `Ctrl+Shift+P` — `Create Plain Axis Pivot`, если хоткей свободен
 
 ## Требования
 
@@ -200,8 +235,10 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 
 Коротко по актуальному состоянию:
 
+- `0.5.3.0` (`2026-05-31`) — PNG-кеш превью текстур, persistent `NH_Objects` asset libraries для `Common` / `Environment`, кастомные иконки Asset Browser, `Cache Manager`, `Menu Settings`, обновленные хоткеи collider workflow и улучшения proxy/collider target selection
+- `0.5.2.31` (`2026-05-29`) — drag-and-drop `.p3d` сразу добавляет файлы в `Import/Export planner`, список dropped-файлов сортируется натурально
+- `0.5.2.29` (`2026-05-29`) — drag-and-drop `.p3d`, `Visual 0 Only` / `Show All`, merge workflow в `Model Split`, `Material Safe Merge`, `Plain Axis Pivot` и fixes для snap points
 - `0.4.9.1` (`2026-05-01`) — безопасные `.bak` при batch-export, диагностика missing LOD, рабочий `Force export all LODs`, loose-vertex export checks, auto mass для `Geometry` LOD, `Fix Proxy Triangles` и улучшения `Fire Geometry` / `Roadway` UI
-- `Unreleased` (`2026-04-25`) — component-fix `.txt` workflow, `Delete Faces/Edges Keep Verts`, поиск `Find Trash` / `Find Flat Plates`, quick-add импорта по имени из `NH_Objects`, named standalone model split, A/V target workflow для `Snap Points`, стабильная нумерация snap-точек `0/1` и дополнительные export-проверки на duplicate `Resolution LOD` и `n-gon`
 - `0.4.0` (`2026-04-12`) — ручной A/V workflow для `Snap Points`, автоматическое создание `Point clouds > Memory`, scatter по выделенным полигонам и `Slope Falloff`
 - `0.3.1` (`2026-04-07`) — `Import/Export planner`, `Model Split`, кеш texture preview и batch-export фильтр для split-part коллекций
 

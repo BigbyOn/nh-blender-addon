@@ -2,6 +2,38 @@
 
 Все заметные изменения проекта фиксируются в этом файле.
 
+## [0.5.3.0] - 2026-05-31
+
+### Добавлено
+- Добавлен общий кеш PNG-превью для `.paa`-текстур: импорт и обновление материалов могут переиспользовать уже сконвертированные изображения вместо повторной конвертации.
+- Добавлен `Cache Manager` в `N-panel -> NH Plugin` для управления кешем текстур, пересборки NH-библиотек, пересборки иконок и быстрого открытия папок кеша.
+- Добавлена сборка persistent Blender asset libraries для `NH_Objects` из корней `Common` и `Environment`, с регистрацией библиотек `NH Objects - Common` и `NH Objects - Environment`.
+- Добавлены manifest-файлы для persistent asset libraries, чтобы пропускать уже актуальные библиотеки и пересобирать их только при изменении набора `.p3d`, версии или режима превью.
+- Добавлены кастомные иконки Asset Browser для импортированных `.p3d`: быстрые geometry-preview и опциональные textured rendered previews по уже готовому кешу текстур.
+- Добавлены кнопки `Build NH Libraries`, `Open NH Asset Browser`, `Rebuild Icons`, `Open NH Library Cache`, `Open Texture PNG Cache` и `Report`.
+- Добавлена панель `Menu Settings` для включения/скрытия основных блоков `NH Plugin` и просмотра текущих кастомных хоткеев.
+
+### Изменено
+- Версия аддона поднята до `0.5.3.0`.
+- `P3D Asset Library` расширен под workflow `NH_Objects`: отдельные поля для `Common` и `Environment`, флаг `Use textured icons` и сборка кешируемых `.blend`-библиотек.
+- Импорт материалов теперь пишет подробную статистику превью: найденные текстуры, cache hit/cache created, packed images, missing и warnings.
+- `Texture Replace` и импорт через planner синхронизированы с новым кешем превью, чтобы карточки материалов и иконки ассетов показывали текстуры сразу после импорта.
+- Хоткеи collider workflow обновлены: `Ctrl+Shift+X` для `Select Isolated Verts`, `Mouse4` для `Selection -> Hull`, `Mouse5` для `Selection -> Box`.
+- Регистрация хоткеев стала аккуратнее: старые привязки операторов очищаются перед добавлением новых, чтобы не копились дубли после перезагрузки аддона.
+- `Geometry Collider (exp)` теперь безопаснее выбирает target LOD и не использует source object как collider target.
+- Панели `Collider` и `Geometry LODs` разведены по названиям и могут скрываться отдельно через `Menu Settings`.
+
+### Исправлено
+- Исправлены сценарии, где выбранный source object мог быть ошибочно переиспользован как target geometry object в experimental collider workflow.
+- Исправлена сборка proxy из размещенных asset objects: теперь можно создавать unparented proxies, если target object не выбран, и корректно выбирать collection для результата.
+- Исправлены потенциальные дубли/конфликты хоткеев после повторной регистрации аддона.
+- Исправлены случаи, когда Asset Browser не переключался на нужную NH-библиотеку после сборки.
+
+### Проверено
+- `python -m py_compile NH_Blender.py NH_Blender\__init__.py` проходит без ошибок.
+- Собран архив `dist/nh-blender-addon-v0.5.3.0.zip`.
+- Обновлен `dist/nh-blender-addon-latest.zip`.
+
 ## [0.5.2.31] - 2026-05-29
 
 ### Изменено
