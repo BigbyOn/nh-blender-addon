@@ -18,7 +18,7 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 - общий PNG-кеш превью для `.paa`, чтобы импорт, карточки материалов и asset icons не конвертировали одни и те же текстуры заново
 - Batch import/export `.p3d`
 - `Import/Export planner` с быстрым добавлением моделей по имени из `NH_Objects`
-- `Model Split` для part-моделей и named standalone-моделей
+- `Model Split / Merge` для part-моделей, named standalone-моделей и объединения `.p3d`-коллекций
 - `P3D Asset Library`: temporary library, persistent `NH_Objects` asset libraries для `Common` / `Environment`, кастомные иконки Asset Browser и конвертация размещённых объектов в A3OB proxy
 - `Cache Manager` для обновления кеша текстур, пересборки NH-библиотек и открытия папок кеша
 - `Menu Settings` для включения/скрытия панелей `NH Plugin` и просмотра кастомных хоткеев
@@ -33,7 +33,7 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 - `P3D Asset Library`
 - `Fixes`
 - `Import/Export planner`
-- `Model Split`
+- `Model Split / Merge`
 - `Cache Manager`
 - `Texture Replace`
 - `Menu Settings`
@@ -147,12 +147,13 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 
 Если такая проблема найдена, экспорт конкретной коллекции останавливается заранее, а детали пишутся в `System Console`.
 
-## Model Split
+## Model Split / Merge
 
-Панель `Model Split` поддерживает два сценария:
+Панель `Model Split / Merge` поддерживает три сценария:
 
 - создание обычных split-part моделей с суффиксами вида `*_01.p3d`, `*_02.p3d`
 - `Separate -> Named Standalone Model` для сборки новой самостоятельной модели из выбранных объектов
+- `Merge Collections` для объединения нескольких `.p3d` root-коллекций в один target model
 
 Для named standalone workflow доступны:
 
@@ -161,6 +162,10 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 - сохранение логических путей вроде `Visuals`, `Geometries`, `Misc`, `Point clouds`
 
 Такой результат затем нормально работает с `Back to source` в `Import/Export planner`.
+
+В `Merge Collections` selector `Source` отсортирован так, чтобы основные `.p3d` root-коллекции шли первыми, а остальные коллекции — ниже по алфавиту. После merge можно нажать `Refresh` в `Import/Export planner`: аддон добавит текущие `.p3d` root-коллекции сцены в список, удалит отсутствующие после merge коллекции и, если root-коллекция была переименована под другой `.p3d`, переназначит `Back to source` по новому имени.
+
+Если вручную переименовать `pripyat_fireDepartment_p06.p3d` в `pripyat_fireDepartment_p03.p3d`, после `Refresh` экспорт в режиме `Back to source` будет писать в путь `...p03.p3d`, если этот `.p3d` есть в списке planner-а. Без `Refresh` у коллекции может оставаться старый internal source tag.
 
 ## P3D Asset Library
 
@@ -173,6 +178,8 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 - создавать быстрые geometry-preview и, при включенном `Use textured icons`, textured rendered previews по уже готовому кешу текстур
 - пропускать уже актуальные библиотеки по manifest-файлу и пересобирать только изменившиеся папки
 - конвертировать расставленные объекты в A3OB proxies
+
+В `Convert Selected Assets To Proxies` поле `Target Resolution / LOD` должно указывать на A3OB LOD mesh, например `Resolution 0`: созданный proxy станет child-объектом внутри этого LOD. Объект, который нужно превратить в proxy, можно указать отдельно через `Proxy Source Object`; если поле пустое, аддон берет выделенные placed asset object(s). Если target не указан, он подбирается автоматически из parent LOD, той же LOD-коллекции или `.p3d` root-коллекции.
 
 Для `NH_Objects` workflow укажите корни `Common` и `Environment`, затем нажмите `Build NH Libraries`. После сборки можно открыть Asset Browser кнопкой рядом с build-кнопкой или через `Cache Manager`.
 
@@ -206,17 +213,70 @@ Blender-аддон для пайплайна DayZ/Arma с интеграцией
 - `Mouse5` — `Selection -> Box`
 - `Ctrl+Shift+P` — `Create Plain Axis Pivot`, если хоткей свободен
 
+## Что нужно пользователю
+
+Минимальный набор:
+
+- Blender `5.1+`
+- включенный аддон **Arma 3 Object Builder (A3OB)**
+- установленный и включенный `NH Blender Plugin`
+- папка с `.p3d` моделями, если нужен import/export или Asset Browser
+- папка с `.paa` / `.rvmat` текстурами, если нужны превью материалов, texture replace или textured icons
+
+Для полного texture workflow дополнительно нужен `ImageToPAA.exe` / `Pal2PacE` из DayZ Tools. Он требуется для конвертации PNG обратно в `.paa`; для обычного просмотра `.paa` в Blender аддон использует PNG-кеш.
+
+## Первичная настройка
+
+1. Установите и включите **Arma 3 Object Builder (A3OB)**.
+2. Установите `NH Blender Plugin` и перезапустите Blender или выполните `F3 -> Reload Scripts`.
+3. Откройте `3D Viewport -> N Panel -> NH Plugin`.
+4. В `Texture Replace` укажите `Texture Cache Source`: корневую папку, где лежат `.paa` / `.rvmat` текстуры.
+5. Если будете экспортировать PNG в `.paa`, укажите `ImageToPAA / Pal2PacE`.
+6. В `P3D Asset Library` укажите `Common Folder` и `Environment Folder` из `NH_Objects`.
+7. В `Import/Export planner` оставьте включенными `Show Materials` и `Keep converted textures`, если хотите видеть текстуры сразу после импорта.
+8. В `Cache Manager` нажмите `Cache NH Used` или `Update All Folder`, чтобы подготовить PNG-кеш текстур.
+9. В `P3D Asset Library` или `Cache Manager` нажмите `Build NH Libraries`.
+10. Откройте Asset Browser через кнопку рядом с `Build NH Libraries` или через `Open NH Asset Browser`.
+
+Рекомендуемый порядок для красивых иконок в Asset Browser:
+
+1. Сначала соберите PNG-кеш текстур через `Cache Manager`.
+2. Включите `Use textured icons`.
+3. Нажмите `Rebuild Icons` или заново `Build / Update Libraries`.
+
+Если `Use textured icons` выключен, библиотеки все равно работают: аддон создает быстрые geometry-preview без рендера текстур.
+
+## Проверка настройки
+
+После настройки проверьте три вещи:
+
+- `Import/Export planner` может импортировать `.p3d` через A3OB без ошибки `Arma 3 Object Builder import operators not found`.
+- `Texture Replace` или импорт показывают материалы с Image Texture nodes, а в `Cache Manager` появляется путь к PNG-кешу.
+- `P3D Asset Library` создает или открывает `NH Objects - Common` / `NH Objects - Environment` в Asset Browser.
+
+## Частые проблемы
+
+- `Arma 3 Object Builder import/export operators not found`: включите A3OB в `Edit -> Preferences -> Add-ons` и перезапустите Blender.
+- `ImageToPAA not found`: укажите путь к `ImageToPAA.exe` / `Pal2PacE` в `Texture Replace`; это нужно только для PNG -> PAA.
+- `No .p3d folders found`: проверьте `Common Folder` и `Environment Folder`; внутри должны быть папки с `.p3d`.
+- Иконки без текстур: сначала соберите PNG-кеш, затем включите `Use textured icons` и нажмите `Rebuild Icons`.
+- Хоткей `Ctrl+Shift+P` не работает: он может быть занят другим аддоном или настройкой Blender; статус видно в `Menu Settings -> Custom Keybinds`.
+
 ## Требования
 
 - Blender `5.1+`
 - включенный аддон **Arma 3 Object Builder (A3OB)**
+- для PNG -> PAA: установленный DayZ Tools с `ImageToPAA.exe` / `Pal2PacE`
+- для NH Asset Browser: доступные папки `NH_Objects/Common` и `NH_Objects/Environment`
 
 ## Установка
 
-1. Скачайте репозиторий.
+1. Скачайте `dist/nh-blender-addon-latest.zip` или архив нужной версии из `dist`.
 2. В Blender откройте `Edit -> Preferences -> Add-ons -> Install...`
-3. Выберите файл `NH_Blender.py`.
+3. Выберите ZIP-архив аддона.
 4. Включите аддон.
+
+Для разработки можно устанавливать одиночный файл `NH_Blender.py`, но для обычного пользователя удобнее ZIP из `dist`.
 
 ## Обновление во время разработки
 

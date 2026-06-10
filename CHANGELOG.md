@@ -12,6 +12,7 @@
 - Добавлены кастомные иконки Asset Browser для импортированных `.p3d`: быстрые geometry-preview и опциональные textured rendered previews по уже готовому кешу текстур.
 - Добавлены кнопки `Build NH Libraries`, `Open NH Asset Browser`, `Rebuild Icons`, `Open NH Library Cache`, `Open Texture PNG Cache` и `Report`.
 - Добавлена панель `Menu Settings` для включения/скрытия основных блоков `NH Plugin` и просмотра текущих кастомных хоткеев.
+- В `Import/Export planner` добавлена кнопка `Refresh` для добавления текущих `.p3d` root-коллекций сцены, удаления отсутствующих после merge и перепривязки `Back to source` после rename.
 
 ### Изменено
 - Версия аддона поднята до `0.5.3.0`.
@@ -22,12 +23,17 @@
 - Регистрация хоткеев стала аккуратнее: старые привязки операторов очищаются перед добавлением новых, чтобы не копились дубли после перезагрузки аддона.
 - `Geometry Collider (exp)` теперь безопаснее выбирает target LOD и не использует source object как collider target.
 - Панели `Collider` и `Geometry LODs` разведены по названиям и могут скрываться отдельно через `Menu Settings`.
+- Панель `Model Split` переименована в `Model Split / Merge`.
+- Selector `Source` в `Merge Collections` теперь показывает `.p3d` root-коллекции первыми, затем остальные коллекции по алфавиту.
+- Кнопки `Add` и `Remove` в `Import/Export planner` сделаны компактными icon-only.
 
 ### Исправлено
 - Исправлены сценарии, где выбранный source object мог быть ошибочно переиспользован как target geometry object в experimental collider workflow.
 - Исправлена сборка proxy из размещенных asset objects: теперь можно создавать unparented proxies, если target object не выбран, и корректно выбирать collection для результата.
+- Исправлен `Convert Selected Assets To Proxies`: создаются настоящие A3OB proxy-объекты с `proxy_path` / `proxy_index`, wire-display и именем `proxy: ...`; `Target` теперь указывает A3OB LOD mesh (`Resolution 0` и т.п.), а объект для конвертации можно задать отдельным `Proxy Source Object` или выделением.
 - Исправлены потенциальные дубли/конфликты хоткеев после повторной регистрации аддона.
 - Исправлены случаи, когда Asset Browser не переключался на нужную NH-библиотеку после сборки.
+- Исправлен merge `Point clouds > Memory`: Memory-точки теперь пересобираются в координатах target-модели с сохранением world-позиций и vertex groups, чтобы после merge/export они не уезжали в Object Builder.
 
 ### Проверено
 - `python -m py_compile NH_Blender.py NH_Blender\__init__.py` проходит без ошибок.
