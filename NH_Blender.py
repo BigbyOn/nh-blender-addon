@@ -1,7 +1,7 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Daryl and Enisam",
-    "version": (0, 5, 3, 7),
+    "version": (0, 5, 3, 11),
     "blender": (5, 1, 1),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "All-in-one Blender toolkit for porting and preparing DayZ/Arma assets: fixes, textures, colliders, proxies, snap points, and P3D workflow helpers.",    
@@ -210,12 +210,14 @@ _PERSISTED_UI_SETTINGS = {
         "export_force_all_lods",
     ),
     "cray_asset_proxy_settings": (
-        "delete_originals",
+        "duplicate_to_all_resolution_lods",
     ),
     "cray_asset_library_settings": (
         "folder",
         "common_root",
         "environment_root",
+        "custom_search_root",
+        "custom_p3d_name",
         "import_first_lod_only",
         "clear_previous_temp_library",
         "rebuild_existing_libraries",
@@ -11955,6 +11957,11 @@ _TEX_EXPORT_DDS_BACKEND_LABELS = {
 }
 _TEX_EXPORT_NOHQ_FALLBACK = "#(argb,8,8,3)color(0.5,0.5,1,1,NOHQ)"
 _TEX_EXPORT_SMDI_FALLBACK = "#(argb,8,8,3)color(0,0.012,0.63,1,SMDI)"
+_TEX_EXPORT_DEFAULT_SOURCE_ROOTS = (
+    r"E:\Living_zone\textures12012025\textures",
+    r"E:\stalker anomaly\textures",
+)
+_TEX_EXPORT_LEGACY_DEFAULT_SOURCE_ROOT = _TEX_EXPORT_DEFAULT_SOURCE_ROOTS[0]
 _TEXTURE_CONVERTER_TEST_SUFFIXES = (
     "_test",
     "_node_test",
@@ -11962,6 +11969,29 @@ _TEXTURE_CONVERTER_TEST_SUFFIXES = (
     "_backend_test",
     "_selftest",
 )
+_WINDOWS_INVALID_FILENAME_CHARS = set('<>:"|?*')
+_TEXTURE_CANDIDATE_EXTS = {
+    ".paa",
+    ".rvmat",
+    ".dds",
+    ".png",
+    ".tga",
+    ".jpg",
+    ".jpeg",
+    ".bmp",
+    ".tif",
+    ".tiff",
+}
+_PLACEHOLDER_MATERIAL_KEYS = {
+    "<no materials>",
+    "__none__",
+    "p3d: no material",
+    "p3d no material",
+    "p3d:_no_material",
+    "p3d no_material",
+    "no material",
+    "no_material",
+}
 
 def _norm_path(p: str) -> str:
     return (p or "").replace("/", "\\")
@@ -11986,8 +12016,174 @@ def _unique_ci(values):
         out.append(s)
     return out
 
+def _strip_blender_numeric_suffix(value: str) -> str:
+    return re.sub(r"\.\d{3,}$", "", str(value or "").strip())
+
+def _candidate_base_no_ext(name_or_path: str) -> str:
+    s = _strip_blender_numeric_suffix(_norm_path(str(name_or_path or "")))
+    s = _basename_no_ext(s)
+    return _strip_blender_numeric_suffix(s)
+
+def _placeholder_name_keys(value: str):
+    raw = str(value or "").strip()
+    if not raw:
+        return [""]
+
+    norm = _norm_path(raw)
+    leaf = norm.split("\\")[-1].strip()
+    base = _candidate_base_no_ext(norm)
+    values = [raw, norm, leaf, _candidate_base_no_ext(leaf), base]
+    keys = []
+    for item in values:
+        s = str(item or "").strip().strip("'\"")
+        if not s:
+            keys.append("")
+            continue
+        lower = s.lower()
+        keys.append(lower)
+        keys.append(re.sub(r"\s+", " ", lower.replace("_", " ")).strip())
+        keys.append(re.sub(r"[^a-z0-9]+", " ", lower).strip())
+    return _unique_ci(keys)
+
+def _is_placeholder_material_name(value) -> bool:
+    for key in _placeholder_name_keys(value):
+        if key == "" or key in _PLACEHOLDER_MATERIAL_KEYS:
+            return True
+    return False
+
+def _is_invalid_windows_filename_component(value) -> bool:
+    raw = str(value or "").strip().strip("'\"")
+    if not raw:
+        return True
+
+    norm = _norm_path(raw)
+    parts = [part.strip() for part in re.split(r"[\\/]+", norm) if part.strip()]
+    if not parts:
+        return True
+
+    for idx, part in enumerate(parts):
+        if idx == 0 and re.fullmatch(r"[A-Za-z]:", part):
+            continue
+        if any(ch in _WINDOWS_INVALID_FILENAME_CHARS for ch in part):
+            return True
+    return False
+
+def _blender_install_dir_abs() -> str:
+    try:
+        binary = getattr(bpy.app, "binary_path", "") or ""
+        if binary:
+            return os.path.abspath(os.path.dirname(binary))
+    except Exception:
+        pass
+    return ""
+
+def _path_is_under_or_equal_safe(path: str, root: str) -> bool:
+    try:
+        path_abs = os.path.abspath(os.path.normpath(path))
+        root_abs = os.path.abspath(os.path.normpath(root))
+        return os.path.normcase(os.path.commonpath([path_abs, root_abs])) == os.path.normcase(root_abs)
+    except Exception:
+        return False
+
+def _iter_texture_resolution_roots(settings=None):
+    try:
+        ts = _get_texreplace_settings_safe(settings)
+    except Exception:
+        ts = settings
+
+    if ts is not None:
+        for attr in ("target_textures_folder", "folder", "texture_cache_source_folder"):
+            raw = getattr(ts, attr, "") if hasattr(ts, attr) else ""
+            path = _tex_export_resolve_path(raw) if raw else ""
+            if path:
+                yield path
+        try:
+            for root in _tex_export_source_roots_from_settings(ts):
+                if root:
+                    yield root
+        except Exception:
+            pass
+
+    for root in _iter_a3ob_project_roots():
+        if root:
+            yield root
+
+def _is_under_configured_texture_root(path: str, settings=None) -> bool:
+    if not path:
+        return False
+    for root in _iter_texture_resolution_roots(settings):
+        if root and _path_is_under_or_equal_safe(path, root):
+            return True
+    return False
+
+def _is_blender_install_texture_path_invalid(path_value: str, settings=None) -> bool:
+    raw = _normalize_drive_relative_path(str(path_value or "").strip())
+    if not raw:
+        return False
+
+    raw_is_abs = os.path.isabs(raw) or re.match(r"^[A-Za-z]:[\\/]", raw) is not None
+    if not raw_is_abs:
+        return False
+
+    try:
+        abs_path = os.path.abspath(bpy.path.abspath(raw))
+    except Exception:
+        try:
+            abs_path = os.path.abspath(raw)
+        except Exception:
+            return False
+
+    blender_dir = _blender_install_dir_abs()
+    if not blender_dir or not _path_is_under_or_equal_safe(abs_path, blender_dir):
+        return False
+    return not _is_under_configured_texture_root(abs_path, settings)
+
+def _looks_like_texture_candidate(value: str) -> bool:
+    raw = str(value or "").strip()
+    if not raw or raw.startswith("#"):
+        return False
+
+    norm = _norm_path(raw)
+    stripped = _strip_blender_numeric_suffix(norm)
+    ext = os.path.splitext(stripped)[1].lower()
+    base = _candidate_base_no_ext(norm)
+    if not base or not re.search(r"[A-Za-z0-9]", base):
+        return False
+
+    if ext in _TEXTURE_CANDIDATE_EXTS:
+        return True
+    if "\\" in norm or "/" in raw:
+        return True
+    if "_" in base or "-" in base:
+        return True
+    if re.search(r"\d", base):
+        return True
+    return False
+
+def _is_valid_texture_candidate(value) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    if _is_placeholder_material_name(raw):
+        return False
+    if _is_invalid_windows_filename_component(raw):
+        return False
+    if _is_blender_install_texture_path_invalid(raw):
+        return False
+    return _looks_like_texture_candidate(raw)
+
+def _log_rejected_texture_candidate(value, *, material_name: str = ""):
+    raw = str(value or "").strip()
+    if not raw:
+        return
+    if _is_placeholder_material_name(raw):
+        print(f"Skipped placeholder material: {raw}")
+        return
+    if _is_invalid_windows_filename_component(raw) or _is_blender_install_texture_path_invalid(raw):
+        print(f"Skipped invalid texture candidate: {raw}")
+
 def _expand_basename_variants(base: str):
-    base = _basename_no_ext(base)
+    base = _candidate_base_no_ext(base)
     if not base:
         return []
 
@@ -12016,30 +12212,48 @@ def _expand_basename_variants(base: str):
 def _build_material_candidates(mat: bpy.types.Material):
     candidates = []
 
+    def add_candidate(value, *, source=""):
+        raw = str(value or "").strip()
+        if not raw:
+            return
+        if not _is_valid_texture_candidate(raw):
+            _log_rejected_texture_candidate(raw, material_name=getattr(mat, "name", ""))
+            return
+        base = _sanitize_tex_export_base(raw)
+        if not base:
+            _log_rejected_texture_candidate(raw, material_name=getattr(mat, "name", ""))
+            return
+        candidates.append(base)
+
+    paa_path, rvmat_path = _get_a3ob_material_paths(mat)
+    add_candidate(paa_path, source="a3ob-paa")
+    add_candidate(rvmat_path, source="a3ob-rvmat")
+
     if mat.use_nodes and mat.node_tree:
         for node in mat.node_tree.nodes:
             if node.type != "TEX_IMAGE" or not getattr(node, "image", None):
                 continue
             img = node.image
-            fp = getattr(img, "filepath", "") or ""
-            if fp.strip():
-                candidates.append(_basename_no_ext(fp))
-            candidates.append(_basename_no_ext(img.name))
+            fp = (getattr(img, "filepath_raw", "") or getattr(img, "filepath", "") or "").strip()
+            if fp:
+                add_candidate(fp, source="image-filepath")
+            image_name = getattr(img, "name", "") or ""
+            add_candidate(image_name, source="image-name")
 
-    candidates.append(_basename_no_ext(mat.name))
+    add_candidate(getattr(mat, "name", ""), source="material-name")
 
     expanded = []
     for c in _unique_ci(candidates):
         expanded.extend(_expand_basename_variants(c))
-    return _unique_ci(expanded)
+    return _unique_ci(c for c in expanded if _is_valid_texture_candidate(c))
 
 def _make_expected_texture_path_from_base(folder_abs: str, base: str, ext: str) -> str:
     ext = (ext or "").lower().strip()
     if ext not in _ALLOWED_DB_EXTS:
         raise ValueError(f"Unsupported texture extension: {ext}")
 
-    base = _basename_no_ext(base)
-    if not base:
+    base = _sanitize_tex_export_base(base)
+    if not base or not _is_valid_texture_candidate(base):
         return ""
 
     folder_abs = folder_abs or ""
@@ -12053,8 +12267,8 @@ def _make_expected_texture_path_from_base(folder_abs: str, base: str, ext: str) 
     return _norm_path(os.path.normpath(path))
 
 def _split_texture_candidate_base(base: str):
-    texture_base = _basename_no_ext(base)
-    if not texture_base:
+    texture_base = _sanitize_tex_export_base(base)
+    if not texture_base or not _is_valid_texture_candidate(texture_base):
         return "", ""
 
     material_base = _TEXTURE_SUFFIX_RE.sub("", texture_base) or texture_base
@@ -12097,7 +12311,10 @@ def _texreplace_folder_abs(settings) -> str:
 
 def _first_valid_texture_candidate(candidates) -> str:
     for candidate in candidates or []:
-        base = _basename_no_ext(candidate)
+        if not _is_valid_texture_candidate(candidate):
+            _log_rejected_texture_candidate(candidate)
+            continue
+        base = _sanitize_tex_export_base(candidate)
         if base:
             return base
     return ""
@@ -12105,6 +12322,9 @@ def _first_valid_texture_candidate(candidates) -> str:
 def _pick_best_db_match(candidates, db_map):
     best = None
     for base in candidates:
+        if not _is_valid_texture_candidate(base):
+            _log_rejected_texture_candidate(base)
+            continue
         texture_base, material_base = _split_texture_candidate_base(base)
         if not texture_base and not material_base:
             continue
@@ -12136,6 +12356,8 @@ def _build_expected_texture_pair(settings, candidates, match):
         found_rvmat = match.get("rvmat")
         used_base = match.get("base") or _first_valid_texture_candidate(candidates)
         texture_base, material_base = _split_texture_candidate_base(used_base)
+        if not texture_base and not material_base:
+            return None, None, used_base, False, False
 
         paa_path = found_paa or None
         rvmat_path = found_rvmat or None
@@ -12155,10 +12377,12 @@ def _build_expected_texture_pair(settings, candidates, match):
         return paa_path, rvmat_path, used_base, is_virtual_paa, is_virtual_rvmat
 
     used_base = _first_valid_texture_candidate(candidates)
-    if not write_expected or not used_base:
+    if not write_expected or not used_base or not _is_valid_texture_candidate(used_base):
         return None, None, used_base, False, False
 
     texture_base, material_base = _split_texture_candidate_base(used_base)
+    if not texture_base and not material_base:
+        return None, None, used_base, False, False
     paa_path = _make_expected_texture_path_from_base(folder_abs, texture_base, ".paa") if texture_base else None
     rvmat_path = _make_expected_texture_path_from_base(folder_abs, material_base, ".rvmat") if material_base else None
     return paa_path, rvmat_path, used_base, bool(paa_path), bool(rvmat_path)
@@ -12177,6 +12401,84 @@ def _tex_export_resolve_path(path_value: str, fallback: str = "") -> str:
         pass
     return _norm_path(os.path.normpath(path_value))
 
+def _split_tex_source_roots_text(raw) -> list[str]:
+    roots = []
+    for part in re.split(r"[;\r\n]+", str(raw or "")):
+        part = part.strip()
+        if not part:
+            continue
+        resolved = _tex_export_resolve_path(part)
+        if not resolved:
+            continue
+        roots.append(resolved)
+    return _unique_ci(roots)
+
+def _tex_source_roots_with_defaults(roots) -> list[str]:
+    roots = _unique_ci(roots or [])
+    if not roots:
+        return list(_TEX_EXPORT_DEFAULT_SOURCE_ROOTS)
+
+    if (
+        len(roots) == 1
+        and os.path.normcase(os.path.normpath(roots[0])) == os.path.normcase(os.path.normpath(_TEX_EXPORT_LEGACY_DEFAULT_SOURCE_ROOT))
+    ):
+        for default_root in _TEX_EXPORT_DEFAULT_SOURCE_ROOTS:
+            if default_root not in roots:
+                roots.append(default_root)
+    return _unique_ci(roots)
+
+def _tex_source_roots_from_collection(settings) -> list[str]:
+    if settings is None or not hasattr(settings, "source_texture_roots"):
+        return []
+    roots = []
+    try:
+        items = list(getattr(settings, "source_texture_roots", []) or [])
+    except Exception:
+        items = []
+    for item in items:
+        path = getattr(item, "path", "") or ""
+        resolved = _tex_export_resolve_path(path)
+        if resolved:
+            roots.append(resolved)
+    return _unique_ci(roots)
+
+def _sync_tex_source_roots_text(settings, roots=None):
+    if settings is None or not hasattr(settings, "source_textures_folder"):
+        return []
+    roots = _unique_ci(roots if roots is not None else _tex_source_roots_from_collection(settings))
+    try:
+        settings.source_textures_folder = ";".join(roots)
+    except Exception:
+        pass
+    return roots
+
+def _ensure_tex_source_roots_collection(settings):
+    if settings is None or not hasattr(settings, "source_texture_roots"):
+        return _tex_source_roots_with_defaults(
+            _split_tex_source_roots_text(getattr(settings, "source_textures_folder", ""))
+        )
+
+    collection_roots = _tex_source_roots_from_collection(settings)
+    if collection_roots:
+        return _sync_tex_source_roots_text(settings, collection_roots)
+
+    roots = _tex_source_roots_with_defaults(
+        _split_tex_source_roots_text(getattr(settings, "source_textures_folder", ""))
+    )
+    try:
+        settings.source_texture_roots.clear()
+        for root in roots:
+            item = settings.source_texture_roots.add()
+            item.path = root
+    except Exception:
+        pass
+    return _sync_tex_source_roots_text(settings, roots)
+
+def _tex_export_source_roots_from_settings(settings) -> list[str]:
+    if settings is None:
+        return list(_TEX_EXPORT_DEFAULT_SOURCE_ROOTS)
+    return _ensure_tex_source_roots_collection(settings)
+
 def _tex_export_diffuse_suffix(settings) -> str:
     value = getattr(settings, "output_diffuse_suffix", "NONE")
     if value == "NONE":
@@ -12184,9 +12486,23 @@ def _tex_export_diffuse_suffix(settings) -> str:
     return value or ""
 
 def _sanitize_tex_export_base(base: str) -> str:
-    base = _basename_no_ext(base)
-    base = re.sub(r"\s+", "_", base).strip(" _")
-    return base
+    raw = _norm_path(str(base or "")).strip().strip("'\"")
+    if not raw or _is_placeholder_material_name(raw):
+        return ""
+
+    leaf = raw.split("\\")[-1].strip()
+    leaf = _strip_blender_numeric_suffix(leaf)
+    leaf = os.path.splitext(leaf)[0]
+    leaf = _strip_blender_numeric_suffix(leaf)
+    if not leaf or _is_placeholder_material_name(leaf):
+        return ""
+
+    leaf = re.sub(r"\s+", "_", leaf)
+    leaf = re.sub(r'[<>:"/\\|?*]+', "_", leaf)
+    leaf = re.sub(r"_+", "_", leaf).strip(" _.")
+    if not leaf or _is_placeholder_material_name(leaf):
+        return ""
+    return leaf
 
 def _is_texture_converter_test_output(name_or_path: str) -> bool:
     base = _sanitize_tex_export_base(name_or_path).lower()
@@ -12235,6 +12551,17 @@ def _scan_source_dds_files(source_root: str):
             }
             dds_map.setdefault(base.lower(), []).append(item)
     return dds_map, scanned
+
+def _scan_source_dds_files_from_roots(source_roots):
+    dds_map = {}
+    scanned_total = 0
+    for source_root in source_roots or []:
+        print(f"Texture source root: {source_root}")
+        current_map, scanned = _scan_source_dds_files(source_root)
+        scanned_total += scanned
+        for key, items in current_map.items():
+            dds_map.setdefault(key, []).extend(items)
+    return dds_map, scanned_total
 
 def _find_tex_export_dds(dds_map, *base_names, preferred_rel_dir=""):
     preferred_rel_dir = _norm_path(preferred_rel_dir or "").lower()
@@ -12996,15 +13323,19 @@ def _tex_export_refresh_db(settings, folder_abs: str):
         it.dup_count = d["dup_count"]
     return entries
 
-def _tex_export_source_tried_lines(source_root: str, rel_dir: str, names):
+def _tex_export_source_tried_lines(source_root, rel_dir: str, names):
     out = []
-    for name in names:
-        base = _sanitize_tex_export_base(name)
-        if not base:
+    roots = source_root if isinstance(source_root, (list, tuple, set)) else [source_root]
+    for root in roots:
+        if not root:
             continue
-        if rel_dir:
-            out.append(_norm_path(os.path.join(source_root, rel_dir, base + ".dds")))
-        out.append(_norm_path(os.path.join(source_root, base + ".dds")))
+        for name in names:
+            base = _sanitize_tex_export_base(name)
+            if not base:
+                continue
+            if rel_dir:
+                out.append(_norm_path(os.path.join(root, rel_dir, base + ".dds")))
+            out.append(_norm_path(os.path.join(root, base + ".dds")))
     return _unique_ci(out)
 
 _TEX_EXPORT_CONSOLE_INFO_CODES = {
@@ -13419,11 +13750,17 @@ def _collect_tex_source_export_requests(context, settings, target_root: str):
             continue
 
         candidates = _build_material_candidates(mat)
+        if not candidates:
+            if _is_placeholder_material_name(getattr(mat, "name", "")):
+                print(f"Skipped placeholder material: {mat.name}")
+            continue
+
         match = _pick_best_db_match(candidates, db_map)
         paa_path, rvmat_path, used_base, _, _ = _build_expected_texture_pair(settings, candidates, match)
         texture_base, material_base = _split_texture_candidate_base(used_base)
-        material_base = _strip_tex_export_suffixes(material_base or texture_base or mat.name)
-        if not material_base:
+        material_base = _strip_tex_export_suffixes(material_base or texture_base or used_base)
+        if not material_base or not _is_valid_texture_candidate(material_base):
+            _log_rejected_texture_candidate(material_base or used_base or getattr(mat, "name", ""))
             continue
 
         key = material_base.lower()
@@ -14698,6 +15035,22 @@ def _ensure_roadway_material(target_materials, src_mat: bpy.types.Material):
     return len(target_materials) - 1, roadway_mat.name
 
 def _set_a3ob_material_paths(mat: bpy.types.Material, paa_abs: str | None, rvmat_abs: str | None):
+    def clean_path(value, label):
+        if value is None:
+            return None
+        raw = _norm_path(str(value or "").strip())
+        if not raw:
+            return None
+        if _is_placeholder_material_name(raw):
+            raise RuntimeError(f"{label} path is a placeholder, not a texture path: {raw}")
+        if _is_invalid_windows_filename_component(raw) or _is_blender_install_texture_path_invalid(raw):
+            print(f"Skipped invalid texture candidate: {raw}")
+            raise RuntimeError(f"{label} path has an invalid filename component: {raw}")
+        return raw
+
+    paa_abs = clean_path(paa_abs, "PAA")
+    rvmat_abs = clean_path(rvmat_abs, "RVMAT")
+
     pg = _find_a3ob_material_pg(mat)
     if pg is None:
         raise RuntimeError("A3OB material property group not found")
@@ -14935,9 +15288,89 @@ def _ensure_a3ob_import_paa_helpers():
 
     return import_paa_mod
 
-def _resolve_a3ob_texture_path(texture_path: str) -> str:
-    raw = (texture_path or "").strip()
+def _normalize_drive_relative_path(path_value: str) -> str:
+    raw = _norm_path(str(path_value or "").strip())
+    match = re.match(r"^([A-Za-z]):(?![\\/])(.*)$", raw)
+    if match:
+        tail = match.group(2).lstrip("\\/")
+        return f"{match.group(1)}:\\{tail}"
+    return raw
+
+def _iter_a3ob_project_roots(context=None):
+    try:
+        scene = (context or bpy.context).scene
+    except Exception:
+        scene = None
+    if scene is None:
+        return
+
+    for attr in dir(scene):
+        if not attr.startswith("a3ob"):
+            continue
+        try:
+            pg = getattr(scene, attr)
+        except Exception:
+            continue
+        if not hasattr(pg, "bl_rna"):
+            continue
+        for prop in pg.bl_rna.properties:
+            if prop.identifier == "rna_type" or prop.type != "STRING":
+                continue
+            label = f"{prop.identifier} {prop.name}".lower()
+            if not any(token in label for token in ("project", "root", "folder")):
+                continue
+            try:
+                value = str(getattr(pg, prop.identifier, "") or "").strip()
+            except Exception:
+                value = ""
+            if not value:
+                continue
+            resolved = _tex_export_resolve_path(value)
+            if resolved and os.path.isdir(resolved):
+                yield resolved
+
+def _texture_path_rel_variants(raw: str):
+    norm = _normalize_drive_relative_path(raw).strip().lstrip("\\/")
+    if not norm:
+        return []
+
+    variants = [norm]
+    no_suffix = _strip_blender_numeric_suffix(norm)
+    if no_suffix != norm:
+        variants.append(no_suffix)
+
+    for item in list(variants):
+        ext = os.path.splitext(item)[1].lower()
+        if not ext:
+            variants.append(item + ".paa")
+            variants.append(item + ".dds")
+        elif ext == ".paa":
+            variants.append(os.path.splitext(item)[0] + ".dds")
+        elif ext == ".dds":
+            variants.append(os.path.splitext(item)[0] + ".paa")
+    return _unique_ci(variants)
+
+def _add_texture_resolution_candidate(candidates, value):
+    raw = _normalize_drive_relative_path(value)
     if not raw:
+        return
+    if _is_placeholder_material_name(raw):
+        print(f"Skipped placeholder material: {raw}")
+        return
+    if _is_invalid_windows_filename_component(raw):
+        print(f"Skipped invalid texture candidate: {raw}")
+        return
+    candidates.append(raw)
+
+def _resolve_a3ob_texture_path(texture_path: str) -> str:
+    raw = _normalize_drive_relative_path(texture_path)
+    if not raw:
+        return ""
+    if _is_placeholder_material_name(raw):
+        print(f"Skipped placeholder material: {raw}")
+        return ""
+    if _is_invalid_windows_filename_component(raw):
+        print(f"Skipped invalid texture candidate: {raw}")
         return ""
 
     import_p3d_mod = _import_first_available_module(
@@ -14947,13 +15380,13 @@ def _resolve_a3ob_texture_path(texture_path: str) -> str:
         )
     )
     resolver = getattr(import_p3d_mod, "resolve_texture_path", None) if import_p3d_mod is not None else None
+    candidates = []
+
     if callable(resolver):
         try:
             resolved = resolver(raw)
             if resolved:
-                resolved = os.path.abspath(bpy.path.abspath(resolved))
-                if os.path.isfile(resolved):
-                    return _norm_path(resolved)
+                _add_texture_resolution_candidate(candidates, resolved)
         except Exception:
             pass
 
@@ -14965,14 +15398,8 @@ def _resolve_a3ob_texture_path(texture_path: str) -> str:
     )
     restore_absolute = getattr(utils_mod, "restore_absolute", None) if utils_mod is not None else None
 
-    candidates = []
-    try:
-        candidates.append(os.path.abspath(bpy.path.abspath(raw)))
-    except Exception:
-        pass
-
     if callable(restore_absolute):
-        for extension in ("", ".paa"):
+        for extension in ("", ".paa", ".dds"):
             try:
                 candidate = restore_absolute(raw, extension)
             except TypeError:
@@ -14983,11 +15410,30 @@ def _resolve_a3ob_texture_path(texture_path: str) -> str:
             except Exception:
                 candidate = ""
             if candidate:
-                candidates.append(candidate)
+                _add_texture_resolution_candidate(candidates, candidate)
 
-    if os.path.splitext(raw)[1] == "":
+    _add_texture_resolution_candidate(candidates, raw)
+
+    raw_is_abs = os.path.isabs(raw) or re.match(r"^[A-Za-z]:[\\/]", raw) is not None
+    if not raw_is_abs:
+        for root in _iter_texture_resolution_roots():
+            if not root:
+                continue
+            for rel in _texture_path_rel_variants(raw):
+                _add_texture_resolution_candidate(candidates, os.path.join(root, rel))
+
+    try:
+        blender_abs = os.path.abspath(bpy.path.abspath(raw))
+        if not _is_blender_install_texture_path_invalid(blender_abs):
+            _add_texture_resolution_candidate(candidates, blender_abs)
+    except Exception:
+        pass
+
+    if os.path.splitext(_strip_blender_numeric_suffix(raw))[1] == "":
         try:
-            candidates.append(os.path.abspath(bpy.path.abspath(raw + ".paa")))
+            blender_abs_paa = os.path.abspath(bpy.path.abspath(raw + ".paa"))
+            if not _is_blender_install_texture_path_invalid(blender_abs_paa):
+                _add_texture_resolution_candidate(candidates, blender_abs_paa)
         except Exception:
             pass
 
@@ -14996,15 +15442,21 @@ def _resolve_a3ob_texture_path(texture_path: str) -> str:
         if not candidate:
             continue
         try:
-            candidate_abs = os.path.abspath(bpy.path.abspath(candidate))
+            candidate_abs = os.path.abspath(os.path.normpath(_normalize_drive_relative_path(candidate)))
         except Exception:
+            continue
+        if _is_blender_install_texture_path_invalid(candidate_abs):
+            print(f"Skipped invalid texture candidate: {candidate_abs}")
             continue
         key = os.path.normcase(candidate_abs)
         if key in checked:
             continue
         checked.add(key)
         if os.path.isfile(candidate_abs):
-            return _norm_path(candidate_abs)
+            resolved = _norm_path(candidate_abs)
+            if os.path.splitext(resolved)[1].lower() == ".dds":
+                print(f"DDS source found: {resolved}")
+            return resolved
 
     return ""
 
@@ -15365,6 +15817,81 @@ def _load_external_image(filepath: str, color_space: str = "SRGB"):
     _apply_image_color_space(image, color_space)
     return image
 
+def _image_filepath_value(image) -> str:
+    if image is None:
+        return ""
+    return (getattr(image, "filepath_raw", "") or getattr(image, "filepath", "") or "").strip()
+
+def _relative_texture_path_from_blender_install(path_value: str) -> str:
+    raw = _normalize_drive_relative_path(path_value)
+    blender_dir = _blender_install_dir_abs()
+    if not raw or not blender_dir:
+        return ""
+    try:
+        raw_abs = os.path.abspath(os.path.normpath(raw))
+        if not _path_is_under_or_equal_safe(raw_abs, blender_dir):
+            return ""
+        return _norm_path(os.path.relpath(raw_abs, blender_dir))
+    except Exception:
+        return ""
+
+def _set_image_filepath_value(image, filepath: str):
+    if image is None:
+        return
+    try:
+        image.filepath_raw = filepath
+    except Exception:
+        pass
+    try:
+        image.filepath = filepath
+    except Exception:
+        pass
+
+def _repair_preview_image_path(image) -> bool:
+    raw = _image_filepath_value(image)
+    if not raw:
+        return False
+
+    raw = _normalize_drive_relative_path(raw)
+    rel_from_blender = _relative_texture_path_from_blender_install(raw)
+    blender_resolved = ""
+    try:
+        blender_resolved = os.path.abspath(bpy.path.abspath(raw))
+    except Exception:
+        blender_resolved = ""
+    if not rel_from_blender and blender_resolved:
+        rel_from_blender = _relative_texture_path_from_blender_install(blender_resolved)
+
+    if not rel_from_blender and not _is_blender_install_texture_path_invalid(raw):
+        return False
+
+    search_values = _unique_ci([
+        rel_from_blender,
+        raw if not _is_blender_install_texture_path_invalid(raw) else "",
+        getattr(image, "name", "") or "",
+    ])
+    for candidate in search_values:
+        if not candidate:
+            continue
+        resolved = _resolve_a3ob_texture_path(candidate)
+        if resolved and not _is_blender_install_texture_path_invalid(resolved):
+            _set_image_filepath_value(image, resolved)
+            return True
+
+    print(f"Skipped invalid texture candidate: {raw}")
+    _set_image_filepath_value(image, "")
+    return True
+
+def _repair_existing_preview_image_paths():
+    repaired = 0
+    for image in list(getattr(bpy.data, "images", []) or []):
+        try:
+            if _repair_preview_image_path(image):
+                repaired += 1
+        except Exception as e:
+            print(f"Preview image path repair failed for {getattr(image, 'name', '<image>')}: {_fmt_exc(e)}")
+    return repaired
+
 def _load_material_preview_image(
     texture_path: str,
     keep_converted_textures: bool,
@@ -15509,12 +16036,20 @@ def _postprocess_imported_material_previews(
     if not show_materials:
         return result
 
+    _repair_existing_preview_image_paths()
+
     materials = _iter_unique_materials_from_objects(imported_objs)
     result["materials_total"] = len(materials)
 
     for mat in materials:
         paa_path, _ = _get_a3ob_material_paths(mat)
         if not paa_path:
+            continue
+        if _is_placeholder_material_name(paa_path):
+            print(f"Skipped placeholder material: {paa_path}")
+            continue
+        if not _is_valid_texture_candidate(paa_path):
+            _log_rejected_texture_candidate(paa_path, material_name=getattr(mat, "name", ""))
             continue
 
         result["textured_candidates"] += 1
@@ -15616,6 +16151,9 @@ class CRAY_PG_ObjMatImagesItem(PropertyGroup):
     mat_name: StringProperty()
     images_csv: StringProperty()
 
+class CRAY_PG_TexSourceRootItem(PropertyGroup):
+    path: StringProperty(name="Root", subtype="DIR_PATH")
+
 class CRAY_PG_TexReplaceSettings(PropertyGroup):
     folder: StringProperty(name="Folder", default="P:\\NH_ObjectTextures", subtype="DIR_PATH")
     picked_object: PointerProperty(name="Select Object", type=bpy.types.Object)
@@ -15627,8 +16165,17 @@ class CRAY_PG_TexReplaceSettings(PropertyGroup):
     source_textures_folder: StringProperty(
         name="Source Textures Folder",
         subtype="DIR_PATH",
-        default="E:\\Living_zone\\textures12012025\\textures",
+        default=";".join(_TEX_EXPORT_DEFAULT_SOURCE_ROOTS),
+        description="One or more DDS source roots; separate multiple folders with ; or new lines",
     )
+    source_root_to_add: StringProperty(
+        name="Add Source Root",
+        subtype="DIR_PATH",
+        default="",
+        description="Pick or type a DDS source root, then press +",
+    )
+    source_texture_roots: CollectionProperty(type=CRAY_PG_TexSourceRootItem)
+    source_texture_roots_index: IntProperty(default=0, options={"SKIP_SAVE"})
     target_textures_folder: StringProperty(
         name="Target Textures Folder",
         subtype="DIR_PATH",
@@ -15872,6 +16419,91 @@ class CRAY_OT_TexDBBuildFromFolder(Operator):
         _save_texreplace_settings_now(context)
         return {"FINISHED"}
 
+class CRAY_OT_TexSourceRootAdd(Operator):
+    bl_idname = "cray.tex_source_root_add"
+    bl_label = "Add Texture Source Root"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        ts = context.scene.cray_texreplace_settings
+        _ensure_tex_source_roots_collection(ts)
+
+        raw = getattr(ts, "source_root_to_add", "") or ""
+        roots_to_add = _split_tex_source_roots_text(raw)
+        if not roots_to_add:
+            self.report({"WARNING"}, "Pick or type a source texture folder first")
+            return {"CANCELLED"}
+
+        existing = _tex_source_roots_from_collection(ts)
+        existing_keys = {os.path.normcase(os.path.normpath(path)) for path in existing}
+        added = 0
+        for root in roots_to_add:
+            key = os.path.normcase(os.path.normpath(root))
+            if key in existing_keys:
+                continue
+            item = ts.source_texture_roots.add()
+            item.path = root
+            existing_keys.add(key)
+            added += 1
+
+        _sync_tex_source_roots_text(ts, _tex_source_roots_from_collection(ts))
+        try:
+            ts.source_root_to_add = ""
+        except Exception:
+            pass
+        _save_texreplace_settings_now(context)
+
+        if added:
+            self.report({"INFO"}, f"Added {added} texture source root(s)")
+        else:
+            self.report({"INFO"}, "Texture source root already exists")
+        return {"FINISHED"}
+
+class CRAY_OT_TexSourceRootRemove(Operator):
+    bl_idname = "cray.tex_source_root_remove"
+    bl_label = "Remove Texture Source Root"
+    bl_options = {"REGISTER", "UNDO"}
+
+    index: IntProperty(default=-1, options={"SKIP_SAVE"})
+
+    def execute(self, context):
+        ts = context.scene.cray_texreplace_settings
+        _ensure_tex_source_roots_collection(ts)
+
+        try:
+            index = int(self.index)
+        except Exception:
+            index = -1
+        try:
+            count = len(ts.source_texture_roots)
+        except Exception:
+            count = 0
+        if index < 0 or index >= count:
+            self.report({"WARNING"}, "Texture source root not found")
+            return {"CANCELLED"}
+
+        try:
+            ts.source_texture_roots.remove(index)
+        except Exception as e:
+            self.report({"ERROR"}, f"Could not remove texture source root: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+
+        remaining = _tex_source_roots_from_collection(ts)
+        if remaining:
+            _sync_tex_source_roots_text(ts, remaining)
+        else:
+            try:
+                ts.source_textures_folder = ""
+            except Exception:
+                pass
+        try:
+            ts.source_texture_roots_index = max(0, min(index, len(ts.source_texture_roots) - 1))
+        except Exception:
+            pass
+        _save_texreplace_settings_now(context)
+        self.report({"INFO"}, "Removed texture source root")
+        return {"FINISHED"}
+
 class CRAY_OT_UpdateObjectPreview(Operator):
     bl_idname = "cray.update_object_preview"
     bl_label = "Update Object Preview"
@@ -16107,6 +16739,8 @@ class CRAY_OT_ReplaceTexturesFromDB(Operator):
         missing = []
         failed = []
         virtual_missing = []
+        skipped_placeholders = []
+        skipped_invalid = []
 
         for slot in obj.material_slots:
             mat = slot.material
@@ -16115,6 +16749,14 @@ class CRAY_OT_ReplaceTexturesFromDB(Operator):
 
             materials_checked += 1
             candidates = _build_material_candidates(mat)
+            if not candidates:
+                if _is_placeholder_material_name(getattr(mat, "name", "")):
+                    msg = f"Skipped placeholder material: {mat.name}"
+                    print(msg)
+                    skipped_placeholders.append(mat.name)
+                else:
+                    missing.append(f"{mat.name} -> no valid texture candidates")
+                continue
             match = _pick_best_db_match(candidates, db_map)
 
             paa_path, rvmat_path, used_base, is_virtual_paa, is_virtual_rvmat = _build_expected_texture_pair(ts, candidates, match)
@@ -16122,6 +16764,16 @@ class CRAY_OT_ReplaceTexturesFromDB(Operator):
             rvmat_to_set = rvmat_path if (rvmat_path or "").strip() else None
 
             if not paa_to_set and not rvmat_to_set:
+                if _is_placeholder_material_name(used_base) or _is_placeholder_material_name(getattr(mat, "name", "")):
+                    msg = f"Skipped placeholder material: {mat.name}"
+                    print(msg)
+                    skipped_placeholders.append(mat.name)
+                    continue
+                if used_base and not _is_valid_texture_candidate(used_base):
+                    msg = f"{mat.name} -> invalid texture candidate: {used_base}"
+                    print(f"Skipped invalid texture candidate: {used_base}")
+                    skipped_invalid.append(msg)
+                    continue
                 preview = ", ".join(candidates[:5]) if candidates else "<none>"
                 missing.append(f"{mat.name} -> no .paa/.rvmat match (candidates: {preview})")
                 continue
@@ -16159,6 +16811,8 @@ class CRAY_OT_ReplaceTexturesFromDB(Operator):
         print(f"Virtual missing paths written: {len(virtual_missing)} (paa: {virtual_paa}, rvmat: {virtual_rvmat})")
         print(f"Updated: {changed}")
         print(f"Missing: {len(missing)}")
+        print(f"Skipped placeholders: {len(skipped_placeholders)}")
+        print(f"Skipped invalid: {len(skipped_invalid)}")
         print(f"Failed: {len(failed)}")
 
         if failed:
@@ -16174,12 +16828,30 @@ class CRAY_OT_ReplaceTexturesFromDB(Operator):
                 print("=== Texture Replace: Virtual missing paths written ===")
                 for v in virtual_missing:
                     print(v)
+            if skipped_placeholders:
+                print("=== Texture Replace: Skipped placeholders ===")
+                for item in _unique_ci(skipped_placeholders):
+                    print(f"Skipped placeholder material: {item}")
+            if skipped_invalid:
+                print("=== Texture Replace: Skipped invalid candidates ===")
+                for item in skipped_invalid:
+                    print(item)
             return {"CANCELLED"}
 
         if virtual_missing:
             print("=== Texture Replace: Virtual missing paths written ===")
             for v in virtual_missing:
                 print(v)
+
+        if skipped_placeholders:
+            print("=== Texture Replace: Skipped placeholders ===")
+            for item in _unique_ci(skipped_placeholders):
+                print(f"Skipped placeholder material: {item}")
+
+        if skipped_invalid:
+            print("=== Texture Replace: Skipped invalid candidates ===")
+            for item in skipped_invalid:
+                print(item)
 
         if missing:
             details = f"Updated: {changed}, missing: {len(missing)}"
@@ -16191,6 +16863,11 @@ class CRAY_OT_ReplaceTexturesFromDB(Operator):
                 print(m)
         elif virtual_missing:
             self.report({"WARNING"}, f"Updated: {changed}, virtual missing paths: {len(virtual_missing)} (see System Console)")
+        elif skipped_placeholders or skipped_invalid:
+            self.report(
+                {"WARNING"},
+                f"Updated: {changed}, skipped placeholders: {len(skipped_placeholders)}, invalid: {len(skipped_invalid)} (see System Console)",
+            )
         else:
             self.report({"INFO"}, f"Updated: {changed} materials (A3OB updated)")
 
@@ -16225,6 +16902,7 @@ class CRAY_OT_ExportMissingTexturesFromSources(Operator):
     def _init_runtime(self):
         self.events = []
         self.source_root = ""
+        self.source_roots = []
         self.target_root = ""
         self.diffuse_suffix = ""
         self.dds_map = {}
@@ -16275,7 +16953,8 @@ class CRAY_OT_ExportMissingTexturesFromSources(Operator):
             pass
         _save_texreplace_settings_now(context)
 
-        self.source_root = _tex_export_resolve_path(ts.source_textures_folder)
+        self.source_roots = _tex_export_source_roots_from_settings(ts)
+        self.source_root = "; ".join(self.source_roots)
         self.target_root = _tex_export_resolve_path(ts.target_textures_folder, fallback=ts.folder)
         self.diffuse_suffix = _tex_export_diffuse_suffix(ts)
 
@@ -16285,6 +16964,7 @@ class CRAY_OT_ExportMissingTexturesFromSources(Operator):
             "EXPORT_START",
             "Texture source export started",
             source_root=self.source_root,
+            source_roots=self.source_roots,
             target_root=self.target_root,
             texture_tools_folder=_texture_tools_folder_from_settings(ts),
             convert_dds_to_png=bool(ts.convert_dds_to_png),
@@ -16299,7 +16979,7 @@ class CRAY_OT_ExportMissingTexturesFromSources(Operator):
             output_diffuse_suffix=self.diffuse_suffix,
         )
 
-        if not self.source_root or not os.path.isdir(self.source_root):
+        if not self.source_roots or not any(os.path.isdir(root) for root in self.source_roots):
             self._finish_export_logging(ts)
             self.report({"ERROR"}, "Source Textures Folder is not set or does not exist")
             return {"CANCELLED"}
@@ -16328,9 +17008,9 @@ class CRAY_OT_ExportMissingTexturesFromSources(Operator):
             pass
 
         _tex_export_set_progress(context, ts, 0, len(self.requests), "", "Scanning source DDS")
-        self.dds_map, self.dds_scanned = _scan_source_dds_files(self.source_root)
+        self.dds_map, self.dds_scanned = _scan_source_dds_files_from_roots(self.source_roots)
         self.stats["dds_scanned"] = self.dds_scanned
-        _tex_export_log_event(self.events, "INFO", "SOURCE_DDS_SCAN_DONE", "Source DDS scan finished", source_root=self.source_root, dds_scanned=self.dds_scanned)
+        _tex_export_log_event(self.events, "INFO", "SOURCE_DDS_SCAN_DONE", "Source DDS scan finished", source_root=self.source_root, source_roots=self.source_roots, dds_scanned=self.dds_scanned)
         _tex_export_set_progress(context, ts, 0, len(self.requests), "", "Starting...")
 
         try:
@@ -16434,7 +17114,7 @@ class CRAY_OT_ExportMissingTexturesFromSources(Operator):
         return item
 
     def _note_missing_source(self, expected_path, rel_dir, tried_names, material_base="", kind=""):
-        tried = _tex_export_source_tried_lines(self.source_root, rel_dir, tried_names)
+        tried = _tex_export_source_tried_lines(self.source_roots or self.source_root, rel_dir, tried_names)
         item = _tex_export_result_item(material_base, kind, "", expected_path, self.target_root, reason="source DDS not found")
         item["expected"] = _to_dayz_relative_texture_path(expected_path, self.target_root)
         item["tried"] = tried
@@ -16560,6 +17240,10 @@ class CRAY_OT_ExportMissingTexturesFromSources(Operator):
         preferred_rel_dir = req.get("expected_rel_dir") or ""
         diffuse_src = _find_tex_export_dds(self.dds_map, material_base, preferred_rel_dir=preferred_rel_dir)
         bump_src = _find_tex_export_dds(self.dds_map, material_base + "_bump", preferred_rel_dir=preferred_rel_dir)
+        if diffuse_src:
+            print(f"DDS source found: {diffuse_src.get('path')}")
+        if bump_src and (not diffuse_src or bump_src.get("path") != diffuse_src.get("path")):
+            print(f"DDS source found: {bump_src.get('path')}")
         rel_dir = req.get("expected_rel_dir") or (diffuse_src or {}).get("rel_dir") or (bump_src or {}).get("rel_dir") or ""
         target_dir = os.path.normpath(os.path.join(self.target_root, rel_dir)) if rel_dir else self.target_root
         diffuse_png = _norm_path(os.path.join(target_dir, diffuse_base + ".png"))
@@ -16697,7 +17381,8 @@ class CRAY_OT_PrintTextureExportDiagnostics(Operator):
     def execute(self, context):
         ts = context.scene.cray_texreplace_settings
         _save_texreplace_settings_now(context)
-        source_root = _tex_export_resolve_path(ts.source_textures_folder)
+        source_roots = _tex_export_source_roots_from_settings(ts)
+        source_root = "; ".join(source_roots)
         target_root = _tex_export_resolve_path(ts.target_textures_folder, fallback=ts.folder)
         obj, requests = _collect_tex_source_export_requests(context, ts, target_root)
 
@@ -16711,8 +17396,8 @@ class CRAY_OT_PrintTextureExportDiagnostics(Operator):
             self.report({"ERROR"}, "No mesh object found (pick one or select one)")
             return {"CANCELLED"}
 
-        if source_root and os.path.isdir(source_root):
-            dds_map, dds_scanned = _scan_source_dds_files(source_root)
+        if source_roots and any(os.path.isdir(root) for root in source_roots):
+            dds_map, dds_scanned = _scan_source_dds_files_from_roots(source_roots)
             print(f"DDS scanned: {dds_scanned}")
         else:
             dds_map = {}
@@ -16728,6 +17413,10 @@ class CRAY_OT_PrintTextureExportDiagnostics(Operator):
             preferred_rel_dir = req.get("expected_rel_dir") or ""
             diffuse_src = _find_tex_export_dds(dds_map, material_base, preferred_rel_dir=preferred_rel_dir)
             bump_src = _find_tex_export_dds(dds_map, material_base + "_bump", preferred_rel_dir=preferred_rel_dir)
+            if diffuse_src:
+                print(f"DDS source found: {diffuse_src.get('path')}")
+            if bump_src and (not diffuse_src or bump_src.get("path") != diffuse_src.get("path")):
+                print(f"DDS source found: {bump_src.get('path')}")
             rel_dir = (
                 req.get("expected_rel_dir")
                 or (diffuse_src or {}).get("rel_dir")
@@ -16748,12 +17437,12 @@ class CRAY_OT_PrintTextureExportDiagnostics(Operator):
             print(f"  diffuse source: {(diffuse_src or {}).get('path') or '<not found>'}")
             if not diffuse_src:
                 print("  diffuse tried:")
-                for tried in _tex_export_source_tried_lines(source_root, preferred_rel_dir, (material_base,)):
+                for tried in _tex_export_source_tried_lines(source_roots, preferred_rel_dir, (material_base,)):
                     print(f"    {tried}")
             print(f"  bump source: {(bump_src or {}).get('path') or '<not found>'}")
             if not bump_src:
                 print("  bump tried:")
-                for tried in _tex_export_source_tried_lines(source_root, preferred_rel_dir, (material_base + '_bump',)):
+                for tried in _tex_export_source_tried_lines(source_roots, preferred_rel_dir, (material_base + '_bump',)):
                     print(f"    {tried}")
             print(f"  diffuse png: {diffuse_png}")
             print(f"  diffuse paa: {diffuse_paa}")
@@ -17627,7 +18316,7 @@ def _find_existing_scene_p3d_root(scene, model_name_or_path: str):
     return None
 
 
-def _find_p3d_paths_by_name(search_root: str, model_name: str, settings=None):
+def _find_p3d_paths_by_name(search_root: str, model_name: str, settings=None, respect_ignore: bool = True):
     root_abs = bpy.path.abspath(search_root) if search_root else ""
     root_abs = os.path.abspath(root_abs) if root_abs else ""
     wanted = _normalize_p3d_lookup_key(model_name)
@@ -17636,12 +18325,13 @@ def _find_p3d_paths_by_name(search_root: str, model_name: str, settings=None):
 
     matches = []
     for root, dirs, files in os.walk(root_abs):
-        dirs[:] = [
-            name for name in dirs
-                if not _is_ignored_nh_objects_asset_path(os.path.join(root, name), settings)
-            ]
-        if _is_ignored_nh_objects_asset_path(root, settings):
-            continue
+        if respect_ignore:
+            dirs[:] = [
+                name for name in dirs
+                    if not _is_ignored_nh_objects_asset_path(os.path.join(root, name), settings)
+                ]
+            if _is_ignored_nh_objects_asset_path(root, settings):
+                continue
         for fn in files:
             if not fn.lower().endswith(".p3d"):
                 continue
@@ -19849,6 +20539,10 @@ def _find_nh_objects_p3d_path_by_name(model_name: str):
         matches = _find_p3d_paths_by_name(root_abs, model_name, settings=settings)
         if matches:
             return matches[0]
+    wanted = _normalize_p3d_lookup_key(model_name)
+    for fp in _read_custom_asset_p3d_paths():
+        if _normalize_p3d_lookup_key(fp) == wanted:
+            return fp
     return ""
 
 
@@ -20104,6 +20798,68 @@ def _pick_proxy_target_object(context, explicit_obj=None, source_objs=None):
             return obj
 
     return _proxy_target_from_source_context(context, source_objs)
+
+
+def _proxy_is_resolution_lod_object(obj) -> bool:
+    if not _model_split_is_a3ob_lod_object(obj):
+        return False
+    try:
+        return _model_split_lod_merge_category(obj) == "RESOLUTION"
+    except Exception:
+        return False
+
+
+def _proxy_resolution_lod_sort_key(obj):
+    resolution = 0.0
+    try:
+        props = obj.a3ob_properties_object
+        resolution = float(getattr(props, "resolution", getattr(props, "resolution_float", 0.0)) or 0.0)
+    except Exception:
+        pass
+    return (resolution, (getattr(obj, "name", "") or "").lower())
+
+
+def _proxy_conversion_target_lods(context, target_obj, duplicate_to_all_resolution_lods: bool):
+    if target_obj is None:
+        return []
+    if not duplicate_to_all_resolution_lods:
+        return [target_obj]
+
+    if not _proxy_is_resolution_lod_object(target_obj):
+        return []
+
+    root = _find_p3d_root_collection_for_object(context, target_obj)
+    if root is None:
+        return [target_obj]
+
+    candidates = [
+        obj for obj in _collect_collection_objects_recursive(root)
+        if _proxy_is_resolution_lod_object(obj)
+    ]
+    if target_obj not in candidates:
+        candidates.append(target_obj)
+
+    seen = set()
+    ordered = []
+    for obj in sorted(candidates, key=_proxy_resolution_lod_sort_key):
+        ptr = _model_split_object_ptr(obj)
+        if ptr in seen:
+            continue
+        seen.add(ptr)
+        ordered.append(obj)
+
+    if target_obj in ordered:
+        ordered.remove(target_obj)
+    return [target_obj] + ordered
+
+
+def _proxy_target_collection_for_lod(lod_obj, fallback_collection):
+    if lod_obj is not None and getattr(lod_obj, "users_collection", None):
+        try:
+            return lod_obj.users_collection[0]
+        except Exception:
+            pass
+    return fallback_collection
 
 
 def _tag_import_source_on_imported_data(context, filepath, imported_objs, pre_collection_ptrs):
@@ -21210,10 +21966,10 @@ class CRAY_PG_AssetProxySettings(PropertyGroup):
         description="A3OB LOD mesh, for example Resolution 0, that will own the created proxy",
         type=bpy.types.Object,
     )
-    delete_originals: BoolProperty(
-        name="Delete originals after convert",
-        default=True,
-        description="Remove selected placed objects after proxy creation",
+    duplicate_to_all_resolution_lods: BoolProperty(
+        name="Duplicate to all Resolution LODs",
+        default=False,
+        description="After conversion, also create the same A3OB proxy in every Resolution LOD under the same .p3d root",
     )
 
 
@@ -21221,12 +21977,20 @@ _NH_TEMP_ASSET_LIBRARY_NAME = "NH Temp Asset Library"
 _NH_TEMP_ASSET_SCENE_NAME = "NH Asset Library Scene"
 _NH_OBJECTS_DEFAULT_COMMON_ROOT = r"P:\NH_Objects\Common"
 _NH_OBJECTS_DEFAULT_ENVIRONMENT_ROOT = r"P:\NH_Objects\Environment"
+_NH_OBJECTS_DEFAULT_CUSTOM_SEARCH_ROOT = r"P:\NH_Objects"
+_NH_OBJECTS_CUSTOM_LABEL = "Custom"
+_NH_OBJECTS_CUSTOM_LIBRARY_NAME = "NH Objects - Custom"
 _NH_OBJECTS_ASSET_BLEND_NAME = "_NH_AssetLibrary.blend"
 _NH_OBJECTS_ASSET_MANIFEST_NAME = "_NH_AssetLibrary.manifest.json"
 _NH_OBJECTS_CACHE_FOLDER_NAME = "NH_Objects_AssetLibraries"
 _NH_OBJECTS_ASSET_PREVIEWS_FOLDER_NAME = "_NH_previews"
 _NH_TEXTURE_CACHE_FOLDER_NAME = "NH_TexturePreviewCache"
 _NH_OBJECTS_ASSET_CATALOG_FILE_NAME = "blender_assets.cats.txt"
+_NH_OBJECTS_LEGACY_SOURCE_CACHE_FILENAMES = {
+    _NH_OBJECTS_ASSET_BLEND_NAME,
+    _NH_OBJECTS_ASSET_MANIFEST_NAME,
+    _NH_OBJECTS_ASSET_CATALOG_FILE_NAME,
+}
 _NH_OBJECTS_ASSET_CATALOG_NAMESPACE = uuid.UUID("c91f1215-9261-4d7e-8df4-4bb81567b6a8")
 _NH_OBJECTS_ASSET_MANIFEST_VERSION = 7
 
@@ -21253,6 +22017,11 @@ def _nh_objects_environment_root(settings=None) -> str:
     settings = settings or _nh_asset_library_settings()
     path = getattr(settings, "environment_root", "") if settings is not None else ""
     return os.path.abspath(bpy.path.abspath(path or _NH_OBJECTS_DEFAULT_ENVIRONMENT_ROOT))
+
+def _nh_objects_custom_search_root(settings=None) -> str:
+    settings = settings or _nh_asset_library_settings()
+    path = getattr(settings, "custom_search_root", "") if settings is not None else ""
+    return os.path.abspath(bpy.path.abspath(path or _NH_OBJECTS_DEFAULT_CUSTOM_SEARCH_ROOT))
 
 def _is_ignored_nh_objects_asset_path(path: str, settings=None) -> bool:
     common_root = _nh_objects_common_root(settings)
@@ -21282,6 +22051,10 @@ def _nh_objects_asset_cache_root(label: str, create=False) -> str:
     return path
 
 
+def _nh_objects_custom_asset_cache_root(create=False) -> str:
+    return _nh_objects_asset_cache_root(_NH_OBJECTS_CUSTOM_LABEL, create=create)
+
+
 def _iter_nh_objects_source_roots(settings=None):
     roots = (
         ("Common", _nh_objects_common_root(settings)),
@@ -21293,9 +22066,62 @@ def _iter_nh_objects_source_roots(settings=None):
             yield label, path_abs
 
 
+def _iter_legacy_nh_asset_library_artifacts(settings=None):
+    for _label, root_abs in _iter_nh_objects_source_roots(settings):
+        for current, dirs, files in os.walk(root_abs):
+            dirs[:] = [
+                name for name in dirs
+                if not _is_ignored_nh_objects_asset_path(os.path.join(current, name), settings)
+            ]
+            if _is_ignored_nh_objects_asset_path(current, settings):
+                continue
+
+            for dirname in list(dirs):
+                if dirname != _NH_OBJECTS_ASSET_PREVIEWS_FOLDER_NAME:
+                    continue
+                path_abs = os.path.abspath(os.path.join(current, dirname))
+                if _path_is_under_or_equal(path_abs, root_abs):
+                    yield "dir", path_abs
+                dirs.remove(dirname)
+
+            for filename in files:
+                if filename not in _NH_OBJECTS_LEGACY_SOURCE_CACHE_FILENAMES:
+                    continue
+                path_abs = os.path.abspath(os.path.join(current, filename))
+                if _path_is_under_or_equal(path_abs, root_abs):
+                    yield "file", path_abs
+
+
+def _cleanup_legacy_nh_asset_library_artifacts(settings=None):
+    artifacts = sorted(
+        set(_iter_legacy_nh_asset_library_artifacts(settings)),
+        key=lambda item: (item[0] != "dir", item[1].lower()),
+    )
+    removed_files = 0
+    removed_dirs = 0
+    failed = []
+    for kind, path_abs in artifacts:
+        try:
+            if kind == "dir":
+                if os.path.isdir(path_abs):
+                    shutil.rmtree(path_abs, ignore_errors=False)
+                    removed_dirs += 1
+            elif os.path.isfile(path_abs):
+                os.remove(path_abs)
+                removed_files += 1
+        except Exception as e:
+            failed.append(f"{path_abs}: {_fmt_exc(e)}")
+    return {
+        "removed_files": removed_files,
+        "removed_dirs": removed_dirs,
+        "failed": failed,
+    }
+
+
 def _iter_nh_objects_asset_roots(settings=None):
     for label, _source_abs in _iter_nh_objects_source_roots(settings):
         yield f"NH Objects - {label}", _nh_objects_asset_cache_root(label, create=True)
+    yield _NH_OBJECTS_CUSTOM_LIBRARY_NAME, _nh_objects_custom_asset_cache_root(create=True)
 
 
 def _safe_cache_relpath(path_abs: str, root_abs: str) -> list[str]:
@@ -22234,6 +23060,17 @@ class CRAY_PG_AssetLibrarySettings(PropertyGroup):
         subtype="DIR_PATH",
         description="Папка Environment с .p3d ассетами",
     )
+    custom_search_root: StringProperty(
+        name="Custom Search Root",
+        default=_NH_OBJECTS_DEFAULT_CUSTOM_SEARCH_ROOT,
+        subtype="DIR_PATH",
+        description="Root folder used to find a .p3d by name for the Custom asset library",
+    )
+    custom_p3d_name: StringProperty(
+        name="Custom P3D Name",
+        default="",
+        description="Type a model name like pripyat_shoppingMall_sign, without .p3d, and add it to NH Objects - Custom",
+    )
     import_first_lod_only: BoolProperty(
         name="Import first LOD only",
         default=True,
@@ -22315,6 +23152,37 @@ class CRAY_OT_AssetLibraryClear(Operator):
     def execute(self, context):
         removed = _clear_temp_asset_library(context)
         self.report({"INFO"}, f"Cleared temp asset library ({removed} collection(s))")
+        return {"FINISHED"}
+
+
+class CRAY_OT_AssetLibraryCleanSourceArtifacts(Operator):
+    bl_idname = "cray.asset_library_clean_source_artifacts"
+    bl_label = "Clean Source Cache Files"
+    bl_description = (
+        "Remove legacy _NH_AssetLibrary cache files from NH_Objects source folders; "
+        "current libraries are stored outside the pack tree"
+    )
+    bl_options = {"REGISTER"}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        settings = context.scene.cray_asset_library_settings
+        stats = _cleanup_legacy_nh_asset_library_artifacts(settings)
+        failed = list(stats.get("failed", []) or [])
+        if failed:
+            print("=== NH Objects Asset Libraries: source cache cleanup failures ===")
+            for item in failed:
+                print(item)
+
+        removed_files = int(stats.get("removed_files", 0) or 0)
+        removed_dirs = int(stats.get("removed_dirs", 0) or 0)
+        msg = f"Removed {removed_files} legacy cache file(s), {removed_dirs} preview folder(s)"
+        if failed:
+            self.report({"WARNING"}, msg + f", failed {len(failed)} (see System Console)")
+        else:
+            self.report({"INFO"}, msg)
         return {"FINISHED"}
 
 
@@ -22406,6 +23274,10 @@ def _register_nh_objects_blender_asset_libraries():
         else:
             missing.append(root_abs)
     try:
+        _write_custom_asset_catalog_file()
+    except Exception:
+        pass
+    try:
         bpy.ops.wm.save_userpref()
     except Exception:
         pass
@@ -22451,6 +23323,102 @@ def _read_json_file(filepath: str):
             return json.load(f)
     except Exception:
         return None
+
+
+def _custom_asset_manifest_path() -> str:
+    return _nh_asset_manifest_path_for_folder(_nh_objects_custom_asset_cache_root(create=False))
+
+
+def _custom_asset_catalog_id() -> str:
+    return _nh_asset_catalog_id(_NH_OBJECTS_CUSTOM_LIBRARY_NAME, _NH_OBJECTS_CUSTOM_LABEL)
+
+
+def _write_custom_asset_catalog_file():
+    return _write_nh_asset_catalog_file(
+        _nh_objects_custom_asset_cache_root(create=True),
+        {_NH_OBJECTS_CUSTOM_LABEL: _custom_asset_catalog_id()},
+    )
+
+
+def _custom_p3d_file_manifest_entry(filepath: str):
+    stat = os.stat(filepath)
+    return {
+        "path": _norm_path(os.path.abspath(bpy.path.abspath(filepath))),
+        "size": int(getattr(stat, "st_size", 0) or 0),
+        "mtime_ns": int(getattr(stat, "st_mtime_ns", int(getattr(stat, "st_mtime", 0.0) * 1000000000))),
+    }
+
+
+def _custom_asset_manifest(p3d_files, settings=None):
+    entries = []
+    for fp in sorted((p3d_files or []), key=lambda item: item.lower()):
+        if not fp or not os.path.isfile(fp):
+            continue
+        try:
+            entries.append(_custom_p3d_file_manifest_entry(fp))
+        except Exception:
+            continue
+    preview_mode = "rendered_textured_cached_only" if bool(getattr(settings, "render_textured_previews", False)) else "geometry"
+    return {
+        "version": _NH_OBJECTS_ASSET_MANIFEST_VERSION,
+        "asset_blend": _NH_OBJECTS_ASSET_BLEND_NAME,
+        "source": "custom",
+        "preview_mode": preview_mode,
+        "files": entries,
+    }
+
+
+def _read_custom_asset_p3d_paths(include_missing=False):
+    manifest = _read_json_file(_custom_asset_manifest_path())
+    if not isinstance(manifest, dict):
+        return []
+
+    out = []
+    seen = set()
+    for item in manifest.get("files", []) or []:
+        if not isinstance(item, dict):
+            continue
+        path = item.get("path", "")
+        if not path:
+            continue
+        try:
+            path_abs = os.path.abspath(bpy.path.abspath(path))
+        except Exception:
+            path_abs = os.path.abspath(path)
+        key = os.path.normcase(path_abs)
+        if key in seen:
+            continue
+        if include_missing or (os.path.isfile(path_abs) and path_abs.lower().endswith(".p3d")):
+            seen.add(key)
+            out.append(_norm_path(path_abs))
+    return out
+
+
+def _write_custom_asset_manifest(cache_folder_abs: str, p3d_files, blend_path: str, asset_entries: int, settings=None):
+    os.makedirs(cache_folder_abs, exist_ok=True)
+    manifest = _custom_asset_manifest(p3d_files, settings=settings)
+    manifest["asset_blend"] = os.path.basename(blend_path or _NH_OBJECTS_ASSET_BLEND_NAME)
+    manifest["asset_entries"] = int(asset_entries or 0)
+    manifest_path = _nh_asset_manifest_path_for_folder(cache_folder_abs)
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2, sort_keys=True)
+    return manifest_path
+
+
+def _custom_asset_library_is_current(p3d_files, settings=None):
+    cache_folder_abs = _nh_objects_custom_asset_cache_root(create=False)
+    blend_path = _nh_asset_blend_path_for_folder(cache_folder_abs)
+    if not os.path.isfile(blend_path):
+        return False
+    saved_manifest = _read_json_file(_nh_asset_manifest_path_for_folder(cache_folder_abs))
+    if not isinstance(saved_manifest, dict):
+        return False
+    current_manifest = _custom_asset_manifest(p3d_files, settings=settings)
+    if int(saved_manifest.get("version", 0) or 0) != int(current_manifest.get("version", 0) or 0):
+        return False
+    if str(saved_manifest.get("preview_mode", "") or "") != str(current_manifest.get("preview_mode", "") or ""):
+        return False
+    return list(saved_manifest.get("files", []) or []) == list(current_manifest.get("files", []) or [])
 
 
 def _write_persistent_asset_library_manifest(cache_folder_abs: str, source_folder_abs: str, p3d_files, blend_path: str, asset_entries: int, settings=None):
@@ -22499,17 +23467,30 @@ def _write_persistent_asset_library_blend(folder_abs: str, asset_root):
     return blend_path, len(asset_objects)
 
 
-def _build_persistent_asset_library_for_folder(context, folder_abs: str, p3d_files, settings):
+def _build_persistent_asset_library_for_folder(
+    context,
+    folder_abs: str,
+    p3d_files,
+    settings,
+    *,
+    cache_folder_abs: str = "",
+    catalog_path: str = "",
+    library_label: str = "",
+    cache_missing_textures: bool = False,
+    manifest_writer=None,
+):
     _clear_temp_asset_library(context)
     asset_root = _ensure_temp_asset_library_root(context)
-    cache_folder_abs = _nh_asset_cache_folder_for_source_folder(folder_abs, settings, create=True)
+    cache_folder_abs = cache_folder_abs or _nh_asset_cache_folder_for_source_folder(folder_abs, settings, create=True)
+    os.makedirs(cache_folder_abs, exist_ok=True)
     preview_dir = os.path.join(cache_folder_abs, _NH_OBJECTS_ASSET_PREVIEWS_FOLDER_NAME)
-    catalog_path = _nh_asset_catalog_path_for_source_folder(folder_abs, settings)
-    library_label = "NH Objects"
-    for name, root_abs in _iter_nh_objects_asset_roots(settings):
-        if _path_is_under_or_equal(cache_folder_abs, root_abs):
-            library_label = name
-            break
+    catalog_path = catalog_path or _nh_asset_catalog_path_for_source_folder(folder_abs, settings)
+    if not library_label:
+        library_label = "NH Objects"
+        for name, root_abs in _iter_nh_objects_asset_roots(settings):
+            if _path_is_under_or_equal(cache_folder_abs, root_abs):
+                library_label = name
+                break
     catalog_id = _nh_asset_catalog_id(library_label, catalog_path)
 
     imported = 0
@@ -22551,7 +23532,7 @@ def _build_persistent_asset_library_for_folder(context, folder_abs: str, p3d_fil
                     show_materials=True,
                     keep_converted_textures=True,
                     pack_runtime_images=False,
-                    cache_missing_textures=False,
+                    cache_missing_textures=bool(cache_missing_textures),
                 )
                 previewed += int(preview_stats.get("previewed", 0) or 0)
                 textured_candidates += int(preview_stats.get("textured_candidates", 0) or 0)
@@ -22576,7 +23557,10 @@ def _build_persistent_asset_library_for_folder(context, folder_abs: str, p3d_fil
             raise RuntimeError("No .p3d files imported")
 
         blend_path, asset_entries = _write_persistent_asset_library_blend(cache_folder_abs, asset_root)
-        manifest_path = _write_persistent_asset_library_manifest(cache_folder_abs, folder_abs, p3d_files, blend_path, asset_entries, settings=settings)
+        if callable(manifest_writer):
+            manifest_path = manifest_writer(cache_folder_abs, p3d_files, blend_path, asset_entries, settings=settings)
+        else:
+            manifest_path = _write_persistent_asset_library_manifest(cache_folder_abs, folder_abs, p3d_files, blend_path, asset_entries, settings=settings)
         return {
             "folder": folder_abs,
             "cache_folder": cache_folder_abs,
@@ -22593,6 +23577,169 @@ def _build_persistent_asset_library_for_folder(context, folder_abs: str, p3d_fil
         }
     finally:
         _clear_temp_asset_library(context)
+
+
+def _normalize_custom_asset_p3d_paths(p3d_files):
+    out = []
+    seen = set()
+    for fp in p3d_files or []:
+        try:
+            fp_abs = os.path.abspath(bpy.path.abspath(fp))
+        except Exception:
+            fp_abs = os.path.abspath(fp or "")
+        if not fp_abs or not os.path.isfile(fp_abs) or not fp_abs.lower().endswith(".p3d"):
+            continue
+        key = os.path.normcase(fp_abs)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(_norm_path(fp_abs))
+    out.sort(key=lambda item: _normalize_p3d_lookup_key(item))
+    return out
+
+
+def _clear_custom_asset_library_cache():
+    cache_root = _nh_objects_custom_asset_cache_root(create=True)
+    removed = 0
+    for path in (
+        _nh_asset_blend_path_for_folder(cache_root),
+        _nh_asset_manifest_path_for_folder(cache_root),
+    ):
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+                removed += 1
+        except Exception:
+            pass
+    preview_dir = os.path.join(cache_root, _NH_OBJECTS_ASSET_PREVIEWS_FOLDER_NAME)
+    try:
+        if os.path.isdir(preview_dir):
+            shutil.rmtree(preview_dir, ignore_errors=True)
+            removed += 1
+    except Exception:
+        pass
+    try:
+        _write_custom_asset_catalog_file()
+    except Exception:
+        pass
+    return removed
+
+
+def _remove_custom_preview_cache_for_model_key(model_key: str) -> int:
+    wanted = _normalize_p3d_lookup_key(model_key)
+    if not wanted:
+        return 0
+    preview_dir = os.path.join(_nh_objects_custom_asset_cache_root(create=False), _NH_OBJECTS_ASSET_PREVIEWS_FOLDER_NAME)
+    if not os.path.isdir(preview_dir):
+        return 0
+    removed = 0
+    try:
+        for name in os.listdir(preview_dir):
+            if not name.lower().endswith(".png"):
+                continue
+            if _normalize_p3d_lookup_key(name) != wanted:
+                continue
+            try:
+                os.remove(os.path.join(preview_dir, name))
+                removed += 1
+            except Exception:
+                pass
+    except Exception:
+        return removed
+    return removed
+
+
+def _build_custom_persistent_asset_library(op, context, p3d_files, *, open_browser=True, force_rebuild=True):
+    settings = context.scene.cray_asset_library_settings
+    p3d_files = _normalize_custom_asset_p3d_paths(p3d_files)
+    if not p3d_files:
+        _register_nh_objects_blender_asset_libraries()
+        _clear_custom_asset_library_cache()
+        if open_browser:
+            _open_nh_objects_asset_browser(context, settings, preferred_library_name=_NH_OBJECTS_CUSTOM_LIBRARY_NAME)
+        op.report({"INFO"}, "Custom asset library cleared")
+        return {"FINISHED"}
+    if not _has_any_a3ob_import_ops():
+        op.report({"ERROR"}, "Arma 3 Object Builder import operators not found")
+        return {"CANCELLED"}
+
+    _register_nh_objects_blender_asset_libraries()
+    _write_custom_asset_catalog_file()
+
+    if (not force_rebuild) and _custom_asset_library_is_current(p3d_files, settings):
+        if open_browser:
+            _open_nh_objects_asset_browser(context, settings, preferred_library_name=_NH_OBJECTS_CUSTOM_LIBRARY_NAME)
+        op.report({"INFO"}, f"Custom library already up to date: {len(p3d_files)} asset(s)")
+        return {"FINISHED"}
+
+    try:
+        stats = _build_persistent_asset_library_for_folder(
+            context,
+            _nh_objects_custom_search_root(settings),
+            p3d_files,
+            settings,
+            cache_folder_abs=_nh_objects_custom_asset_cache_root(create=True),
+            catalog_path=_NH_OBJECTS_CUSTOM_LABEL,
+            library_label=_NH_OBJECTS_CUSTOM_LIBRARY_NAME,
+            cache_missing_textures=True,
+            manifest_writer=_write_custom_asset_manifest,
+        )
+    except Exception as e:
+        op.report({"ERROR"}, f"Could not build Custom library: {_fmt_exc(e)}")
+        return {"CANCELLED"}
+
+    failed = list(stats.get("failed", []) or [])
+    preview_errors = list(stats.get("preview_errors", []) or [])
+    if failed:
+        print("=== NH Objects Custom Asset Library: Failures ===")
+        for item in failed:
+            print(item)
+    if preview_errors:
+        print("=== NH Objects Custom Asset Library: Material preview warnings ===")
+        for item in preview_errors:
+            print(item)
+
+    if open_browser:
+        _open_nh_objects_asset_browser(context, settings, preferred_library_name=_NH_OBJECTS_CUSTOM_LIBRARY_NAME)
+
+    msg = (
+        f"Custom library ready: imported {int(stats.get('imported', 0) or 0)}, "
+        f"assets {int(stats.get('asset_entries', 0) or 0)}"
+    )
+    textured_candidates = int(stats.get("textured_candidates", 0) or 0)
+    if textured_candidates > 0:
+        msg += f", texture previews {int(stats.get('previewed', 0) or 0)}/{textured_candidates}"
+    if failed:
+        op.report({"WARNING"}, msg + f", failed {len(failed)} (see System Console)")
+    elif preview_errors:
+        op.report({"WARNING"}, msg + f", preview warnings {len(preview_errors)} (see System Console)")
+    else:
+        op.report({"INFO"}, msg)
+    return {"FINISHED"}
+
+
+def _find_custom_asset_source_by_name(settings, model_name: str):
+    model_key = _normalize_p3d_lookup_key(model_name)
+    if not model_key:
+        return "", []
+
+    search_root = _nh_objects_custom_search_root(settings)
+    matches = _find_p3d_paths_by_name(search_root, model_key, settings=settings, respect_ignore=False)
+    if matches:
+        return matches[0], matches
+
+    extra_roots = (_nh_objects_common_root(settings), _nh_objects_environment_root(settings))
+    all_matches = []
+    seen = set()
+    for root_abs in extra_roots:
+        for fp in _find_p3d_paths_by_name(root_abs, model_key, settings=settings, respect_ignore=False):
+            key = os.path.normcase(fp)
+            if key in seen:
+                continue
+            seen.add(key)
+            all_matches.append(fp)
+    all_matches.sort(key=lambda item: (len(item), item.lower()))
+    return (all_matches[0], all_matches) if all_matches else ("", [])
 
 
 def _build_nh_objects_persistent_asset_libraries(op, context):
@@ -22662,6 +23809,41 @@ def _build_nh_objects_persistent_asset_libraries(op, context):
         for item in stats.get("preview_errors", []) or []:
             preview_errors.append(f"{folder_abs}: {item}")
 
+    custom_files = _read_custom_asset_p3d_paths()
+    if custom_files:
+        try:
+            _write_custom_asset_catalog_file()
+        except Exception as e:
+            print(f"NH Objects Custom Asset Catalog: {_fmt_exc(e)}")
+        if not rebuild and _custom_asset_library_is_current(custom_files, settings):
+            skipped_current += 1
+        else:
+            try:
+                stats = _build_persistent_asset_library_for_folder(
+                    context,
+                    _nh_objects_custom_search_root(settings),
+                    custom_files,
+                    settings,
+                    cache_folder_abs=_nh_objects_custom_asset_cache_root(create=True),
+                    catalog_path=_NH_OBJECTS_CUSTOM_LABEL,
+                    library_label=_NH_OBJECTS_CUSTOM_LIBRARY_NAME,
+                    cache_missing_textures=True,
+                    manifest_writer=_write_custom_asset_manifest,
+                )
+            except Exception as e:
+                failed.append(f"{_NH_OBJECTS_CUSTOM_LIBRARY_NAME}: {_fmt_exc(e)}")
+            else:
+                built += 1
+                imported_total += int(stats.get("imported", 0))
+                asset_entries_total += int(stats.get("asset_entries", 0))
+                previewed_total += int(stats.get("previewed", 0))
+                textured_candidates_total += int(stats.get("textured_candidates", 0))
+                packed_preview_images_total += int(stats.get("packed_preview_images", 0))
+                for item in stats.get("failed", []) or []:
+                    failed.append(f"{_NH_OBJECTS_CUSTOM_LIBRARY_NAME}: {item}")
+                for item in stats.get("preview_errors", []) or []:
+                    preview_errors.append(f"{_NH_OBJECTS_CUSTOM_LIBRARY_NAME}: {item}")
+
     if failed:
         print("=== NH Objects Persistent Asset Libraries: Failures ===")
         for item in failed:
@@ -22722,9 +23904,105 @@ class CRAY_OT_AssetLibraryOpenNHBrowser(Operator):
         _register_nh_objects_blender_asset_libraries()
         area = _open_nh_objects_asset_browser(context, settings)
         if area is None:
-            self.report({"WARNING"}, "Open an Asset Browser and select NH Objects - Common or NH Objects - Environment")
+            self.report({"WARNING"}, "Open an Asset Browser and select an NH Objects library")
         else:
             self.report({"INFO"}, "NH Asset Browser opened")
+        return {"FINISHED"}
+
+
+class CRAY_OT_AssetLibraryAddCustomByName(Operator):
+    bl_idname = "cray.asset_library_add_custom_by_name"
+    bl_label = "Add Custom Asset"
+    bl_description = "Find a .p3d by name and add it to NH Objects - Custom"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = context.scene.cray_asset_library_settings
+        model_name = (getattr(settings, "custom_p3d_name", "") or "").strip()
+        model_key = _normalize_p3d_lookup_key(model_name)
+        if not model_key:
+            self.report({"ERROR"}, "Type a .p3d name like pripyat_shoppingMall_sign")
+            return {"CANCELLED"}
+
+        search_root = _nh_objects_custom_search_root(settings)
+        if not search_root or not os.path.isdir(search_root):
+            self.report({"ERROR"}, "Custom Search Root was not found")
+            return {"CANCELLED"}
+
+        chosen, matches = _find_custom_asset_source_by_name(settings, model_key)
+        if not chosen:
+            self.report({"ERROR"}, f"{_display_p3d_name(model_key)} was not found in {search_root}")
+            return {"CANCELLED"}
+
+        current = _read_custom_asset_p3d_paths()
+        current = [
+            fp for fp in current
+            if _normalize_p3d_lookup_key(fp) != model_key
+        ]
+        current.append(chosen)
+        settings.custom_p3d_name = model_key
+
+        if len(matches) > 1:
+            print("=== Custom Asset Library: multiple .p3d matches found ===")
+            print(f"Requested: {model_key}")
+            for path in matches:
+                print(path)
+
+        result = _build_custom_persistent_asset_library(self, context, current, open_browser=True, force_rebuild=True)
+        if "FINISHED" in result and len(matches) > 1:
+            self.report(
+                {"WARNING"},
+                (
+                    f"Added {os.path.basename(chosen)} to Custom; found {len(matches)} matches, "
+                    f"used the first one (see System Console)"
+                ),
+            )
+        return result
+
+
+class CRAY_OT_AssetLibraryRemoveCustomByName(Operator):
+    bl_idname = "cray.asset_library_remove_custom_by_name"
+    bl_label = "Remove Custom Asset"
+    bl_description = "Remove the named .p3d from NH Objects - Custom"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = context.scene.cray_asset_library_settings
+        model_name = (getattr(settings, "custom_p3d_name", "") or "").strip()
+        model_key = _normalize_p3d_lookup_key(model_name)
+        if not model_key:
+            self.report({"ERROR"}, "Type the custom .p3d name to remove")
+            return {"CANCELLED"}
+
+        current = _read_custom_asset_p3d_paths()
+        remaining = [
+            fp for fp in current
+            if _normalize_p3d_lookup_key(fp) != model_key
+        ]
+        removed = len(current) - len(remaining)
+        if removed <= 0:
+            self.report({"WARNING"}, f"{_display_p3d_name(model_key)} is not in Custom")
+            return {"CANCELLED"}
+
+        settings.custom_p3d_name = model_key
+        _remove_custom_preview_cache_for_model_key(model_key)
+        result = _build_custom_persistent_asset_library(self, context, remaining, open_browser=True, force_rebuild=True)
+        if "FINISHED" in result:
+            self.report({"INFO"}, f"Removed {removed} custom asset(s)")
+        return result
+
+
+class CRAY_OT_AssetLibraryClearCustom(Operator):
+    bl_idname = "cray.asset_library_clear_custom"
+    bl_label = "Clear Custom Assets"
+    bl_description = "Clear NH Objects - Custom cached assets and previews"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        _register_nh_objects_blender_asset_libraries()
+        removed = _clear_custom_asset_library_cache()
+        _open_nh_objects_asset_browser(context, context.scene.cray_asset_library_settings, preferred_library_name=_NH_OBJECTS_CUSTOM_LIBRARY_NAME)
+        self.report({"INFO"}, f"Cleared Custom asset library ({removed} cache item(s))")
         return {"FINISHED"}
 
 
@@ -22905,7 +24183,19 @@ def _switch_bottom_area_to_asset_browser(context, asset_library_reference="LOCAL
     return area if ok else None
 
 
-def _first_nh_objects_asset_library_reference(settings=None):
+def _first_nh_objects_asset_library_reference(settings=None, preferred_library_name: str = ""):
+    preferred = str(preferred_library_name or "").strip()
+    if preferred:
+        for name, root_abs in _iter_nh_objects_asset_roots(settings):
+            if name != preferred:
+                continue
+            lib, _idx = _find_registered_asset_library_by_path(root_abs)
+            if lib is not None:
+                try:
+                    return str(getattr(lib, "name", "") or name)
+                except Exception:
+                    return name
+            return name
     for name, root_abs in _iter_nh_objects_asset_roots(settings):
         lib, _idx = _find_registered_asset_library_by_path(root_abs)
         if lib is not None:
@@ -22918,8 +24208,8 @@ def _first_nh_objects_asset_library_reference(settings=None):
     return "ALL"
 
 
-def _open_nh_objects_asset_browser(context, settings=None):
-    library_ref = _first_nh_objects_asset_library_reference(settings)
+def _open_nh_objects_asset_browser(context, settings=None, preferred_library_name: str = ""):
+    library_ref = _first_nh_objects_asset_library_reference(settings, preferred_library_name=preferred_library_name)
     return _switch_bottom_area_to_asset_browser(context, asset_library_reference=library_ref)
 
 
@@ -23025,12 +24315,20 @@ class CRAY_OT_ConvertSelectedToProxies(Operator):
             self.report({"ERROR"}, "Target must be an A3OB LOD mesh, for example Resolution 0")
             return {"CANCELLED"}
 
+        duplicate_to_all_resolution_lods = bool(getattr(st, "duplicate_to_all_resolution_lods", False))
+        target_lods = _proxy_conversion_target_lods(context, target_obj, duplicate_to_all_resolution_lods)
+        if duplicate_to_all_resolution_lods and not target_lods:
+            self.report({"ERROR"}, "Duplicate to all Resolution LODs requires a Resolution LOD target")
+            return {"CANCELLED"}
+        if not target_lods:
+            target_lods = [target_obj]
+
         if explicit_source is not None:
             selected = [explicit_source] if explicit_source != target_obj else []
         else:
             selected = [
                 o for o in context.selected_objects
-                if o != target_obj and o in source_map
+                if o not in target_lods and o in source_map
             ]
         if not selected:
             self.report({"ERROR"}, "Pick Proxy Source Object or select placed asset object(s)")
@@ -23053,8 +24351,9 @@ class CRAY_OT_ConvertSelectedToProxies(Operator):
 
         created = 0
         removed = 0
+        target_count = len(target_lods)
         skipped = []
-        next_index = _next_proxy_index_for_parent(target_obj)
+        next_indices = {lod_obj: _next_proxy_index_for_parent(lod_obj) for lod_obj in target_lods}
         to_remove = []
 
         for obj in selected:
@@ -23063,23 +24362,32 @@ class CRAY_OT_ConvertSelectedToProxies(Operator):
                 skipped.append(f"{obj.name}: no source .p3d path")
                 continue
 
-            proxy_mesh = _new_proxy_triangle_mesh(f"proxy_{obj.name}_mesh")
-            proxy_obj = bpy.data.objects.new("proxy", proxy_mesh)
-            target_collection.objects.link(proxy_obj)
-            _build_proxy_from_object_instance(proxy_obj, obj, target_obj, next_index, model_path=src)
-            try:
-                set_a3ob_proxy_properties(proxy_obj, src, next_index)
-            except Exception as e:
+            created_for_source = 0
+            for lod_obj in target_lods:
+                proxy_index = int(next_indices.get(lod_obj, 1) or 1)
+                proxy_mesh = _new_proxy_triangle_mesh(f"proxy_{obj.name}_mesh")
+                proxy_obj = bpy.data.objects.new("proxy", proxy_mesh)
+                proxy_collection = _proxy_target_collection_for_lod(lod_obj, target_collection)
                 try:
-                    bpy.data.objects.remove(proxy_obj, do_unlink=True)
+                    proxy_collection.objects.link(proxy_obj)
                 except Exception:
-                    pass
-                skipped.append(f"{obj.name}: {_fmt_exc(e)}")
-                continue
+                    context.scene.collection.objects.link(proxy_obj)
+                _build_proxy_from_object_instance(proxy_obj, obj, lod_obj, proxy_index, model_path=src)
+                try:
+                    set_a3ob_proxy_properties(proxy_obj, src, proxy_index)
+                except Exception as e:
+                    try:
+                        bpy.data.objects.remove(proxy_obj, do_unlink=True)
+                    except Exception:
+                        pass
+                    skipped.append(f"{obj.name} -> {lod_obj.name}: {_fmt_exc(e)}")
+                    continue
 
-            created += 1
-            next_index += 1
-            if st.delete_originals:
+                created += 1
+                created_for_source += 1
+                next_indices[lod_obj] = proxy_index + 1
+
+            if created_for_source > 0:
                 to_remove.append(obj)
 
         for obj in sorted(to_remove, key=_obj_depth, reverse=True):
@@ -23100,16 +24408,19 @@ class CRAY_OT_ConvertSelectedToProxies(Operator):
             self.report({"ERROR"}, "No proxies created (see System Console)")
             return {"CANCELLED"}
 
-        if explicit_source is not None and st.delete_originals:
+        if explicit_source is not None:
             try:
                 if bpy.data.objects.get(explicit_source.name) is None:
                     st.source_object = None
             except Exception:
                 pass
 
-        msg = f"Created {created} proxy(s) under '{target_obj.name}'"
-        if st.delete_originals:
-            msg += f", removed {removed} original(s)"
+        msg = f"Created {created} proxy(s)"
+        if target_count > 1:
+            msg += f" across {target_count} Resolution LOD(s)"
+        else:
+            msg += f" under '{target_obj.name}'"
+        msg += f", removed {removed} original(s)"
         if skipped:
             msg += f", skipped {len(skipped)} (see System Console)"
             self.report({"WARNING"}, msg)
@@ -24985,13 +26296,22 @@ class CRAY_PT_AssetProxyPanel(Panel):
         row = box.row(align=True)
         row.operator("cray.asset_library_build_nh_objects", icon="ASSET_MANAGER")
         row.operator("cray.asset_library_open_nh_browser", text="", icon="FILEBROWSER")
+        box.operator("cray.asset_library_clean_source_artifacts", text="Clean Source Cache Files", icon="TRASH")
         box.operator("cray.texture_cache_build_nh_library_used", text="Cache Used Library Textures", icon="TEXTURE")
+        box.separator()
+        box.label(text="Custom", icon="BOOKMARKS")
+        box.prop(lib, "custom_search_root")
+        custom_row = box.row(align=True)
+        custom_row.prop(lib, "custom_p3d_name", text="")
+        custom_row.operator("cray.asset_library_add_custom_by_name", text="", icon="ADD")
+        custom_row.operator("cray.asset_library_remove_custom_by_name", text="", icon="REMOVE")
+        box.operator("cray.asset_library_clear_custom", text="Clear Custom", icon="TRASH")
 
         box = layout.box()
         box.label(text="Placed Assets -> A3OB Proxies", icon="CONSTRAINT")
         box.prop(st, "source_object", text="Proxy Source Object")
         box.prop(st, "target_object", text="Target Resolution / LOD")
-        box.prop(st, "delete_originals")
+        box.prop(st, "duplicate_to_all_resolution_lods")
         box.operator("cray.convert_selected_to_proxies", icon="CONSTRAINT")
 
 
@@ -25220,6 +26540,7 @@ class CRAY_PT_CacheManagerPanel(Panel):
         row = lbox.row(align=True)
         row.operator("cray.asset_library_build_nh_objects", text="Build / Update Libraries", icon="ASSET_MANAGER")
         row.operator("cray.asset_library_rebuild_icon_cache", text="Rebuild Icons", icon="IMAGE_DATA")
+        lbox.operator("cray.asset_library_clean_source_artifacts", text="Clean Source Cache Files", icon="TRASH")
         lbox.operator("cray.open_nh_asset_cache_folder", text="Open NH Library Cache", icon="FILE_FOLDER")
         try:
             asset_cache = _nh_objects_asset_cache_base(create=False)
@@ -25261,7 +26582,20 @@ class CRAY_PT_TextureReplacePanel(Panel):
 
         ebox = layout.box()
         ebox.label(text="Export Missing Textures from Sources", icon="EXPORT")
-        ebox.prop(ts, "source_textures_folder")
+        roots = _ensure_tex_source_roots_collection(ts)
+        roots_box = ebox.box()
+        roots_box.label(text="Source Texture Roots", icon="FILE_FOLDER")
+        if roots:
+            for idx, item in enumerate(ts.source_texture_roots):
+                row = roots_box.row(align=True)
+                row.prop(item, "path", text=f"{idx + 1}")
+                remove_op = row.operator("cray.tex_source_root_remove", text="", icon="TRASH")
+                remove_op.index = idx
+        else:
+            roots_box.label(text="No source roots configured", icon="ERROR")
+        add_row = roots_box.row(align=True)
+        add_row.prop(ts, "source_root_to_add", text="")
+        add_row.operator("cray.tex_source_root_add", text="", icon="ADD")
         ebox.prop(ts, "target_textures_folder")
         ebox.prop(ts, "output_diffuse_suffix")
         row = ebox.row(align=True)
@@ -25398,10 +26732,13 @@ classes = (
 
     CRAY_PG_TexDBItem,
     CRAY_PG_ObjMatImagesItem,
+    CRAY_PG_TexSourceRootItem,
     CRAY_PG_TexReplaceSettings,
     CRAY_UL_TexDB,
     CRAY_UL_ObjPreview,
     CRAY_OT_TexDBBuildFromFolder,
+    CRAY_OT_TexSourceRootAdd,
+    CRAY_OT_TexSourceRootRemove,
     CRAY_OT_UpdateObjectPreview,
     CRAY_OT_FixMeshHierarchy,
     CRAY_OT_ReplaceTexturesFromDB,
@@ -25431,8 +26768,12 @@ classes = (
     CRAY_OT_AssetLibraryBuildFromFolder,
     CRAY_OT_AssetLibraryBuildFromFiles,
     CRAY_OT_AssetLibraryClear,
+    CRAY_OT_AssetLibraryCleanSourceArtifacts,
     CRAY_OT_AssetLibraryBuildNHObjects,
     CRAY_OT_AssetLibraryOpenNHBrowser,
+    CRAY_OT_AssetLibraryAddCustomByName,
+    CRAY_OT_AssetLibraryRemoveCustomByName,
+    CRAY_OT_AssetLibraryClearCustom,
     CRAY_OT_IE_AddFiles,
     CRAY_OT_P3DDropMenu,
     CRAY_MT_P3DDropMenu,
