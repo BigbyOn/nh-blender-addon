@@ -1,7 +1,7 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Daryl and Enisam",
-    "version": (0, 5, 3, 11),
+    "version": (0, 5, 3, 12),
     "blender": (5, 1, 1),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "All-in-one Blender toolkit for porting and preparing DayZ/Arma assets: fixes, textures, colliders, proxies, snap points, and P3D workflow helpers.",    
@@ -123,6 +123,24 @@ _PERSISTED_UI_SETTINGS = {
         "named_model_name",
         "named_export_mode",
         "named_export_directory",
+        "grid_cell_size_x",
+        "grid_cell_size_y",
+        "grid_cell_size_z",
+        "grid_count_x",
+        "grid_count_y",
+        "grid_count_z",
+        "grid_origin_mode",
+        "grid_manual_origin_x",
+        "grid_manual_origin_y",
+        "grid_manual_origin_z",
+        "grid_output_prefix",
+        "grid_use_visible_cutters_only",
+        "grid_keep_original",
+        "grid_hide_cutters_after_split",
+        "grid_skip_empty_pieces",
+        "grid_min_vertices",
+        "grid_min_faces",
+        "grid_add_result_to_export_planner",
     ),
     "cray_collider_settings": (
         "target_lod",
@@ -1360,6 +1378,19 @@ def _on_model_split_merge_source_key_changed(self, context):
         pass
 
 
+_MODEL_SPLIT_GRID_ORIGIN_MODE_ITEMS = (
+    ("ACTIVE_OBJECT_BOUNDS", "Active Object Bounds", "Place the cutter grid at the active object's bounds center"),
+    ("SOURCE_ROOT_BOUNDS", "Source Root Bounds", "Place the cutter grid at the source root collection bounds center"),
+    ("SELECTION_BOUNDS", "Selection Bounds", "Place the cutter grid at the selected objects bounds center"),
+    ("CURSOR", "Cursor", "Place the cutter grid at the 3D cursor"),
+    ("MANUAL", "Manual", "Use the manual origin coordinates"),
+)
+
+
+def _poll_model_split_grid_source_object(self, obj):
+    return obj is not None and getattr(obj, "type", None) == "MESH"
+
+
 class CRAY_PG_ModelSplitMergeSourceItem(PropertyGroup):
     name: StringProperty(name="Name", default="")
     collection: PointerProperty(name="Collection", type=bpy.types.Collection)
@@ -1428,6 +1459,117 @@ class CRAY_PG_ModelSplitSettings(PropertyGroup):
     )
     merge_sources: CollectionProperty(type=CRAY_PG_ModelSplitMergeSourceItem)
     merge_sources_index: IntProperty(default=0)
+    grid_source_object: PointerProperty(
+        name="Source Object",
+        description="Single mesh object to split by the cutter grid",
+        type=bpy.types.Object,
+        poll=_poll_model_split_grid_source_object,
+    )
+    grid_source_root_collection: PointerProperty(
+        name="Source Root Collection",
+        description=".p3d root collection whose mesh objects will be split by the cutter grid",
+        type=bpy.types.Collection,
+    )
+    grid_cutter_collection: PointerProperty(
+        name="Cutter Collection",
+        description="Collection containing tagged cube cutter objects",
+        type=bpy.types.Collection,
+    )
+    grid_cell_size_x: FloatProperty(
+        name="Cell Size X",
+        description="Cutter cube size along local X",
+        default=10.0,
+        min=0.001,
+        soft_min=0.001,
+    )
+    grid_cell_size_y: FloatProperty(
+        name="Cell Size Y",
+        description="Cutter cube size along local Y",
+        default=10.0,
+        min=0.001,
+        soft_min=0.001,
+    )
+    grid_cell_size_z: FloatProperty(
+        name="Cell Size Z",
+        description="Cutter cube size along local Z",
+        default=10.0,
+        min=0.001,
+        soft_min=0.001,
+    )
+    grid_count_x: IntProperty(
+        name="Count X",
+        description="Number of cutter cubes along X",
+        default=2,
+        min=1,
+        max=999,
+    )
+    grid_count_y: IntProperty(
+        name="Count Y",
+        description="Number of cutter cubes along Y",
+        default=2,
+        min=1,
+        max=999,
+    )
+    grid_count_z: IntProperty(
+        name="Count Z",
+        description="Number of cutter cubes along Z",
+        default=1,
+        min=1,
+        max=999,
+    )
+    grid_origin_mode: EnumProperty(
+        name="Grid Origin Mode",
+        description="How the starting center of the cutter grid is chosen",
+        items=_MODEL_SPLIT_GRID_ORIGIN_MODE_ITEMS,
+        default="ACTIVE_OBJECT_BOUNDS",
+    )
+    grid_manual_origin_x: FloatProperty(name="Manual Origin X", default=0.0)
+    grid_manual_origin_y: FloatProperty(name="Manual Origin Y", default=0.0)
+    grid_manual_origin_z: FloatProperty(name="Manual Origin Z", default=0.0)
+    grid_output_prefix: StringProperty(
+        name="Output Name Prefix",
+        default="split",
+        description="Prefix for generated .p3d root collections",
+    )
+    grid_use_visible_cutters_only: BoolProperty(
+        name="Use Visible Cutters Only",
+        description="Ignore hidden cutter cubes during split",
+        default=True,
+    )
+    grid_keep_original: BoolProperty(
+        name="Keep Original",
+        description="Keep source objects untouched after a successful grid split",
+        default=True,
+    )
+    grid_hide_cutters_after_split: BoolProperty(
+        name="Hide Cutters After Split",
+        description="Hide the cutter collection after splitting",
+        default=False,
+    )
+    grid_skip_empty_pieces: BoolProperty(
+        name="Skip Empty Pieces",
+        description="Skip generated pieces below the minimum vertex or face thresholds",
+        default=True,
+    )
+    grid_min_vertices: IntProperty(
+        name="Min Vertices",
+        description="Minimum vertex count for generated pieces",
+        default=1,
+        min=0,
+        max=1000000,
+    )
+    grid_min_faces: IntProperty(
+        name="Min Faces",
+        description="Minimum face count for generated face pieces when Skip Empty Pieces is enabled",
+        default=1,
+        min=0,
+        max=1000000,
+    )
+    grid_add_result_to_export_planner: BoolProperty(
+        name="Add Result To Export Planner",
+        description="Add generated .p3d root collections to the Import/Export planner",
+        default=True,
+    )
 
 
 _COLLIDER_TARGET_LOD_ITEMS = (
@@ -21753,6 +21895,1104 @@ class CRAY_OT_ModelSplitTransferSelectedToTargetCategory(Operator):
             self.report({"INFO"}, msg)
         return {"FINISHED"}
 
+
+def _model_split_grid_active_mesh_object(context):
+    active_objects = getattr(getattr(context, "view_layer", None), "objects", None)
+    active_obj = getattr(active_objects, "active", None) if active_objects is not None else None
+    if active_obj is not None and getattr(active_obj, "type", None) == "MESH":
+        return active_obj
+    return None
+
+
+def _model_split_grid_is_cutter(obj) -> bool:
+    if obj is None:
+        return False
+    try:
+        return bool(obj.get("nh_grid_cutter", False))
+    except Exception:
+        return False
+
+
+def _model_split_grid_is_enabled_cutter(obj) -> bool:
+    if not _model_split_grid_is_cutter(obj):
+        return False
+    try:
+        return bool(obj.get("nh_grid_enabled", True))
+    except Exception:
+        return True
+
+
+def _model_split_grid_object_visible(context, obj) -> bool:
+    if obj is None:
+        return False
+    try:
+        return bool(obj.visible_get(view_layer=context.view_layer))
+    except TypeError:
+        try:
+            return bool(obj.visible_get())
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        if obj.hide_get():
+            return False
+    except Exception:
+        pass
+    try:
+        if bool(getattr(obj, "hide_viewport", False)):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _model_split_grid_cutter_sort_key(obj):
+    def _int_prop(name):
+        try:
+            return int(obj.get(name, 0))
+        except Exception:
+            return 0
+
+    return (
+        _int_prop("nh_grid_x"),
+        _int_prop("nh_grid_y"),
+        _int_prop("nh_grid_z"),
+        getattr(obj, "name", ""),
+    )
+
+
+def _model_split_grid_cutter_id_from_object(obj) -> str:
+    try:
+        grid_id = str(obj.get("nh_grid_id", "") or "").strip()
+        if grid_id:
+            return grid_id
+    except Exception:
+        pass
+    name = _strip_blender_numeric_suffix(getattr(obj, "name", "") or "")
+    if name.upper().startswith("CUT_"):
+        return name[4:]
+    return name or "X00_Y00"
+
+
+def _model_split_grid_source_display_name(context, settings) -> str:
+    source_obj = getattr(settings, "grid_source_object", None)
+    if source_obj is not None:
+        return _strip_blender_numeric_suffix(getattr(source_obj, "name", "") or "Source")
+    source_root = getattr(settings, "grid_source_root_collection", None)
+    if source_root is not None:
+        return _strip_blender_numeric_suffix(getattr(source_root, "name", "") or "Source")
+    active_obj = _model_split_grid_active_mesh_object(context)
+    if active_obj is not None and not _model_split_grid_is_cutter(active_obj):
+        return _strip_blender_numeric_suffix(getattr(active_obj, "name", "") or "Source")
+    roots = _model_split_selected_p3d_root_collections(context)
+    if roots:
+        return _strip_blender_numeric_suffix(getattr(roots[0], "name", "") or "Source")
+    return "Scene"
+
+
+def _model_split_grid_safe_name(value: str, fallback: str = "split") -> str:
+    name = _strip_blender_numeric_suffix((value or "").strip())
+    if name.lower().endswith(".p3d"):
+        name = os.path.splitext(name)[0]
+    name = _INVALID_FILENAME_CHARS_RE.sub("_", name)
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    return name or fallback
+
+
+def _model_split_grid_output_prefix(settings, source_name: str = "") -> str:
+    return _model_split_grid_safe_name(
+        getattr(settings, "grid_output_prefix", "") or source_name or "split",
+        fallback="split",
+    )
+
+
+def _model_split_grid_collection_parent(context, source_root=None):
+    scene_root = getattr(getattr(context, "scene", None), "collection", None)
+    if scene_root is None:
+        return source_root
+    if source_root is not None:
+        parent = _find_parent_collection(scene_root, source_root)
+        if parent is not None:
+            return parent
+    return scene_root
+
+
+def _model_split_grid_cutter_collection(context, settings, *, create: bool = False):
+    collection = getattr(settings, "grid_cutter_collection", None)
+    if collection is not None:
+        return collection
+    if not create:
+        return None
+
+    source_name = _model_split_grid_source_display_name(context, settings)
+    collection_name = f"NH Grid Cutters - {source_name}"
+    collection = bpy.data.collections.get(collection_name)
+    if collection is None:
+        collection = bpy.data.collections.new(collection_name)
+
+    scene_root = getattr(getattr(context, "scene", None), "collection", None)
+    if scene_root is not None:
+        try:
+            if _find_parent_collection(scene_root, collection) is None and scene_root != collection:
+                scene_root.children.link(collection)
+        except Exception:
+            pass
+
+    try:
+        settings.grid_cutter_collection = collection
+    except Exception:
+        pass
+    return collection
+
+
+def _model_split_grid_collect_cutters(context, settings):
+    cutter_collection = _model_split_grid_cutter_collection(context, settings, create=False)
+    if cutter_collection is None:
+        return []
+
+    cutters = []
+    for obj in _collect_collection_objects_recursive(cutter_collection):
+        if getattr(obj, "type", None) != "MESH":
+            continue
+        if not _model_split_grid_is_enabled_cutter(obj):
+            continue
+        if bool(getattr(settings, "grid_use_visible_cutters_only", True)) and not _model_split_grid_object_visible(context, obj):
+            continue
+        cutters.append(obj)
+
+    cutters.sort(key=_model_split_grid_cutter_sort_key)
+    return cutters
+
+
+def _model_split_grid_delete_tagged_cutters(collection):
+    if collection is None:
+        return 0
+    removed = 0
+    for obj in list(_collect_collection_objects_recursive(collection)):
+        if not _model_split_grid_is_cutter(obj):
+            continue
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+            removed += 1
+        except Exception as e:
+            print(f"[NH Plugin] Grid Cutter Split: failed to remove cutter {getattr(obj, 'name', '<object>')}: {_fmt_exc(e)}")
+    return removed
+
+
+def _model_split_grid_world_bounds_for_objects(objects):
+    points = []
+    for obj in objects or ():
+        if obj is None or getattr(obj, "type", None) != "MESH":
+            continue
+        try:
+            matrix = obj.matrix_world.copy()
+            bound_box = list(getattr(obj, "bound_box", []) or [])
+        except Exception:
+            bound_box = []
+        if bound_box:
+            points.extend(matrix @ Vector(corner) for corner in bound_box)
+            continue
+        data = getattr(obj, "data", None)
+        if data is None:
+            continue
+        for vertex in getattr(data, "vertices", []) or []:
+            try:
+                points.append(matrix @ vertex.co)
+            except Exception:
+                pass
+    if not points:
+        return None
+
+    min_v = Vector((
+        min(p.x for p in points),
+        min(p.y for p in points),
+        min(p.z for p in points),
+    ))
+    max_v = Vector((
+        max(p.x for p in points),
+        max(p.y for p in points),
+        max(p.z for p in points),
+    ))
+    return min_v, max_v
+
+
+def _model_split_grid_bounds_center(bounds):
+    if not bounds:
+        return Vector((0.0, 0.0, 0.0))
+    return (bounds[0] + bounds[1]) * 0.5
+
+
+def _model_split_grid_origin(context, settings):
+    mode = str(getattr(settings, "grid_origin_mode", "ACTIVE_OBJECT_BOUNDS") or "ACTIVE_OBJECT_BOUNDS")
+    if mode == "MANUAL":
+        return Vector((
+            float(getattr(settings, "grid_manual_origin_x", 0.0) or 0.0),
+            float(getattr(settings, "grid_manual_origin_y", 0.0) or 0.0),
+            float(getattr(settings, "grid_manual_origin_z", 0.0) or 0.0),
+        ))
+    if mode == "CURSOR":
+        try:
+            return context.scene.cursor.location.copy()
+        except Exception:
+            return Vector((0.0, 0.0, 0.0))
+
+    objects = []
+    if mode == "SOURCE_ROOT_BOUNDS":
+        root = getattr(settings, "grid_source_root_collection", None)
+        if root is None:
+            source_obj = getattr(settings, "grid_source_object", None)
+            root = _find_p3d_root_collection_for_object(context, source_obj) if source_obj is not None else None
+        if root is not None:
+            objects = [obj for obj in _collect_collection_objects_recursive(root) if getattr(obj, "type", None) == "MESH" and not _model_split_grid_is_cutter(obj)]
+    elif mode == "SELECTION_BOUNDS":
+        objects = [
+            obj for obj in getattr(context, "selected_objects", []) or []
+            if getattr(obj, "type", None) == "MESH" and not _model_split_grid_is_cutter(obj)
+        ]
+    else:
+        active_obj = _model_split_grid_active_mesh_object(context)
+        source_obj = getattr(settings, "grid_source_object", None)
+        if active_obj is not None and not _model_split_grid_is_cutter(active_obj):
+            objects = [active_obj]
+        elif source_obj is not None:
+            objects = [source_obj]
+
+    bounds = _model_split_grid_world_bounds_for_objects(objects)
+    return _model_split_grid_bounds_center(bounds)
+
+
+def _model_split_grid_axis_token(axis: str, index: int, count: int) -> str:
+    width = max(2, len(str(max(0, int(count) - 1))))
+    return f"{axis}{int(index):0{width}d}"
+
+
+def _model_split_grid_id(ix: int, iy: int, iz: int, count_z: int, count_x: int, count_y: int) -> str:
+    parts = (
+        _model_split_grid_axis_token("X", ix, count_x),
+        _model_split_grid_axis_token("Y", iy, count_y),
+    )
+    if int(count_z) > 1:
+        parts = parts + (_model_split_grid_axis_token("Z", iz, count_z),)
+    return "_".join(parts)
+
+
+def _model_split_grid_create_cube_mesh(name: str):
+    mesh = bpy.data.meshes.new(name)
+    verts = (
+        (-0.5, -0.5, -0.5),
+        (0.5, -0.5, -0.5),
+        (0.5, 0.5, -0.5),
+        (-0.5, 0.5, -0.5),
+        (-0.5, -0.5, 0.5),
+        (0.5, -0.5, 0.5),
+        (0.5, 0.5, 0.5),
+        (-0.5, 0.5, 0.5),
+    )
+    faces = (
+        (0, 1, 2, 3),
+        (4, 7, 6, 5),
+        (0, 4, 5, 1),
+        (1, 5, 6, 2),
+        (2, 6, 7, 3),
+        (3, 7, 4, 0),
+    )
+    mesh.from_pydata(verts, (), faces)
+    mesh.update()
+    return mesh
+
+
+def _model_split_grid_config_values(settings):
+    size_x = max(0.001, float(getattr(settings, "grid_cell_size_x", 10.0) or 10.0))
+    size_y = max(0.001, float(getattr(settings, "grid_cell_size_y", 10.0) or 10.0))
+    size_z = max(0.001, float(getattr(settings, "grid_cell_size_z", 10.0) or 10.0))
+    count_x = max(1, int(getattr(settings, "grid_count_x", 1) or 1))
+    count_y = max(1, int(getattr(settings, "grid_count_y", 1) or 1))
+    count_z = max(1, int(getattr(settings, "grid_count_z", 1) or 1))
+    return size_x, size_y, size_z, count_x, count_y, count_z
+
+
+def _model_split_grid_category_for_object(obj) -> str:
+    category = _model_split_category_for_object(obj)
+    if obj is not None and hasattr(obj, "a3ob_properties_object"):
+        try:
+            if bool(getattr(obj.a3ob_properties_object, "is_a3_lod", False)):
+                return category
+        except Exception:
+            pass
+
+    text_parts = [getattr(obj, "name", "") or ""]
+    for col in getattr(obj, "users_collection", []) or []:
+        text_parts.append(getattr(col, "name", "") or "")
+    text = " ".join(_logical_collection_name(part) for part in text_parts)
+    if "roadway" in text:
+        return "ROADWAY"
+    if "memory" in text or "point cloud" in text or "pointcloud" in text:
+        return "POINT_CLOUDS"
+    if (
+        "geometry" in text or
+        "shadow" in text or
+        "physx" in text or
+        "view geometry" in text or
+        "fire geometry" in text
+    ):
+        return "GEOMETRIES"
+    if "resolution" in text or "visual" in text:
+        return "RESOLUTION"
+    return category
+
+
+def _model_split_grid_copy_a3ob_object_props(src_obj, dst_obj):
+    if src_obj is None or dst_obj is None:
+        return False
+    if not hasattr(src_obj, "a3ob_properties_object") or not hasattr(dst_obj, "a3ob_properties_object"):
+        return False
+    try:
+        src_props = src_obj.a3ob_properties_object
+        dst_props = dst_obj.a3ob_properties_object
+        for prop in getattr(src_props, "bl_rna", ()).properties:
+            identifier = getattr(prop, "identifier", "")
+            if not identifier or identifier == "rna_type" or getattr(prop, "is_readonly", False):
+                continue
+            try:
+                setattr(dst_props, identifier, getattr(src_props, identifier))
+            except Exception:
+                pass
+        return True
+    except Exception:
+        return False
+
+
+def _model_split_grid_set_piece_names(obj, piece_name: str):
+    if obj is None:
+        return
+    try:
+        obj.name = piece_name
+    except Exception:
+        pass
+    try:
+        if obj.data is not None:
+            obj.data.name = piece_name
+    except Exception:
+        pass
+
+
+def _model_split_grid_prepare_piece_props(src_obj, dst_obj, category_token: str, piece_name: str):
+    copied = _model_split_grid_copy_a3ob_object_props(src_obj, dst_obj)
+    if not copied:
+        _set_model_split_target_lod_a3ob_props(dst_obj, category_token)
+    _model_split_grid_set_piece_names(dst_obj, piece_name)
+
+
+def _model_split_grid_has_faces(obj) -> bool:
+    data = getattr(obj, "data", None)
+    if data is None:
+        return False
+    try:
+        return len(data.polygons) > 0
+    except Exception:
+        return False
+
+
+def _model_split_grid_should_clip_as_points(obj, category_token: str) -> bool:
+    return category_token == "POINT_CLOUDS" or not _model_split_grid_has_faces(obj)
+
+
+def _model_split_grid_is_proxy_object(obj) -> bool:
+    if obj is None or getattr(obj, "type", None) != "MESH":
+        return False
+    try:
+        if _is_a3ob_proxy_object(obj):
+            return True
+    except Exception:
+        pass
+    if hasattr(obj, "a3ob_properties_object_proxy"):
+        try:
+            props = obj.a3ob_properties_object_proxy
+            if bool(getattr(props, "is_a3_proxy", False)):
+                return True
+        except Exception:
+            pass
+    name = (getattr(obj, "name", "") or "").strip().lower()
+    return name.startswith("proxy:")
+
+
+def _model_split_grid_output_container(context, source_root, prefix: str):
+    parent = _model_split_grid_collection_parent(context, source_root)
+    if parent is None:
+        return None
+    container_name = f"NH Grid Split - {prefix}"
+    container = bpy.data.collections.new(container_name)
+    parent.children.link(container)
+    try:
+        container.color_tag = "COLOR_04"
+    except Exception:
+        pass
+    return container
+
+
+def _model_split_grid_output_root_name(prefix: str, grid_id: str) -> str:
+    root_name = f"{prefix}_{grid_id}.p3d"
+    root_name = _INVALID_FILENAME_CHARS_RE.sub("_", root_name)
+    return root_name
+
+
+def _model_split_grid_create_output_root(context, container, source_root, root_name: str):
+    if container is None:
+        return None
+    target_root = bpy.data.collections.new(root_name)
+    container.children.link(target_root)
+    try:
+        if source_root is not None and getattr(source_root, "color_tag", None):
+            target_root.color_tag = source_root.color_tag
+    except Exception:
+        pass
+    if source_root is not None:
+        _set_ie_source_path_tag(target_root, _derive_split_export_source_path(source_root, root_name))
+    return target_root
+
+
+def _model_split_grid_remove_collection_tree(collection):
+    if collection is None:
+        return
+    for child in list(getattr(collection, "children", []) or []):
+        _model_split_grid_remove_collection_tree(child)
+    for obj in list(getattr(collection, "objects", []) or []):
+        try:
+            collection.objects.unlink(obj)
+        except Exception:
+            pass
+    try:
+        bpy.data.collections.remove(collection)
+    except Exception:
+        pass
+
+
+def _model_split_grid_point_inside_cutter(cutter, world_point, epsilon: float = 1.0e-6) -> bool:
+    if cutter is None:
+        return False
+    try:
+        local = cutter.matrix_world.inverted_safe() @ world_point
+    except Exception:
+        return False
+
+    bound_box = list(getattr(cutter, "bound_box", []) or [])
+    if not bound_box and getattr(cutter, "data", None) is not None:
+        try:
+            bound_box = [vertex.co[:] for vertex in cutter.data.vertices]
+        except Exception:
+            bound_box = []
+    if not bound_box:
+        bound_box = [(-0.5, -0.5, -0.5), (0.5, 0.5, 0.5)]
+
+    min_v = Vector((
+        min(Vector(corner).x for corner in bound_box),
+        min(Vector(corner).y for corner in bound_box),
+        min(Vector(corner).z for corner in bound_box),
+    ))
+    max_v = Vector((
+        max(Vector(corner).x for corner in bound_box),
+        max(Vector(corner).y for corner in bound_box),
+        max(Vector(corner).z for corner in bound_box),
+    ))
+    return (
+        min_v.x - epsilon <= local.x <= max_v.x + epsilon and
+        min_v.y - epsilon <= local.y <= max_v.y + epsilon and
+        min_v.z - epsilon <= local.z <= max_v.z + epsilon
+    )
+
+
+def _model_split_grid_apply_boolean_intersect(context, obj, cutter):
+    if obj is None or cutter is None:
+        raise RuntimeError("Missing object or cutter for boolean split")
+    modifier = None
+    old_mesh = getattr(obj, "data", None)
+    try:
+        modifier = obj.modifiers.new("NH Grid Cutter Intersect", "BOOLEAN")
+        modifier.operation = "INTERSECT"
+        modifier.object = cutter
+        if hasattr(modifier, "solver"):
+            modifier.solver = "EXACT"
+        try:
+            context.view_layer.update()
+        except Exception:
+            pass
+        depsgraph = context.evaluated_depsgraph_get()
+        evaluated = obj.evaluated_get(depsgraph)
+        try:
+            new_mesh = bpy.data.meshes.new_from_object(
+                evaluated,
+                depsgraph=depsgraph,
+                preserve_all_data_layers=True,
+            )
+        except TypeError:
+            new_mesh = bpy.data.meshes.new_from_object(evaluated, depsgraph=depsgraph)
+        if new_mesh is None:
+            raise RuntimeError("Boolean modifier produced no mesh")
+        obj.modifiers.remove(modifier)
+        modifier = None
+        obj.data = new_mesh
+        if old_mesh is not None and getattr(old_mesh, "users", 0) == 0:
+            try:
+                bpy.data.meshes.remove(old_mesh)
+            except Exception:
+                pass
+        return obj
+    except Exception:
+        if modifier is not None:
+            try:
+                obj.modifiers.remove(modifier)
+            except Exception:
+                pass
+        raise
+
+
+def _model_split_grid_cleanup_mesh(obj, *, recalc_normals: bool = False, remove_loose: bool = False):
+    mesh = getattr(obj, "data", None)
+    if mesh is None:
+        return
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh)
+        if remove_loose:
+            loose_verts = [vert for vert in bm.verts if not vert.link_edges and not vert.link_faces]
+            if loose_verts:
+                bmesh.ops.delete(bm, geom=loose_verts, context="VERTS")
+        if recalc_normals and bm.faces:
+            bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
+        bm.to_mesh(mesh)
+        mesh.update()
+    finally:
+        bm.free()
+
+
+def _model_split_grid_piece_is_empty(obj, settings, *, point_piece: bool = False) -> bool:
+    data = getattr(obj, "data", None)
+    if data is None:
+        return True
+    try:
+        vertex_count = len(data.vertices)
+    except Exception:
+        vertex_count = 0
+    try:
+        face_count = len(data.polygons)
+    except Exception:
+        face_count = 0
+    if vertex_count <= 0:
+        return True
+    min_vertices = max(0, int(getattr(settings, "grid_min_vertices", 0) or 0))
+    min_faces = max(0, int(getattr(settings, "grid_min_faces", 0) or 0))
+    if vertex_count < min_vertices:
+        return True
+    if not point_piece and bool(getattr(settings, "grid_skip_empty_pieces", True)) and face_count < min_faces:
+        return True
+    return False
+
+
+def _model_split_grid_remove_object(obj):
+    if obj is None:
+        return
+    try:
+        bpy.data.objects.remove(obj, do_unlink=True)
+    except Exception:
+        pass
+
+
+def _model_split_grid_make_face_piece(context, src_obj, cutter, dest_collection, settings, piece_name, category_token):
+    dup_obj = _duplicate_object_for_split(src_obj)
+    if dup_obj is None:
+        raise RuntimeError("Failed to duplicate source object")
+    _model_split_grid_prepare_piece_props(src_obj, dup_obj, category_token, piece_name)
+    _link_object_to_collection(dup_obj, dest_collection)
+    _ensure_collection_visible_in_view_layer(context, dest_collection)
+    try:
+        _model_split_grid_apply_boolean_intersect(context, dup_obj, cutter)
+        if category_token == "ROADWAY":
+            _model_split_grid_cleanup_mesh(dup_obj, recalc_normals=True, remove_loose=True)
+        if _model_split_grid_piece_is_empty(dup_obj, settings, point_piece=False):
+            _model_split_grid_remove_object(dup_obj)
+            return None
+        return dup_obj
+    except Exception:
+        _model_split_grid_remove_object(dup_obj)
+        raise
+
+
+def _model_split_grid_copy_vertex_groups(src_obj, dst_obj, index_map):
+    if src_obj is None or dst_obj is None or not index_map:
+        return
+    try:
+        while dst_obj.vertex_groups:
+            dst_obj.vertex_groups.remove(dst_obj.vertex_groups[0])
+    except Exception:
+        pass
+    for src_group in getattr(src_obj, "vertex_groups", []) or []:
+        try:
+            dst_group = dst_obj.vertex_groups.new(name=src_group.name)
+        except Exception:
+            continue
+        for old_index, new_index in index_map.items():
+            try:
+                weight = src_group.weight(old_index)
+            except Exception:
+                continue
+            try:
+                dst_group.add([new_index], weight, "ADD")
+            except Exception:
+                pass
+
+
+def _model_split_grid_make_point_piece(src_obj, cutter, dest_collection, settings, piece_name, category_token):
+    source_mesh = getattr(src_obj, "data", None)
+    if source_mesh is None:
+        return None
+
+    verts = []
+    index_map = {}
+    source_matrix = src_obj.matrix_world.copy()
+    for vertex in source_mesh.vertices:
+        try:
+            world_point = source_matrix @ vertex.co
+        except Exception:
+            continue
+        if not _model_split_grid_point_inside_cutter(cutter, world_point):
+            continue
+        index_map[int(vertex.index)] = len(verts)
+        verts.append(tuple(vertex.co))
+
+    if not verts:
+        return None
+
+    edges = []
+    for edge in getattr(source_mesh, "edges", []) or []:
+        try:
+            v0, v1 = int(edge.vertices[0]), int(edge.vertices[1])
+        except Exception:
+            continue
+        if v0 in index_map and v1 in index_map:
+            edges.append((index_map[v0], index_map[v1]))
+
+    mesh = bpy.data.meshes.new(piece_name)
+    mesh.from_pydata(verts, edges, ())
+    try:
+        for material in getattr(source_mesh, "materials", []) or []:
+            mesh.materials.append(material)
+    except Exception:
+        pass
+    mesh.update()
+
+    dup_obj = src_obj.copy()
+    dup_obj.data = mesh
+    try:
+        dup_obj.parent = None
+    except Exception:
+        pass
+    try:
+        dup_obj.matrix_world = src_obj.matrix_world.copy()
+    except Exception:
+        pass
+    try:
+        for modifier in list(getattr(dup_obj, "modifiers", []) or []):
+            dup_obj.modifiers.remove(modifier)
+    except Exception:
+        pass
+    _clear_ie_source_path_tag(dup_obj)
+    _model_split_grid_prepare_piece_props(src_obj, dup_obj, category_token, piece_name)
+    _model_split_grid_copy_vertex_groups(src_obj, dup_obj, index_map)
+    _link_object_to_collection(dup_obj, dest_collection)
+
+    if _model_split_grid_piece_is_empty(dup_obj, settings, point_piece=True):
+        _model_split_grid_remove_object(dup_obj)
+        return None
+    return dup_obj
+
+
+def _model_split_grid_make_proxy_piece(src_obj, cutter, dest_collection, settings, piece_name, category_token):
+    try:
+        origin = src_obj.matrix_world.translation.copy()
+    except Exception:
+        return None
+
+    if not _model_split_grid_point_inside_cutter(cutter, origin):
+        return None
+
+    dup_obj = _duplicate_object_for_split(src_obj)
+    if dup_obj is None:
+        raise RuntimeError("Failed to duplicate proxy object")
+
+    try:
+        for modifier in list(getattr(dup_obj, "modifiers", []) or []):
+            dup_obj.modifiers.remove(modifier)
+    except Exception:
+        pass
+
+    _model_split_grid_prepare_piece_props(src_obj, dup_obj, category_token, piece_name)
+    _link_object_to_collection(dup_obj, dest_collection)
+    return dup_obj
+
+
+def _model_split_grid_resolve_source(context, settings):
+    source_obj = getattr(settings, "grid_source_object", None)
+    source_root = getattr(settings, "grid_source_root_collection", None)
+    if source_obj is not None:
+        if getattr(source_obj, "type", None) != "MESH":
+            raise RuntimeError("Source Object must be a mesh")
+        resolved_root = _find_p3d_root_collection_for_collection(context, source_root, require_p3d=False) if source_root is not None else None
+        if resolved_root is None:
+            resolved_root = _find_p3d_root_collection_for_object(context, source_obj)
+        return resolved_root, [source_obj]
+
+    if source_root is not None:
+        resolved_root = _find_p3d_root_collection_for_collection(context, source_root, require_p3d=False) or source_root
+        source_objects = [
+            obj for obj in _collect_collection_objects_recursive(resolved_root)
+            if getattr(obj, "type", None) == "MESH" and not _model_split_grid_is_cutter(obj)
+        ]
+        if not source_objects:
+            raise RuntimeError(f"Source Root Collection '{resolved_root.name}' contains no mesh objects")
+        return resolved_root, source_objects
+
+    selected_roots = _model_split_selected_p3d_root_collections(context)
+    if len(selected_roots) == 1:
+        root = selected_roots[0]
+        source_objects = [
+            obj for obj in _collect_collection_objects_recursive(root)
+            if getattr(obj, "type", None) == "MESH" and not _model_split_grid_is_cutter(obj)
+        ]
+        if source_objects:
+            return root, source_objects
+
+    active_obj = _model_split_grid_active_mesh_object(context)
+    if active_obj is not None and not _model_split_grid_is_cutter(active_obj):
+        return _find_p3d_root_collection_for_object(context, active_obj), [active_obj]
+
+    selected_meshes = [
+        obj for obj in getattr(context, "selected_objects", []) or []
+        if getattr(obj, "type", None) == "MESH" and not _model_split_grid_is_cutter(obj)
+    ]
+    if selected_meshes:
+        return _find_p3d_root_collection_for_object(context, selected_meshes[0]), selected_meshes
+
+    raise RuntimeError("Choose Source Object, Source Root Collection, an active mesh, or one selected .p3d root collection")
+
+
+def _model_split_grid_hide_sources(source_objects):
+    for obj in source_objects or ():
+        try:
+            obj.hide_set(True)
+        except Exception:
+            pass
+        try:
+            obj.hide_viewport = True
+        except Exception:
+            pass
+        try:
+            obj.hide_render = True
+        except Exception:
+            pass
+
+
+def _model_split_grid_hide_cutters(cutter_collection, cutters):
+    if cutter_collection is not None:
+        try:
+            cutter_collection.hide_viewport = True
+        except Exception:
+            pass
+    for cutter in cutters or ():
+        try:
+            cutter.hide_set(True)
+        except Exception:
+            pass
+        try:
+            cutter.hide_viewport = True
+        except Exception:
+            pass
+
+
+class CRAY_OT_ModelSplitGridCreateCutters(Operator):
+    bl_idname = "cray.model_split_grid_create_cutters"
+    bl_label = "Create Cutter Grid"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = context.scene.cray_model_split_settings
+        try:
+            size_x, size_y, size_z, count_x, count_y, count_z = _model_split_grid_config_values(settings)
+            origin = _model_split_grid_origin(context, settings)
+            cutter_collection = _model_split_grid_cutter_collection(context, settings, create=True)
+            if cutter_collection is None:
+                raise RuntimeError("Could not create cutter collection")
+
+            removed = _model_split_grid_delete_tagged_cutters(cutter_collection)
+            half_x = (count_x - 1) * 0.5
+            half_y = (count_y - 1) * 0.5
+            half_z = (count_z - 1) * 0.5
+            created = []
+            for ix in range(count_x):
+                for iy in range(count_y):
+                    for iz in range(count_z):
+                        grid_id = _model_split_grid_id(ix, iy, iz, count_z, count_x, count_y)
+                        obj_name = f"CUT_{grid_id}"
+                        mesh = _model_split_grid_create_cube_mesh(obj_name)
+                        obj = bpy.data.objects.new(obj_name, mesh)
+                        obj.location = (
+                            origin.x + (ix - half_x) * size_x,
+                            origin.y + (iy - half_y) * size_y,
+                            origin.z + (iz - half_z) * size_z,
+                        )
+                        obj.scale = (size_x, size_y, size_z)
+                        obj["nh_grid_cutter"] = True
+                        obj["nh_grid_id"] = grid_id
+                        obj["nh_grid_x"] = int(ix)
+                        obj["nh_grid_y"] = int(iy)
+                        obj["nh_grid_z"] = int(iz)
+                        obj["nh_grid_enabled"] = True
+                        try:
+                            obj.display_type = "WIRE"
+                        except Exception:
+                            pass
+                        try:
+                            obj.show_name = True
+                        except Exception:
+                            pass
+                        try:
+                            obj.color = (0.0, 0.85, 1.0, 0.35)
+                        except Exception:
+                            pass
+                        _link_object_to_collection(obj, cutter_collection)
+                        created.append(obj)
+
+            _ensure_collection_visible_in_view_layer(context, cutter_collection)
+            _deselect_all_in_view_layer(context)
+            for obj in created:
+                try:
+                    obj.select_set(True)
+                except Exception:
+                    pass
+            if created:
+                try:
+                    context.view_layer.objects.active = created[0]
+                except Exception:
+                    pass
+
+            self.report({"INFO"}, f"Created {len(created)} cutter cube(s), removed {removed} old tagged cutter(s)")
+            return {"FINISHED"}
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+
+class CRAY_OT_ModelSplitGridSelectCutters(Operator):
+    bl_idname = "cray.model_split_grid_select_cutters"
+    bl_label = "Select Cutter Grid"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = context.scene.cray_model_split_settings
+        cutter_collection = _model_split_grid_cutter_collection(context, settings, create=False)
+        if cutter_collection is None:
+            self.report({"ERROR"}, "Choose or create a Cutter Collection first")
+            return {"CANCELLED"}
+
+        cutters = [
+            obj for obj in _collect_collection_objects_recursive(cutter_collection)
+            if getattr(obj, "type", None) == "MESH" and _model_split_grid_is_cutter(obj)
+        ]
+        _ensure_collection_visible_in_view_layer(context, cutter_collection)
+        _deselect_all_in_view_layer(context)
+        for obj in cutters:
+            try:
+                obj.hide_set(False)
+            except Exception:
+                pass
+            try:
+                obj.hide_viewport = False
+            except Exception:
+                pass
+            try:
+                obj.select_set(True)
+            except Exception:
+                pass
+        if cutters:
+            try:
+                context.view_layer.objects.active = cutters[0]
+            except Exception:
+                pass
+        self.report({"INFO"}, f"Selected {len(cutters)} cutter cube(s)")
+        return {"FINISHED"}
+
+
+class CRAY_OT_ModelSplitGridClearCutters(Operator):
+    bl_idname = "cray.model_split_grid_clear_cutters"
+    bl_label = "Clear Cutter Grid"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = context.scene.cray_model_split_settings
+        cutter_collection = _model_split_grid_cutter_collection(context, settings, create=False)
+        if cutter_collection is None:
+            self.report({"ERROR"}, "Choose or create a Cutter Collection first")
+            return {"CANCELLED"}
+        removed = _model_split_grid_delete_tagged_cutters(cutter_collection)
+        self.report({"INFO"}, f"Removed {removed} tagged cutter cube(s)")
+        return {"FINISHED"}
+
+
+class CRAY_OT_ModelSplitGridSplitSource(Operator):
+    bl_idname = "cray.model_split_grid_split_source"
+    bl_label = "Split Source By Cutter Grid"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = context.scene.cray_model_split_settings
+        created_roots = []
+        created_objects = []
+        failures = []
+        skipped_empty = 0
+        error_count = 0
+
+        try:
+            source_root, source_objects = _model_split_grid_resolve_source(context, settings)
+            cutters = _model_split_grid_collect_cutters(context, settings)
+            if not cutters:
+                raise RuntimeError("No tagged cutter cubes found in Cutter Collection")
+            prefix = _model_split_grid_output_prefix(
+                settings,
+                _model_split_grid_source_display_name(context, settings),
+            )
+            output_container = _model_split_grid_output_container(context, source_root, prefix)
+            if output_container is None:
+                raise RuntimeError("Could not create output collection")
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        for cutter in cutters:
+            grid_id = _model_split_grid_cutter_id_from_object(cutter)
+            root_name = _model_split_grid_output_root_name(prefix, grid_id)
+            target_root = _model_split_grid_create_output_root(context, output_container, source_root, root_name)
+            if target_root is None:
+                error_count += 1
+                failures.append(f"{getattr(cutter, 'name', '<cutter>')} -> failed to create output root")
+                continue
+
+            cutter_created = []
+            for src_obj in source_objects:
+                if src_obj is None or getattr(src_obj, "type", None) != "MESH":
+                    continue
+                if _model_split_grid_is_cutter(src_obj):
+                    continue
+
+                try:
+                    if _model_split_grid_is_proxy_object(src_obj):
+                        category_token = "RESOLUTION"
+                        dest_leaf = _ensure_model_split_target_category_collection(target_root, category_token)
+                        if dest_leaf is None:
+                            raise RuntimeError("Could not create A3OB category collection")
+                        piece_name = f"{getattr(src_obj, 'name', 'Object')}__{grid_id}"
+                        piece = _model_split_grid_make_proxy_piece(
+                            src_obj,
+                            cutter,
+                            dest_leaf,
+                            settings,
+                            piece_name,
+                            category_token,
+                        )
+                        if piece is None:
+                            skipped_empty += 1
+                            continue
+                        cutter_created.append(piece)
+                        created_objects.append(piece)
+                        continue
+
+                    category_token = _model_split_grid_category_for_object(src_obj)
+                    if _model_split_grid_should_clip_as_points(src_obj, category_token):
+                        category_token = "POINT_CLOUDS"
+                    dest_leaf = _ensure_model_split_target_category_collection(target_root, category_token)
+                    if dest_leaf is None:
+                        raise RuntimeError("Could not create A3OB category collection")
+                    piece_name = f"{getattr(src_obj, 'name', 'Object')}__{grid_id}"
+                    if _model_split_grid_should_clip_as_points(src_obj, category_token):
+                        piece = _model_split_grid_make_point_piece(
+                            src_obj,
+                            cutter,
+                            dest_leaf,
+                            settings,
+                            piece_name,
+                            category_token,
+                        )
+                    else:
+                        piece = _model_split_grid_make_face_piece(
+                            context,
+                            src_obj,
+                            cutter,
+                            dest_leaf,
+                            settings,
+                            piece_name,
+                            category_token,
+                        )
+
+                    if piece is None:
+                        skipped_empty += 1
+                        continue
+                    cutter_created.append(piece)
+                    created_objects.append(piece)
+                except Exception as e:
+                    error_count += 1
+                    failures.append(
+                        f"{getattr(src_obj, 'name', '<source>')} / {getattr(cutter, 'name', '<cutter>')} -> {_fmt_exc(e)}"
+                    )
+
+            if cutter_created:
+                created_roots.append(target_root)
+            else:
+                _model_split_grid_remove_collection_tree(target_root)
+
+        if not created_roots:
+            _model_split_grid_remove_collection_tree(output_container)
+        else:
+            _ensure_collection_visible_in_view_layer(context, output_container)
+            _focus_created_split_objects(context, output_container, created_objects)
+
+        if created_roots and not bool(getattr(settings, "grid_keep_original", True)):
+            _model_split_grid_hide_sources(source_objects)
+
+        cutter_collection = _model_split_grid_cutter_collection(context, settings, create=False)
+        if bool(getattr(settings, "grid_hide_cutters_after_split", False)):
+            _model_split_grid_hide_cutters(cutter_collection, cutters)
+
+        planner_added = 0
+        if created_roots and bool(getattr(settings, "grid_add_result_to_export_planner", True)):
+            for root in created_roots:
+                try:
+                    added, _planner_path = _add_model_split_part_to_planner(context, root)
+                    if added:
+                        planner_added += 1
+                except Exception as e:
+                    error_count += 1
+                    failures.append(f"{getattr(root, 'name', '<root>')} -> planner add failed: {_fmt_exc(e)}")
+
+        if failures:
+            print("=== Model Split Grid Cutter Split: Failures ===")
+            for failure in failures:
+                print(failure)
+
+        msg = (
+            f"Grid split: cutters {len(cutters)}, .p3d parts {len(created_roots)}, "
+            f"mesh pieces {len(created_objects)}, skipped empty {skipped_empty}, errors {error_count}"
+        )
+        if planner_added:
+            msg += f", planner added {planner_added}"
+        if not created_objects:
+            self.report({"ERROR"}, msg + " (see System Console)")
+            return {"CANCELLED"}
+        if error_count:
+            self.report({"WARNING"}, msg + " (see System Console)")
+        else:
+            self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
 class CRAY_UL_ModelSplitMergeSources(UIList):
     bl_idname = "CRAY_UL_model_split_merge_sources"
 
@@ -26470,6 +27710,43 @@ class CRAY_PT_ModelSplitPanel(Panel):
 
         layout.separator()
 
+        grid_box = layout.box()
+        grid_box.label(text="Grid Cutter Split", icon="MOD_BOOLEAN")
+        grid_box.prop(st, "grid_source_object")
+        grid_box.prop(st, "grid_source_root_collection")
+        grid_box.prop(st, "grid_cutter_collection")
+        row = grid_box.row(align=True)
+        row.prop(st, "grid_cell_size_x")
+        row.prop(st, "grid_cell_size_y")
+        row.prop(st, "grid_cell_size_z")
+        row = grid_box.row(align=True)
+        row.prop(st, "grid_count_x")
+        row.prop(st, "grid_count_y")
+        row.prop(st, "grid_count_z")
+        grid_box.prop(st, "grid_origin_mode")
+        if st.grid_origin_mode == "MANUAL":
+            row = grid_box.row(align=True)
+            row.prop(st, "grid_manual_origin_x")
+            row.prop(st, "grid_manual_origin_y")
+            row.prop(st, "grid_manual_origin_z")
+        grid_box.prop(st, "grid_output_prefix")
+        grid_box.prop(st, "grid_use_visible_cutters_only")
+        grid_box.prop(st, "grid_keep_original")
+        grid_box.prop(st, "grid_hide_cutters_after_split")
+        grid_box.prop(st, "grid_skip_empty_pieces")
+        row = grid_box.row(align=True)
+        row.prop(st, "grid_min_vertices")
+        row.prop(st, "grid_min_faces")
+        grid_box.prop(st, "grid_add_result_to_export_planner")
+        row = grid_box.row(align=True)
+        row.operator("cray.model_split_grid_create_cutters", text="Create Cutter Grid", icon="MESH_CUBE")
+        row.operator("cray.model_split_grid_select_cutters", text="Select Cutter Grid", icon="RESTRICT_SELECT_OFF")
+        row = grid_box.row(align=True)
+        row.operator("cray.model_split_grid_clear_cutters", text="Clear Cutter Grid", icon="TRASH")
+        row.operator("cray.model_split_grid_split_source", text="Split Source By Cutter Grid", icon="MOD_BOOLEAN")
+
+        layout.separator()
+
         merge_box = layout.box()
         merge_box.label(text="Merge Collections", icon="OUTLINER_COLLECTION")
         merge_box.prop(st, "named_target_collection", text="Target Model")
@@ -26786,6 +28063,10 @@ classes = (
     CRAY_OT_IE_RefreshFiles,
     CRAY_OT_IE_ImportBatch,
     CRAY_OT_ModelSplitTransferSelectedToTargetCategory,
+    CRAY_OT_ModelSplitGridCreateCutters,
+    CRAY_OT_ModelSplitGridSelectCutters,
+    CRAY_OT_ModelSplitGridClearCutters,
+    CRAY_OT_ModelSplitGridSplitSource,
     CRAY_UL_ModelSplitMergeSources,
     CRAY_OT_ModelSplitMergeAddSource,
     CRAY_OT_ModelSplitMergeRemoveSource,

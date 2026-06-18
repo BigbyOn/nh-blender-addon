@@ -2,6 +2,48 @@
 
 Все заметные изменения проекта фиксируются в этом файле.
 
+## [0.5.3.12] - 2026-06-19
+
+### Добавлено
+- В `Model Split / Merge` добавлен workflow `Grid Cutter Split`: генерация сетки cutter-cube-ов с настраиваемыми размерами ячеек, количеством по осям, режимом origin и префиксом выходных `.p3d`-частей.
+- Добавлены команды `Create Cutter Grid`, `Select Cutter Grid`, `Clear Cutter Grid` и `Split Source By Cutter Grid` для подготовки сетки, выбора cutter-объектов, очистки tagged cutter-ов и разрезания source object или `.p3d` root-коллекции.
+- Добавлены настройки grid-split: выбор source object/root collection, cutter collection, фильтр только видимых cutter-ов, сохранение оригинала, скрытие cutter-ов после split, пропуск пустых частей по порогам vertices/faces и автодобавление результата в `Import/Export planner`.
+
+### Изменено
+- Версия аддона поднята до `0.5.3.12`.
+- Результат `Grid Cutter Split` создается как набор отдельных `.p3d` root-коллекций внутри output container, с сохранением A3OB category layout для Resolution/Point Clouds/Geometry и поддержкой mesh, point-cloud и proxy pieces.
+- Настройки `Grid Cutter Split` добавлены в persisted UI state, чтобы размеры сетки, counts, origin, output prefix и поведение split сохранялись между сессиями.
+
+### Исправлено
+- `Grid Cutter Split` удаляет пустые result roots, если cutter не создал валидных pieces, и пишет подробности failures в System Console вместо молчаливого создания пустых `.p3d`-частей.
+
+## [0.5.3.11] - 2026-06-17
+
+### Добавлено
+- В `Texture Replace -> Export Missing Textures from Sources` добавлен список `Source Texture Roots`: можно держать несколько DDS-корней, добавлять и удалять их прямо из UI и сканировать все источники за один запуск.
+- Добавлен modal-export недостающих текстур с прогрессом, отменой, workspace-status и отчетом последнего запуска.
+- Добавлена библиотека `NH Objects - Custom`: поиск `.p3d` по имени через `Custom Search Root`, добавление/удаление ассетов по имени и очистка custom-кеша.
+- Добавлена команда `Clean Source Cache Files` для удаления старых `_NH_AssetLibrary`-кешей и preview-папок из исходных `NH_Objects`-директорий.
+- Добавлена опция `Duplicate to all Resolution LODs` при конвертации размещенных ассетов в A3OB proxies.
+- Добавлен режим `Delete All Plain Axes + Save Z`, который удаляет Plain Axis helper-ы, возвращает модели по X/Y и сохраняет текущую world Z-высоту.
+- В `Import/Export planner` добавлена кнопка `Refresh` для добавления текущих `.p3d` root-коллекций сцены, удаления отсутствующих после merge и перепривязки `Back to source` после rename.
+
+### Изменено
+- Версия аддона поднята до `0.5.3.11`.
+- `Model Split` переименован в `Model Split / Merge`; selector `Source` в `Merge Collections` показывает `.p3d` root-коллекции первыми, затем остальные коллекции по алфавиту.
+- Кнопки `Add` и `Remove` в `Import/Export planner` сделаны компактными icon-only.
+- `Convert Selected Assets To Proxies` переработан под явные поля `Proxy Source Object` и `Target Resolution / LOD`: target теперь должен быть A3OB LOD mesh, а созданные proxies получают корректные `proxy_path` / `proxy_index`, wire-display и имя `proxy: ...`.
+- Экспорт текстур теперь использует встроенный Python DDS backend по умолчанию, переиспользует уже существующие PNG/PAA, обновляет PNG-кеш после успешного PNG -> PAA и пишет подробные события по diffuse/NOHQ/SMDI/RVMAT.
+- Поиск texture candidates стал строже и устойчивее: учитываются A3OB material paths, image nodes, имена изображений и материалов, Blender numeric suffixes и варианты base-name; placeholder-материалы и некорректные Windows-пути отбрасываются.
+- README дополнен быстрым setup workflow, проверкой настройки, частыми проблемами и актуальными установочными требованиями для ZIP-архива.
+
+### Исправлено
+- Исправлен `Convert Selected Assets To Proxies`: теперь можно выбирать source отдельно от target, создавать настоящие A3OB proxy-объекты внутри нужного LOD и при необходимости дублировать их по всем Resolution LODs одного `.p3d` root.
+- Исправлен merge `Point clouds > Memory`: Memory-точки пересобираются в координатах target-модели с сохранением world-позиций и vertex groups, чтобы после merge/export они не уезжали в Object Builder.
+- Исправлены случаи, когда texture export мог принимать `P3D: no material`, `<no materials>`, пути из папки установки Blender или другие невалидные строки как реальные имена текстур.
+- Улучшена обработка отсутствующего `ImageToPAA`: PNG-результат сохраняется как доступный fallback, а предупреждение попадает в отчет без срыва всего экспорта.
+- Очистка Plain Axis теперь дополнительно ремонтирует `Memory LOD` constraints перед удалением helper-ов.
+
 ## [0.5.3.0] - 2026-05-31
 
 ### Добавлено
@@ -12,7 +54,6 @@
 - Добавлены кастомные иконки Asset Browser для импортированных `.p3d`: быстрые geometry-preview и опциональные textured rendered previews по уже готовому кешу текстур.
 - Добавлены кнопки `Build NH Libraries`, `Open NH Asset Browser`, `Rebuild Icons`, `Open NH Library Cache`, `Open Texture PNG Cache` и `Report`.
 - Добавлена панель `Menu Settings` для включения/скрытия основных блоков `NH Plugin` и просмотра текущих кастомных хоткеев.
-- В `Import/Export planner` добавлена кнопка `Refresh` для добавления текущих `.p3d` root-коллекций сцены, удаления отсутствующих после merge и перепривязки `Back to source` после rename.
 
 ### Изменено
 - Версия аддона поднята до `0.5.3.0`.
@@ -23,17 +64,12 @@
 - Регистрация хоткеев стала аккуратнее: старые привязки операторов очищаются перед добавлением новых, чтобы не копились дубли после перезагрузки аддона.
 - `Geometry Collider (exp)` теперь безопаснее выбирает target LOD и не использует source object как collider target.
 - Панели `Collider` и `Geometry LODs` разведены по названиям и могут скрываться отдельно через `Menu Settings`.
-- Панель `Model Split` переименована в `Model Split / Merge`.
-- Selector `Source` в `Merge Collections` теперь показывает `.p3d` root-коллекции первыми, затем остальные коллекции по алфавиту.
-- Кнопки `Add` и `Remove` в `Import/Export planner` сделаны компактными icon-only.
 
 ### Исправлено
 - Исправлены сценарии, где выбранный source object мог быть ошибочно переиспользован как target geometry object в experimental collider workflow.
 - Исправлена сборка proxy из размещенных asset objects: теперь можно создавать unparented proxies, если target object не выбран, и корректно выбирать collection для результата.
-- Исправлен `Convert Selected Assets To Proxies`: создаются настоящие A3OB proxy-объекты с `proxy_path` / `proxy_index`, wire-display и именем `proxy: ...`; `Target` теперь указывает A3OB LOD mesh (`Resolution 0` и т.п.), а объект для конвертации можно задать отдельным `Proxy Source Object` или выделением.
 - Исправлены потенциальные дубли/конфликты хоткеев после повторной регистрации аддона.
 - Исправлены случаи, когда Asset Browser не переключался на нужную NH-библиотеку после сборки.
-- Исправлен merge `Point clouds > Memory`: Memory-точки теперь пересобираются в координатах target-модели с сохранением world-позиций и vertex groups, чтобы после merge/export они не уезжали в Object Builder.
 
 ### Проверено
 - `python -m py_compile NH_Blender.py NH_Blender\__init__.py` проходит без ошибок.
