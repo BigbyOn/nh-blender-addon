@@ -51,11 +51,11 @@ function Resolve-AddonSource {
         $packageDir = Join-Path $RepoRoot "NH_Blender"
         $singleFile = Join-Path $RepoRoot "NH_Blender.py"
 
-        if (Test-Path -LiteralPath (Join-Path $packageDir "__init__.py")) {
-            $candidatePaths += $packageDir
-        }
         if (Test-Path -LiteralPath $singleFile) {
             $candidatePaths += $singleFile
+        }
+        if (Test-Path -LiteralPath (Join-Path $packageDir "__init__.py")) {
+            $candidatePaths += $packageDir
         }
     }
 
@@ -97,7 +97,7 @@ function Resolve-AddonSource {
         }
     }
 
-    throw "Addon source not found. Expected NH_Blender\__init__.py or NH_Blender.py under $RepoRoot"
+    throw "Addon source not found. Expected NH_Blender.py under $RepoRoot"
 }
 
 function Remove-AddonCaches {
@@ -120,6 +120,26 @@ function Remove-AddonCaches {
             Where-Object { $_.Extension -eq ".pyc" } |
             Remove-Item -Force -ErrorAction SilentlyContinue
     }
+}
+
+function Resolve-BundledToolsSource {
+    param(
+        [string]$RepoRoot
+    )
+
+    $candidates = @(
+        (Join-Path $RepoRoot "tools"),
+        (Join-Path $RepoRoot "NH_Blender\tools")
+    )
+
+    foreach ($candidate in $candidates) {
+        $pythonConverter = Join-Path $candidate "xray_tex_converter\dds_python.py"
+        if (Test-Path -LiteralPath $pythonConverter -PathType Leaf) {
+            return $candidate
+        }
+    }
+
+    throw "Bundled tools folder not found. Expected NH_Blender\tools or tools under $RepoRoot"
 }
 
 function Get-PathContentHash {
@@ -157,10 +177,12 @@ function Get-PathContentHash {
 }
 
 $addonSource = Resolve-AddonSource -RequestedPath $SourcePath -RepoRoot $PSScriptRoot
+$toolsSource = Resolve-BundledToolsSource -RepoRoot $PSScriptRoot
 $versionPath = Resolve-BlenderVersionPath -RequestedVersion $BlenderVersion
 $addonsDir = Join-Path $versionPath "scripts\addons"
 $targetFile = Join-Path $addonsDir ("{0}.py" -f $addonSource.Name)
 $targetDir = Join-Path $addonsDir $addonSource.Name
+$toolsTargetDir = Join-Path $addonsDir "_nh_blender_tools"
 $runningBlender = @(Get-Process -Name "blender" -ErrorAction SilentlyContinue)
 
 New-Item -ItemType Directory -Force -Path $addonsDir | Out-Null
@@ -181,8 +203,17 @@ else {
     if (Test-Path -LiteralPath $targetDir) {
         Remove-Item -LiteralPath $targetDir -Recurse -Force
     }
+    if (Test-Path -LiteralPath $toolsTargetDir) {
+        Remove-Item -LiteralPath $toolsTargetDir -Recurse -Force
+    }
 
     Copy-Item -LiteralPath $addonSource.SourcePath -Destination $targetFile -Force
+    Copy-Item -LiteralPath $toolsSource -Destination $toolsTargetDir -Recurse -Force
+    Get-ChildItem -LiteralPath $toolsTargetDir -Recurse -Force -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -LiteralPath $toolsTargetDir -Recurse -Force -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -in @(".pyc", ".pyo") } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
     Remove-AddonCaches -AddonsDir $addonsDir -AddonName $addonSource.Name
     $deployedTarget = $targetFile
 }
@@ -198,6 +229,7 @@ if (Test-Path -LiteralPath $rootPycacheDir) {
 Write-Host "Deployed addon to: $deployedTarget"
 Write-Host "Addon mode: $($addonSource.Mode)"
 Write-Host "Addon entry: $($addonSource.EntryFile)"
+Write-Host "Bundled tools: $toolsSource"
 Write-Host "Blender version path: $versionPath"
 Write-Host "Source hash: $sourceHash"
 Write-Host "Target hash: $targetHash"

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Daryl and Enisam",
-    "version": (0, 5, 3, 12),
+    "version": (0, 5, 4, 5),
     "blender": (5, 1, 1),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "All-in-one Blender toolkit for porting and preparing DayZ/Arma assets: fixes, textures, colliders, proxies, snap points, and P3D workflow helpers.",    
@@ -17,6 +17,7 @@ from bpy.app.handlers import persistent
 from bpy.types import Operator, Panel, PropertyGroup, UIList, OperatorFileListElement, Menu
 from bpy.props import PointerProperty, StringProperty, FloatProperty, IntProperty, BoolProperty, EnumProperty, CollectionProperty
 from mathutils import Vector, Matrix
+from mathutils.geometry import tessellate_polygon
 import math
 import random
 import os
@@ -36,7 +37,6 @@ import tempfile
 #  Global config storage
 # ------------------------------------------------------------------------
 
-CONFIG_PATH = ""
 CONFIG_SURFACES = {}
 CONFIG_CLUTTER = {}
 _PROXY_MESH_NAME = "DayZ_ClutterProxyMesh"
@@ -67,7 +67,7 @@ _LINKED_PICK_CONFLICT_KEYMAPS = {
     "3D View Generic",
 }
 _PERSISTED_UI_STATE_FILENAME = "nh_blender_ui_state.json"
-_PERSISTED_UI_STATE_VERSION = 3
+_PERSISTED_UI_STATE_VERSION = 4
 _PERSISTED_UI_STATE_TIMER_INTERVAL = 1.0
 _PERSISTED_UI_STATE_CACHE = None
 _PERSISTED_UI_FORCE_RESTORE_SETTINGS = {"cray_texreplace_settings"}
@@ -83,7 +83,13 @@ _PERSISTED_UI_LEGACY_DEFAULTS_TO_IGNORE = {
         "convert_png_to_paa": {False},
         "output_diffuse_suffix": {"_co"},
         "dds_backend": {"AUTO", "BUNDLED_EXE", "BUNDLED_NODE", "BLENDER", "EXTERNAL"},
+        "folder": {r"P:\NH_ObjectTextures", "P:\\NH_ObjectTextures\\"},
+        "target_textures_folder": {r"P:\NH_ObjectTextures", "P:\\NH_ObjectTextures\\"},
+        "texture_cache_source_folder": {r"P:\NH_ObjectTextures", "P:\\NH_ObjectTextures\\"},
     },
+}
+_PERSISTED_UI_DYNAMIC_ENUM_DEFAULTS = {
+    ("cray_settings", "selected_surface"): "NONE",
 }
 _TRASH_TINY_ISLAND_MAX_VERTS = 5
 _TRASH_TINY_ISLAND_MAX_FACES = 5
@@ -167,6 +173,7 @@ _PERSISTED_UI_SETTINGS = {
         "offset_z",
         "floor_contact",
         "minimum_size",
+        "normal_minimum_size",
         "convex_detail",
         "convex_max_triangles",
         "cylinder_segments",
@@ -229,6 +236,10 @@ _PERSISTED_UI_SETTINGS = {
     ),
     "cray_asset_proxy_settings": (
         "duplicate_to_all_resolution_lods",
+        "proxy_duplicate_resolution",
+        "proxy_duplicate_geometries",
+        "proxy_duplicate_roadway",
+        "proxy_duplicate_point_clouds",
     ),
     "cray_asset_library_settings": (
         "folder",
@@ -242,6 +253,16 @@ _PERSISTED_UI_SETTINGS = {
         "render_textured_previews",
     ),
     "cray_ui_panel_settings": (
+        "order_collider",
+        "order_geometry_lods",
+        "order_asset_library",
+        "order_snap_points",
+        "order_import_export",
+        "order_fixes",
+        "order_model_split",
+        "order_texture_replace",
+        "order_cache_manager",
+        "order_object_builder",
         "show_snap_points",
         "show_asset_library",
         "show_fixes",
@@ -330,7 +351,7 @@ def _collect_persisted_ui_state(scene):
     return state
 
 
-def _property_has_default_value(settings, prop_name: str) -> bool:
+def _property_has_default_value(settings, prop_name: str, settings_name: str = "") -> bool:
     if settings is None or not prop_name:
         return True
 
@@ -345,6 +366,10 @@ def _property_has_default_value(settings, prop_name: str) -> bool:
         current = getattr(settings, prop_name)
     except Exception:
         return False
+
+    dynamic_enum_default = _PERSISTED_UI_DYNAMIC_ENUM_DEFAULTS.get((settings_name, prop_name))
+    if dynamic_enum_default is not None:
+        return current == dynamic_enum_default
 
     try:
         default = prop.default
@@ -381,7 +406,7 @@ def _apply_persisted_ui_state_to_scene(scene, only_if_default: bool = True):
         for prop_name in prop_names:
             if prop_name not in saved_block:
                 continue
-            if only_if_default and not force_restore and not _property_has_default_value(settings, prop_name):
+            if only_if_default and not force_restore and not _property_has_default_value(settings, prop_name, settings_name):
                 continue
             saved_value = saved_block[prop_name]
             if state_version < _PERSISTED_UI_STATE_VERSION:
@@ -469,6 +494,7 @@ def _save_texreplace_settings_now(context):
 def _restore_persisted_ui_state_on_load(_dummy):
     global _PERSISTED_UI_STATE_CACHE
     _apply_persisted_ui_state_to_all_scenes(only_if_default=True)
+    _apply_ui_panel_class_order(_ui_panel_settings_from_context(bpy.context))
     _PERSISTED_UI_STATE_CACHE = _collect_persisted_ui_state(getattr(bpy.context, "scene", None))
     try:
         bpy.app.timers.register(_deferred_restore_persisted_ui_state, first_interval=0.2)
@@ -479,7 +505,9 @@ def _restore_persisted_ui_state_on_load(_dummy):
 def _deferred_restore_persisted_ui_state():
     global _PERSISTED_UI_STATE_CACHE
     _apply_persisted_ui_state_to_all_scenes(only_if_default=True)
+    _apply_ui_panel_class_order(_ui_panel_settings_from_context(bpy.context))
     _PERSISTED_UI_STATE_CACHE = _collect_persisted_ui_state(getattr(bpy.context, "scene", None))
+    _tag_ui_redraw(bpy.context)
     return None
 
 
@@ -606,6 +634,13 @@ def _remove_addon_keymap_items_for_operators(keymap, operator_ids):
             pass
 
 
+def _nh_keymap_operator_ids():
+    return {
+        operator_idname
+        for operator_idname, _action, _default_shortcut, _status_key in _CUSTOM_KEYBIND_DEFINITIONS
+    } | {"cray.build_collider"}
+
+
 def _register_collider_keymaps():
     global _PLAIN_AXIS_HOTKEY_REGISTERED
     _unregister_collider_keymaps()
@@ -623,15 +658,7 @@ def _register_collider_keymaps():
     if keymap is None:
         keymap = addon_keyconfig.keymaps.new(name=_MESH_KEYMAP_NAME, space_type="EMPTY", region_type="WINDOW")
 
-    _remove_addon_keymap_items_for_operators(
-        keymap,
-        {
-            "cray.copy_selected_verts_to_geometry",
-            "cray.select_isolated_vertices",
-            "cray.build_collider",
-            "cray.create_plain_axis_pivot",
-        },
-    )
+    _remove_addon_keymap_items_for_operators(keymap, _nh_keymap_operator_ids())
 
     _register_addon_keymap_item(
         keymap,
@@ -651,17 +678,29 @@ def _register_collider_keymaps():
     )
     _register_addon_keymap_item(
         keymap,
-        "cray.build_collider",
+        "cray.generate_convex_hull_collider_exp",
         event_type="BUTTON4MOUSE",
         value="PRESS",
-        properties={"build_mode": "SELECTION_HULL"},
     )
     _register_addon_keymap_item(
         keymap,
-        "cray.build_collider",
+        "cray.generate_box_collider_exp",
         event_type="BUTTON5MOUSE",
         value="PRESS",
-        properties={"build_mode": "SELECTION_BOX"},
+    )
+    _register_addon_keymap_item(
+        keymap,
+        "cray.delete_last_collider_exp",
+        event_type="BUTTON4MOUSE",
+        value="PRESS",
+        ctrl=True,
+    )
+    _register_addon_keymap_item(
+        keymap,
+        "cray.select_connected_shell_from_selection_exp",
+        event_type="BUTTON5MOUSE",
+        value="PRESS",
+        ctrl=True,
     )
 
     if _mesh_shortcut_is_free(window_manager, event_type="P", value="PRESS", ctrl=True, shift=True):
@@ -687,6 +726,98 @@ def _unregister_collider_keymaps():
         except Exception:
             pass
     _PLAIN_AXIS_HOTKEY_REGISTERED = False
+
+
+def _find_nh_keymap_item(operator_idname):
+    window_manager = getattr(bpy.context, "window_manager", None)
+    if window_manager is None or not operator_idname:
+        return None
+
+    fallback = None
+    for keyconfig in _iter_unique_keyconfigs(window_manager):
+        keymap = keyconfig.keymaps.get(_MESH_KEYMAP_NAME)
+        if keymap is None:
+            continue
+        for kmi in keymap.keymap_items:
+            if getattr(kmi, "idname", "") != operator_idname:
+                continue
+            if getattr(kmi, "active", True):
+                return kmi
+            if fallback is None:
+                fallback = kmi
+    return fallback
+
+
+def _remove_nh_keymap_user_overrides():
+    window_manager = getattr(bpy.context, "window_manager", None)
+    keyconfigs = getattr(window_manager, "keyconfigs", None) if window_manager is not None else None
+    user_keyconfig = getattr(keyconfigs, "user", None) if keyconfigs is not None else None
+    if user_keyconfig is None:
+        return 0
+
+    removed = 0
+    operator_ids = _nh_keymap_operator_ids()
+    for keymap_name in (_MESH_KEYMAP_NAME,):
+        keymap = user_keyconfig.keymaps.get(keymap_name)
+        if keymap is None:
+            continue
+        for kmi in list(keymap.keymap_items):
+            if getattr(kmi, "idname", "") not in operator_ids:
+                continue
+            try:
+                keymap.keymap_items.remove(kmi)
+                removed += 1
+            except Exception:
+                pass
+    return removed
+
+
+def _keymap_event_type_label(event_type):
+    labels = {
+        "BUTTON4MOUSE": "Mouse4",
+        "BUTTON5MOUSE": "Mouse5",
+        "LEFTMOUSE": "LMB",
+        "MIDDLEMOUSE": "MMB",
+        "RIGHTMOUSE": "RMB",
+        "WHEELUPMOUSE": "Wheel Up",
+        "WHEELDOWNMOUSE": "Wheel Down",
+        "RET": "Enter",
+        "ESC": "Esc",
+        "SPACE": "Space",
+    }
+    return labels.get(str(event_type), str(event_type).replace("_", " ").title())
+
+
+def _keymap_item_shortcut_label(kmi, default_shortcut=""):
+    if kmi is None:
+        return default_shortcut or "Unassigned"
+
+    try:
+        text = kmi.to_string(compact=True)
+        if text:
+            return text
+    except Exception:
+        pass
+
+    parts = []
+    if bool(getattr(kmi, "any", False)):
+        parts.append("Any")
+    else:
+        if bool(getattr(kmi, "ctrl", False)):
+            parts.append("Ctrl")
+        if bool(getattr(kmi, "shift", False)):
+            parts.append("Shift")
+        if bool(getattr(kmi, "alt", False)):
+            parts.append("Alt")
+        if bool(getattr(kmi, "oskey", False)):
+            parts.append("Cmd")
+
+    key_modifier = getattr(kmi, "key_modifier", "NONE")
+    if key_modifier not in {"NONE", "", None}:
+        parts.append(_keymap_event_type_label(key_modifier))
+
+    parts.append(_keymap_event_type_label(getattr(kmi, "type", "")))
+    return "+".join(part for part in parts if part) or default_shortcut or "Unassigned"
 
 # ------------------------------------------------------------------------
 #  Brace helpers
@@ -738,7 +869,7 @@ def _iter_inner_classes(block: str):
 # ------------------------------------------------------------------------
 
 def parse_dayz_config(path: str):
-    global CONFIG_PATH, CONFIG_SURFACES, CONFIG_CLUTTER
+    global CONFIG_SURFACES, CONFIG_CLUTTER
 
     if not os.path.isfile(path):
         raise RuntimeError(f"Config file not found: {path}")
@@ -789,7 +920,6 @@ def parse_dayz_config(path: str):
             probs_f = [float(p) for p in probs]
             surfaces[s_name] = {"names": names, "probs": probs_f}
 
-    CONFIG_PATH = path
     CONFIG_SURFACES = surfaces
     CONFIG_CLUTTER = clutter
 
@@ -1134,11 +1264,11 @@ def _clear_generated_scatter_proxies(parent_obj) -> int:
 # ------------------------------------------------------------------------
 
 def get_surface_enum_items(self, context):
-    items = [("NONE", "<no surface>", "Surface is not selected")]
+    items = [("NONE", "<no surface>", "Surface is not selected", 0)]
     if not CONFIG_SURFACES:
         return items
-    for name in sorted(CONFIG_SURFACES.keys()):
-        items.append((name, name, "Surface from CfgSurfaceCharacters"))
+    for index, name in enumerate(sorted(CONFIG_SURFACES.keys()), start=1):
+        items.append((name, name, "Surface from CfgSurfaceCharacters", index))
     return items
 
 
@@ -1175,7 +1305,7 @@ class CRAY_PG_Settings(PropertyGroup):
     vertex_group: StringProperty(name="Vertex Group", default="")
     target_collection: PointerProperty(name="Target Collection", type=bpy.types.Collection)
     config_path: StringProperty(name="Config .cpp", default="", subtype="FILE_PATH")
-    selected_surface: EnumProperty(name="Surface", items=get_surface_enum_items)
+    selected_surface: EnumProperty(name="Surface", items=get_surface_enum_items, default=0)
     grid_size: FloatProperty(name="Grid Size", default=1.0, min=0.01)
     density_scale: FloatProperty(name="Density Scale", default=1.0, min=0.01, soft_max=8.0)
     slope_falloff: FloatProperty(
@@ -1471,8 +1601,8 @@ class CRAY_PG_ModelSplitSettings(PropertyGroup):
         type=bpy.types.Collection,
     )
     grid_cutter_collection: PointerProperty(
-        name="Cutter Collection",
-        description="Collection containing tagged cube cutter objects",
+        name="Cut Lines Collection",
+        description="Collection containing editable grid cut guide lines",
         type=bpy.types.Collection,
     )
     grid_cell_size_x: FloatProperty(
@@ -1497,22 +1627,22 @@ class CRAY_PG_ModelSplitSettings(PropertyGroup):
         soft_min=0.001,
     )
     grid_count_x: IntProperty(
-        name="Count X",
-        description="Number of cutter cubes along X",
-        default=2,
+        name="Parts X",
+        description="Number of output parts along X",
+        default=3,
         min=1,
         max=999,
     )
     grid_count_y: IntProperty(
-        name="Count Y",
-        description="Number of cutter cubes along Y",
-        default=2,
+        name="Parts Y",
+        description="Number of output parts along Y",
+        default=3,
         min=1,
         max=999,
     )
     grid_count_z: IntProperty(
-        name="Count Z",
-        description="Number of cutter cubes along Z",
+        name="Legacy Count Z",
+        description="Legacy cutter-grid depth; line grid split uses X/Y parts",
         default=1,
         min=1,
         max=999,
@@ -1528,12 +1658,12 @@ class CRAY_PG_ModelSplitSettings(PropertyGroup):
     grid_manual_origin_z: FloatProperty(name="Manual Origin Z", default=0.0)
     grid_output_prefix: StringProperty(
         name="Output Name Prefix",
-        default="split",
-        description="Prefix for generated .p3d root collections",
+        default="",
+        description="Prefix for generated .p3d root collections; empty uses the source model name",
     )
     grid_use_visible_cutters_only: BoolProperty(
-        name="Use Visible Cutters Only",
-        description="Ignore hidden cutter cubes during split",
+        name="Use Visible Guides Only",
+        description="Ignore hidden guide lines during split",
         default=True,
     )
     grid_keep_original: BoolProperty(
@@ -1542,8 +1672,8 @@ class CRAY_PG_ModelSplitSettings(PropertyGroup):
         default=True,
     )
     grid_hide_cutters_after_split: BoolProperty(
-        name="Hide Cutters After Split",
-        description="Hide the cutter collection after splitting",
+        name="Hide Guides After Split",
+        description="Hide the guide line collection after splitting",
         default=False,
     )
     grid_skip_empty_pieces: BoolProperty(
@@ -1629,10 +1759,12 @@ _FIRE_GEOMETRY_MATERIAL_ENUM_CACHE = [
 ]
 _MATERIAL_ADD_NEW = "__ADD_NEW__"
 _COLLIDER_MATERIAL_SELECTION_SYNCING = False
+_COLLIDER_OBJECT_TARGET_SYNCING = False
+_FAKE_TERRAIN_TARGET_SYNCING = False
+_FAKE_TERRAIN_TARGET_NONE = "__NONE__"
 _COLLIDER_LOD_SYNCING_FROM_OBJECT = False
 _COLLIDER_LOD_SYNCING_FROM_OBJECT_EXP = False
 _GEOMETRY_LOD_TOKEN = "6"
-_GEOMETRY_LOD_DEFAULT_TOTAL_MASS = 1000.0
 _MODEL_SPLIT_TARGET_CATEGORY_SPECS = {
     "RESOLUTION": {
         "collection": _VISUALS_COLLECTION_NAME,
@@ -1659,7 +1791,6 @@ _MODEL_SPLIT_TARGET_CATEGORY_SPECS = {
         "lod": _ROADWAY_LOD_TOKEN,
     },
 }
-_MODEL_SPLIT_VISUAL_LODS = {"0", "1", "2", "3", "18"}
 _MODEL_SPLIT_GEOMETRY_LODS = {
     "6", "7", "8", "14", "15", "16", "17", "19", "20", "21", "22", "23", "24", "30"
 }
@@ -1667,47 +1798,62 @@ _MODEL_SPLIT_POINT_CLOUD_LODS = {"9", "10", "13"}
 _MODEL_SPLIT_ROADWAY_LODS = {"11"}
 
 
-def _material_enum_items_for_object(obj, *, none_value: str, missing_object_desc: str, missing_material_desc: str, slot_desc_prefix: str):
+def _material_enum_items_for_objects(objects, *, none_value: str, missing_object_desc: str, missing_material_desc: str, slot_desc_prefix: str):
     items = []
+    objects = [
+        obj for obj in objects or []
+        if obj is not None and getattr(obj, "type", None) == "MESH"
+    ]
 
-    if obj is None or obj.type != "MESH":
+    if not objects:
         return [(none_value, missing_object_desc, missing_object_desc)]
 
     items = [(_MATERIAL_ADD_NEW, "Add New", f"Create and assign a new {slot_desc_prefix.lower()}")]
     material_count = 0
 
     seen = set()
-    for slot_idx, slot in enumerate(obj.material_slots, start=1):
-        mat = slot.material
-        if mat is None:
-            continue
+    for obj in objects:
+        for slot_idx, slot in enumerate(obj.material_slots, start=1):
+            mat = slot.material
+            if mat is None:
+                continue
 
-        key = mat.name.lower()
-        if key in seen:
-            continue
-        seen.add(key)
+            key = mat.name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
 
-        image_names = []
-        if mat.use_nodes and mat.node_tree:
-            for node in mat.node_tree.nodes:
-                if node.type == "TEX_IMAGE" and getattr(node, "image", None):
-                    image_names.append(node.image.name)
+            image_names = []
+            if mat.use_nodes and mat.node_tree:
+                for node in mat.node_tree.nodes:
+                    if node.type == "TEX_IMAGE" and getattr(node, "image", None):
+                        image_names.append(node.image.name)
 
-        label = _repair_mojibake_text(mat.name)
-        desc = f"{slot_desc_prefix} from slot {slot_idx}"
-        if image_names:
-            uniq_images = sorted(set((_repair_mojibake_text(name) for name in image_names)), key=lambda x: x.lower())
-            desc = f"{desc} | Images: {', '.join(uniq_images[:3])}"
-            if len(uniq_images) > 3:
-                desc += f" (+{len(uniq_images) - 3} more)"
+            label = _repair_mojibake_text(mat.name)
+            desc = f"{slot_desc_prefix} from {obj.name} slot {slot_idx}"
+            if image_names:
+                uniq_images = sorted(set((_repair_mojibake_text(name) for name in image_names)), key=lambda x: x.lower())
+                desc = f"{desc} | Images: {', '.join(uniq_images[:3])}"
+                if len(uniq_images) > 3:
+                    desc += f" (+{len(uniq_images) - 3} more)"
 
-        items.append((mat.name, label, desc))
-        material_count += 1
+            items.append((mat.name, label, desc))
+            material_count += 1
 
     if material_count == 0:
         items.append((none_value, "<no materials>", missing_material_desc))
 
     return items
+
+
+def _material_enum_items_for_object(obj, *, none_value: str, missing_object_desc: str, missing_material_desc: str, slot_desc_prefix: str):
+    return _material_enum_items_for_objects(
+        [obj] if obj is not None else [],
+        none_value=none_value,
+        missing_object_desc=missing_object_desc,
+        missing_material_desc=missing_material_desc,
+        slot_desc_prefix=slot_desc_prefix,
+    )
 
 
 def get_roadway_material_enum_items(self, context):
@@ -1732,8 +1878,11 @@ def get_fire_geometry_material_enum_items(self, context):
     del self
 
     obj = _resolve_fire_geometry_object_for_material(context)
-    items = _material_enum_items_for_object(
-        obj,
+    objects = _collider_material_selection_objects(context, "fire_geometry_object", obj) if obj is not None else []
+    if not objects and obj is not None:
+        objects = [obj]
+    items = _material_enum_items_for_objects(
+        objects,
         none_value=_FIRE_GEOMETRY_MATERIAL_NONE,
         missing_object_desc="<no fire geometry object>",
         missing_material_desc="Selected Fire Geometry object has no assigned materials",
@@ -1820,14 +1969,16 @@ def _assign_material_to_target_selection(obj, mat) -> bool:
     return assigned
 
 
-def _selected_material_assignment_objects(context, object_attr: str):
+def _material_assignment_object_predicate(object_attr: str):
     if object_attr == "fire_geometry_object":
-        predicate = lambda obj: _poll_fire_geometry_object(None, obj)
-    elif object_attr == "roadway_object":
-        predicate = lambda obj: _poll_roadway_object(None, obj)
-    else:
-        predicate = lambda obj: obj is not None and getattr(obj, "type", None) == "MESH"
+        return lambda obj: _poll_fire_geometry_object(None, obj)
+    if object_attr == "roadway_object":
+        return lambda obj: _poll_roadway_object(None, obj)
+    return lambda obj: obj is not None and getattr(obj, "type", None) == "MESH"
 
+
+def _selected_material_assignment_objects(context, object_attr: str):
+    predicate = _material_assignment_object_predicate(object_attr)
     objects = []
     seen = set()
     for obj in getattr(context, "selected_objects", []):
@@ -1841,6 +1992,34 @@ def _selected_material_assignment_objects(context, object_attr: str):
             continue
         seen.add(ptr)
         objects.append(obj)
+    return objects
+
+
+def _collider_material_selection_objects(context, object_attr: str, target_obj):
+    predicate = _material_assignment_object_predicate(object_attr)
+    objects = []
+    seen = set()
+
+    def add(obj):
+        if obj is None or not predicate(obj):
+            return
+        try:
+            ptr = obj.as_pointer()
+        except Exception:
+            ptr = id(obj)
+        if ptr in seen:
+            return
+        seen.add(ptr)
+        objects.append(obj)
+
+    for obj in _selected_material_assignment_objects(context, object_attr):
+        add(obj)
+    add(target_obj)
+
+    for col in getattr(target_obj, "users_collection", []) or []:
+        for obj in _collect_collection_objects_recursive(col):
+            add(obj)
+
     return objects
 
 
@@ -1944,18 +2123,27 @@ def _resolve_fire_geometry_object_for_material(context):
     if cs is None:
         return None
 
-    candidates = (
+    candidates = []
+
+    active = getattr(getattr(context, "view_layer", None), "objects", None) if context is not None else None
+    active = getattr(active, "active", None) if active is not None else None
+    for obj in (active,):
+        if obj is not None and obj not in candidates:
+            candidates.append(obj)
+    for obj in getattr(context, "selected_objects", []) or []:
+        if obj is not None and obj not in candidates:
+            candidates.append(obj)
+    for obj in (
         getattr(cs, "fire_geometry_object", None),
         getattr(cs, "geometry_object", None),
-    )
+    ):
+        if obj is not None and obj not in candidates:
+            candidates.append(obj)
+
     for obj in candidates:
         if obj is None or getattr(obj, "type", None) != "MESH":
             continue
         if _collider_lod_token_from_object(obj, allow_name_fallback=True) == _FIRE_GEOMETRY_LOD_TOKEN:
-            try:
-                cs.fire_geometry_object = obj
-            except Exception:
-                pass
             return obj
 
     return None
@@ -1992,6 +2180,9 @@ def _active_or_selected_mesh_object(context):
 
 
 def _on_collider_geometry_object_changed(self, context):
+    global _COLLIDER_OBJECT_TARGET_SYNCING
+    if _COLLIDER_OBJECT_TARGET_SYNCING:
+        return
     if context is None:
         return
 
@@ -2001,6 +2192,7 @@ def _on_collider_geometry_object_changed(self, context):
         return
 
     try:
+        _ensure_object_selectable_in_view_layer(context, target_obj)
         if str(getattr(self, "target_lod", "") or "") != lod_token:
             global _COLLIDER_LOD_SYNCING_FROM_OBJECT
             _COLLIDER_LOD_SYNCING_FROM_OBJECT = True
@@ -2012,10 +2204,68 @@ def _on_collider_geometry_object_changed(self, context):
             _apply_collider_visual_style(target_obj)
             _enable_collider_object_color_preview(context)
         if lod_token == _FIRE_GEOMETRY_LOD_TOKEN:
-            self.fire_geometry_object = target_obj
+            _COLLIDER_OBJECT_TARGET_SYNCING = True
+            try:
+                self.fire_geometry_object = target_obj
+            finally:
+                _COLLIDER_OBJECT_TARGET_SYNCING = False
             _sync_fire_geometry_material_selection(context)
     except Exception:
+        _COLLIDER_OBJECT_TARGET_SYNCING = False
         pass
+
+
+def _on_fire_geometry_object_changed(self, context):
+    global _COLLIDER_OBJECT_TARGET_SYNCING
+    if _COLLIDER_OBJECT_TARGET_SYNCING:
+        return
+    if context is None:
+        return
+
+    target_obj = getattr(self, "fire_geometry_object", None)
+    if not _poll_fire_geometry_object(None, target_obj):
+        return
+
+    try:
+        _ensure_object_selectable_in_view_layer(context, target_obj)
+    except Exception:
+        pass
+    try:
+        if getattr(self, "geometry_object", None) != target_obj:
+            _COLLIDER_OBJECT_TARGET_SYNCING = True
+            try:
+                self.geometry_object = target_obj
+            finally:
+                _COLLIDER_OBJECT_TARGET_SYNCING = False
+    except Exception:
+        _COLLIDER_OBJECT_TARGET_SYNCING = False
+        pass
+    try:
+        if str(getattr(self, "target_lod", "") or "") != _FIRE_GEOMETRY_LOD_TOKEN:
+            global _COLLIDER_LOD_SYNCING_FROM_OBJECT
+            _COLLIDER_LOD_SYNCING_FROM_OBJECT = True
+            try:
+                self.target_lod = _FIRE_GEOMETRY_LOD_TOKEN
+            finally:
+                _COLLIDER_LOD_SYNCING_FROM_OBJECT = False
+    except Exception:
+        pass
+    _sync_fire_geometry_material_selection(context)
+
+
+def _on_roadway_object_changed(self, context):
+    if context is None:
+        return
+
+    target_obj = getattr(self, "roadway_object", None)
+    if not _poll_roadway_object(None, target_obj):
+        return
+
+    try:
+        _ensure_object_selectable_in_view_layer(context, target_obj)
+    except Exception:
+        pass
+    _sync_roadway_material_selection(context)
 
 
 def _on_collider_exp_target_lod_changed_exp(self, context):
@@ -2051,6 +2301,7 @@ def _on_collider_exp_geometry_object_changed_exp(self, context):
         return
 
     try:
+        _ensure_object_selectable_in_view_layer(context, target_obj)
         if str(getattr(self, "target_lod", "") or "") != lod_token:
             global _COLLIDER_LOD_SYNCING_FROM_OBJECT_EXP
             _COLLIDER_LOD_SYNCING_FROM_OBJECT_EXP = True
@@ -2063,6 +2314,142 @@ def _on_collider_exp_geometry_object_changed_exp(self, context):
             _enable_collider_object_color_preview(context)
     except Exception:
         pass
+
+
+def _fake_terrain_context_root_collection(context, settings):
+    candidates = []
+
+    def add(obj):
+        if obj is not None and obj not in candidates:
+            candidates.append(obj)
+
+    add(getattr(settings, "fake_terrain_source_object", None))
+    add(getattr(settings, "source_object", None))
+    add(getattr(settings, "fake_terrain_target_object", None))
+    add(getattr(settings, "geometry_object", None))
+    add(getattr(settings, "fire_geometry_object", None))
+
+    active = getattr(getattr(context, "view_layer", None), "objects", None) if context is not None else None
+    add(getattr(active, "active", None) if active is not None else None)
+    for obj in getattr(context, "selected_objects", []) or []:
+        add(obj)
+
+    for obj in candidates:
+        if obj is None or getattr(obj, "type", None) != "MESH":
+            continue
+        try:
+            root = _find_p3d_root_collection_for_object(context, obj)
+        except Exception:
+            root = None
+        if root is not None:
+            return root
+    return None
+
+
+def _fake_terrain_target_candidates(context, settings):
+    root = _fake_terrain_context_root_collection(context, settings)
+    if root is None:
+        return []
+
+    try:
+        collider_collection = _find_named_child_collection(
+            root,
+            _COLLIDER_COLLECTION_NAME,
+            aliases=_COLLIDER_COLLECTION_ALIASES,
+        )
+    except Exception:
+        collider_collection = None
+    if collider_collection is None:
+        return []
+
+    candidates = []
+    seen = set()
+
+    def add_for_lod(lod_token):
+        expected_name = _collider_lod_name(lod_token)
+        ordered = []
+        direct = getattr(collider_collection, "objects", {}).get(expected_name)
+        if direct is not None:
+            ordered.append(direct)
+        ordered.extend(list(getattr(collider_collection, "objects", []) or []))
+
+        for obj in ordered:
+            if obj is None or getattr(obj, "type", None) != "MESH":
+                continue
+            try:
+                ptr = obj.as_pointer()
+            except Exception:
+                ptr = id(obj)
+            if ptr in seen:
+                continue
+            if _collider_lod_token_from_object(obj, allow_name_fallback=True) != str(lod_token):
+                continue
+            seen.add(ptr)
+            candidates.append((str(lod_token), obj))
+            return
+
+    for lod_token in ("6", "14", _FIRE_GEOMETRY_LOD_TOKEN):
+        add_for_lod(lod_token)
+
+    return candidates
+
+
+def get_fake_terrain_target_enum_items(self, context):
+    items = []
+    for lod_token, obj in _fake_terrain_target_candidates(context, self):
+        lod_name = _collider_lod_name(lod_token)
+        label = f"{lod_name}: {obj.name}"
+        items.append((obj.name, label, f"Create fake terrain in {lod_name} object '{obj.name}'"))
+    if not items:
+        items.append((_FAKE_TERRAIN_TARGET_NONE, "<no Geometry LODs in current model>", "Pick a Source Visual inside a .p3d model with Geometries"))
+    return items
+
+
+def _set_fake_terrain_target_object(context, settings, obj, *, sync_choice=True):
+    global _FAKE_TERRAIN_TARGET_SYNCING
+
+    if obj is None or getattr(obj, "type", None) != "MESH":
+        return False
+
+    lod_token = _collider_lod_token_from_object(obj, allow_name_fallback=True)
+    if lod_token not in _COLLIDER_LOD_NAMES:
+        return False
+
+    _FAKE_TERRAIN_TARGET_SYNCING = True
+    try:
+        settings.fake_terrain_target_object = obj
+        settings.fake_terrain_target_lod = lod_token
+        if sync_choice:
+            try:
+                settings.fake_terrain_target_choice = obj.name
+            except Exception:
+                pass
+    finally:
+        _FAKE_TERRAIN_TARGET_SYNCING = False
+
+    try:
+        _ensure_object_selectable_in_view_layer(context, obj)
+    except Exception:
+        pass
+    try:
+        _set_collider_settings_object(context, "geometry_object", obj)
+        if lod_token == _FIRE_GEOMETRY_LOD_TOKEN:
+            _set_collider_settings_object(context, "fire_geometry_object", obj)
+            _sync_fire_geometry_material_selection(context)
+    except Exception:
+        pass
+    return True
+
+
+def _on_fake_terrain_target_choice_changed(self, context):
+    if _FAKE_TERRAIN_TARGET_SYNCING:
+        return
+
+    choice = str(getattr(self, "fake_terrain_target_choice", "") or "")
+    if not choice or choice == _FAKE_TERRAIN_TARGET_NONE:
+        return
+    obj = bpy.data.objects.get(choice)
+    _set_fake_terrain_target_object(context, self, obj, sync_choice=False)
 
 
 class CRAY_PG_ColliderSettings(PropertyGroup):
@@ -2133,11 +2520,17 @@ class CRAY_PG_ColliderSettings(PropertyGroup):
         description="Show Roadway material and weld tools",
         default=True,
     )
+    show_fake_terrain_tools: BoolProperty(
+        name="Show Fake Terrain Tools",
+        description="Show adaptive fake terrain geometry tools",
+        default=True,
+    )
     fire_geometry_object: PointerProperty(
         name="Fire Geometry Object",
         description="Fire Geometry LOD mesh stored in Geometries collection",
         type=bpy.types.Object,
         poll=_poll_fire_geometry_object,
+        update=_on_fire_geometry_object_changed,
     )
     fire_geometry_material: EnumProperty(
         name="Fire Geometry Material",
@@ -2150,6 +2543,7 @@ class CRAY_PG_ColliderSettings(PropertyGroup):
         description="Roadway LOD mesh stored in Misc collection",
         type=bpy.types.Object,
         poll=_poll_roadway_object,
+        update=_on_roadway_object_changed,
     )
     roadway_material: EnumProperty(
         name="Roadway Material",
@@ -2163,6 +2557,68 @@ class CRAY_PG_ColliderSettings(PropertyGroup):
         default=0.0001,
         min=0.0,
         precision=6,
+        unit="LENGTH",
+    )
+    fake_terrain_source_object: PointerProperty(
+        name="Source Visual",
+        description="Visual terrain mesh whose selected Edit Mode faces are used to build fake terrain geometry",
+        type=bpy.types.Object,
+    )
+    fake_terrain_target_object: PointerProperty(
+        name="Target LOD Object",
+        description="Geometry LOD mesh that receives generated fake terrain components",
+        type=bpy.types.Object,
+    )
+    fake_terrain_target_choice: EnumProperty(
+        name="Target",
+        description="Geometry/View Geometry/Fire Geometry object in the current .p3d model that receives generated fake terrain",
+        items=get_fake_terrain_target_enum_items,
+        update=_on_fake_terrain_target_choice_changed,
+    )
+    fake_terrain_target_lod: EnumProperty(
+        name="Target LOD",
+        description="LOD that receives generated fake terrain components",
+        items=_COLLIDER_TARGET_LOD_ITEMS,
+        default=_FIRE_GEOMETRY_LOD_TOKEN,
+    )
+    fake_terrain_patch_size: FloatProperty(
+        name="Patch Size",
+        description="Starting XY size for fake terrain components; larger values make bigger, fewer slabs",
+        default=8.0,
+        min=0.25,
+        precision=2,
+        unit="LENGTH",
+    )
+    fake_terrain_min_patch_size: FloatProperty(
+        name="Min Patch",
+        description="Smallest XY size allowed when refining pits and uneven terrain",
+        default=1.0,
+        min=0.05,
+        precision=2,
+        unit="LENGTH",
+    )
+    fake_terrain_depression_error: FloatProperty(
+        name="Pit Error",
+        description="Maximum allowed vertical bridge over lower source points before a patch is split",
+        default=0.15,
+        min=0.0,
+        precision=3,
+        unit="LENGTH",
+    )
+    fake_terrain_hill_error: FloatProperty(
+        name="Hill Error",
+        description="Maximum allowed source height above the fitted patch before a patch is split",
+        default=0.35,
+        min=0.0,
+        precision=3,
+        unit="LENGTH",
+    )
+    fake_terrain_thickness: FloatProperty(
+        name="Thickness",
+        description="Vertical thickness of each closed fake terrain component",
+        default=1.0,
+        min=0.05,
+        precision=2,
         unit="LENGTH",
     )
 
@@ -2254,6 +2710,11 @@ class CRAY_PG_ColliderExpSettings(PropertyGroup):
         precision=4,
         unit="LENGTH",
     )
+    normal_minimum_size: BoolProperty(
+        name="Normal Min Size",
+        description="For flat box sources, add missing Minimum Size thickness opposite to the averaged face normal instead of centering it",
+        default=False,
+    )
     convex_detail: IntProperty(
         name="Hull Detail",
         description="Simplification/detail level for experimental convex hull",
@@ -2304,7 +2765,7 @@ class CRAY_PG_ColliderExpSettings(PropertyGroup):
     pipe_thickness: FloatProperty(
         name="Pipe Thickness",
         default=0.25,
-        min=0.001,
+        min=0.0,
         precision=4,
         unit="LENGTH",
     )
@@ -2357,26 +2818,33 @@ class CRAY_PG_ColliderExpSettings(PropertyGroup):
     )
 
 
+_UI_PANEL_LAYOUT_ORDER_STEP = 10
 _UI_PANEL_LAYOUT_DEFINITIONS = (
-    ("snap_points", "Snap Points", "CRAY_PT_SnapPointsPanel"),
-    ("asset_library", "P3D Asset Library", "CRAY_PT_AssetProxyPanel"),
-    ("fixes", "Fixes", "CRAY_PT_FixesPanel"),
-    ("import_export", "Import/Export planner", "CRAY_PT_ImportExportPlannerPanel"),
-    ("model_split", "Model Split / Merge", "CRAY_PT_ModelSplitPanel"),
-    ("texture_replace", "Texture Replace", "CRAY_PT_TextureReplacePanel"),
     ("collider", "Collider", "CRAY_PT_ColliderExpPanel"),
     ("geometry_lods", "Geometry LODs", "CRAY_PT_ColliderPanel"),
-    ("object_builder", "Object Builder / Clutter", "CRAY_PT_ClutterProxiesPanel"),
+    ("asset_library", "P3D Asset Library", "CRAY_PT_AssetProxyPanel"),
+    ("snap_points", "Snap Points (Memory LOD)", "CRAY_PT_SnapPointsPanel"),
+    ("import_export", "Import/Export planner", "CRAY_PT_ImportExportPlannerPanel"),
+    ("fixes", "Fixes", "CRAY_PT_FixesPanel"),
+    ("model_split", "Model Split / Merge", "CRAY_PT_ModelSplitPanel"),
+    ("texture_replace", "Texture Replace", "CRAY_PT_TextureReplacePanel"),
     ("cache_manager", "Cache Manager", "CRAY_PT_CacheManagerPanel"),
+    ("object_builder", "Clutter Proxies (DayZ)", "CRAY_PT_ClutterProxiesPanel"),
 )
+_UI_PANEL_DEFAULT_ORDER = {
+    key: (idx + 1) * _UI_PANEL_LAYOUT_ORDER_STEP
+    for idx, (key, _label, _class_name) in enumerate(_UI_PANEL_LAYOUT_DEFINITIONS)
+}
 
 
 _CUSTOM_KEYBIND_DEFINITIONS = (
-    ("Ctrl+Shift+C", "Copy Selected Verts To Geometry", None),
-    ("Ctrl+Shift+X", "Select Isolated Verts", None),
-    ("Mouse4", "Selection -> Hull", None),
-    ("Mouse5", "Selection -> Box", None),
-    ("Ctrl+Shift+P", "Create Plain Axis Pivot", "plain_axis"),
+    ("cray.copy_selected_verts_to_geometry", "Copy Selected Verts To Geometry", "Ctrl+Shift+C", None),
+    ("cray.select_isolated_vertices", "Select Isolated Verts", "Ctrl+Shift+X", None),
+    ("cray.generate_convex_hull_collider_exp", "Create Collider -> Convex Hull", "Mouse4", None),
+    ("cray.generate_box_collider_exp", "Create Collider -> Box", "Mouse5", None),
+    ("cray.delete_last_collider_exp", "Delete Last Created Collider", "Ctrl+Mouse4", None),
+    ("cray.select_connected_shell_from_selection_exp", "Select Connected Shell", "Ctrl+Mouse5", None),
+    ("cray.create_plain_axis_pivot", "Create Plain Axis Pivot", "Ctrl+Shift+P", "plain_axis"),
 )
 
 
@@ -2390,6 +2858,60 @@ def _is_ui_panel_visible(context, key: str) -> bool:
     if settings is None:
         return True
     return bool(getattr(settings, f"show_{key}", True))
+
+
+def _ui_panel_order_prop_name(key: str) -> str:
+    return f"order_{key}"
+
+
+def _ui_panel_default_order(key: str, fallback_index: int = 0) -> int:
+    return int(_UI_PANEL_DEFAULT_ORDER.get(key, (fallback_index + 1) * _UI_PANEL_LAYOUT_ORDER_STEP))
+
+
+def _ui_panel_order_value(settings, key: str, fallback_index: int = 0) -> int:
+    if settings is None:
+        return _ui_panel_default_order(key, fallback_index)
+    prop_name = _ui_panel_order_prop_name(key)
+    try:
+        value = int(getattr(settings, prop_name))
+    except Exception:
+        value = 0
+    return value if value > 0 else _ui_panel_default_order(key, fallback_index)
+
+
+def _sorted_ui_panel_layout_definitions(settings=None):
+    indexed = list(enumerate(_UI_PANEL_LAYOUT_DEFINITIONS))
+    indexed.sort(key=lambda item: (_ui_panel_order_value(settings, item[1][0], item[0]), item[0]))
+    return [definition for _idx, definition in indexed]
+
+
+def _apply_ui_panel_class_order(settings=None):
+    for fallback_index, (key, _label, class_name) in enumerate(_UI_PANEL_LAYOUT_DEFINITIONS):
+        panel_cls = globals().get(class_name)
+        if panel_cls is None:
+            try:
+                panel_cls = getattr(bpy.types, class_name, None)
+            except Exception:
+                panel_cls = None
+        if panel_cls is None:
+            continue
+        try:
+            panel_cls.bl_order = _ui_panel_order_value(settings, key, fallback_index)
+        except Exception:
+            pass
+
+
+def _normalize_ui_panel_order(settings, ordered_keys):
+    if settings is None:
+        return
+    for idx, key in enumerate(ordered_keys):
+        prop_name = _ui_panel_order_prop_name(key)
+        if not hasattr(settings, prop_name):
+            continue
+        try:
+            setattr(settings, prop_name, (idx + 1) * _UI_PANEL_LAYOUT_ORDER_STEP)
+        except Exception:
+            pass
 
 
 def _tag_ui_redraw(context=None):
@@ -2412,10 +2934,21 @@ def _tag_ui_redraw(context=None):
 
 
 def _on_ui_panel_layout_setting_changed(self, context):
+    _apply_ui_panel_class_order(self)
     _tag_ui_redraw(context)
 
 
 class CRAY_PG_UIPanelSettings(PropertyGroup):
+    order_collider: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["collider"], min=1, update=_on_ui_panel_layout_setting_changed)
+    order_geometry_lods: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["geometry_lods"], min=1, update=_on_ui_panel_layout_setting_changed)
+    order_asset_library: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["asset_library"], min=1, update=_on_ui_panel_layout_setting_changed)
+    order_snap_points: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["snap_points"], min=1, update=_on_ui_panel_layout_setting_changed)
+    order_import_export: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["import_export"], min=1, update=_on_ui_panel_layout_setting_changed)
+    order_fixes: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["fixes"], min=1, update=_on_ui_panel_layout_setting_changed)
+    order_model_split: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["model_split"], min=1, update=_on_ui_panel_layout_setting_changed)
+    order_texture_replace: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["texture_replace"], min=1, update=_on_ui_panel_layout_setting_changed)
+    order_cache_manager: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["cache_manager"], min=1, update=_on_ui_panel_layout_setting_changed)
+    order_object_builder: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["object_builder"], min=1, update=_on_ui_panel_layout_setting_changed)
     show_snap_points: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
     show_asset_library: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
     show_fixes: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
@@ -2424,9 +2957,63 @@ class CRAY_PG_UIPanelSettings(PropertyGroup):
     show_texture_replace: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
     show_collider: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
     show_geometry_lods: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
-    show_object_builder: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_object_builder: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=False, update=_on_ui_panel_layout_setting_changed)
     show_cache_manager: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
     show_custom_keybinds: BoolProperty(name="Custom Keybinds", description="Показывать список кастомных хоткеев аддона", default=False, update=_on_ui_panel_layout_setting_changed)
+
+
+class CRAY_OT_MoveUIPanelLayoutItem(Operator):
+    bl_idname = "cray.move_ui_panel_layout_item"
+    bl_label = "Move Panel"
+    bl_options = {"INTERNAL"}
+
+    panel_key: StringProperty(default="")
+    direction: IntProperty(default=0)
+
+    def execute(self, context):
+        settings = _ui_panel_settings_from_context(context)
+        if settings is None:
+            return {"CANCELLED"}
+
+        ordered_keys = [key for key, _label, _class_name in _sorted_ui_panel_layout_definitions(settings)]
+        if self.panel_key not in ordered_keys:
+            return {"CANCELLED"}
+
+        index = ordered_keys.index(self.panel_key)
+        target = max(0, min(len(ordered_keys) - 1, index + int(self.direction)))
+        if target == index:
+            return {"CANCELLED"}
+
+        ordered_keys.insert(target, ordered_keys.pop(index))
+        _normalize_ui_panel_order(settings, ordered_keys)
+        _apply_ui_panel_class_order(settings)
+        _tag_ui_redraw(context)
+        _save_current_persisted_ui_state(getattr(context, "scene", None))
+        return {"FINISHED"}
+
+
+class CRAY_OT_ResetUIPanelLayoutOrder(Operator):
+    bl_idname = "cray.reset_ui_panel_layout_order"
+    bl_label = "Reset Panel Order"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        settings = _ui_panel_settings_from_context(context)
+        if settings is None:
+            return {"CANCELLED"}
+
+        for key, _label, _class_name in _UI_PANEL_LAYOUT_DEFINITIONS:
+            prop_name = _ui_panel_order_prop_name(key)
+            if not hasattr(settings, prop_name):
+                continue
+            try:
+                setattr(settings, prop_name, _ui_panel_default_order(key))
+            except Exception:
+                pass
+        _apply_ui_panel_class_order(settings)
+        _tag_ui_redraw(context)
+        _save_current_persisted_ui_state(getattr(context, "scene", None))
+        return {"FINISHED"}
 
 
 # ------------------------------------------------------------------------
@@ -2656,6 +3243,8 @@ _A3OB_EXPORT_CANDIDATES = (
             "validate_lods",
             "validate_lods_warning_errors",
             "generate_components",
+            "renumber_components",
+            "translate_selections",
             "force_lowercase",
         ),
     ),
@@ -2909,6 +3498,115 @@ def _call_export_with_optional_relaxed_validation(force_all_lods: bool, **kwargs
         return _call_first_available(_A3OB_EXPORT_CANDIDATES, **kwargs)
 
 
+def _collision_lod_material_export_keep_token(export_objects):
+    present = set()
+    for obj in export_objects or []:
+        if getattr(obj, "type", None) != "MESH":
+            continue
+        lod_token = _collider_lod_token_from_object(obj, allow_name_fallback=True)
+        if lod_token in (_FIRE_GEOMETRY_LOD_TOKEN, _GEOMETRY_LOD_TOKEN, "14"):
+            present.add(lod_token)
+    if _FIRE_GEOMETRY_LOD_TOKEN in present:
+        return _FIRE_GEOMETRY_LOD_TOKEN
+    if _GEOMETRY_LOD_TOKEN in present:
+        return _GEOMETRY_LOD_TOKEN
+    if "14" in present:
+        return "14"
+    return ""
+
+
+def _strip_collision_lod_materials_for_export(export_objects):
+    keep_token = _collision_lod_material_export_keep_token(export_objects)
+    if not keep_token:
+        return []
+
+    restore_items = []
+    seen_meshes = set()
+    for obj in export_objects or []:
+        if getattr(obj, "type", None) != "MESH":
+            continue
+        lod_token = _collider_lod_token_from_object(obj, allow_name_fallback=True)
+        if lod_token not in (_GEOMETRY_LOD_TOKEN, "14"):
+            continue
+        if lod_token == keep_token:
+            continue
+        mesh = getattr(obj, "data", None)
+        if mesh is None:
+            continue
+        try:
+            mesh_key = mesh.as_pointer()
+        except Exception:
+            mesh_key = id(mesh)
+        if mesh_key in seen_meshes:
+            continue
+        seen_meshes.add(mesh_key)
+        materials = [mat for mat in mesh.materials]
+        poly_indices = [int(poly.material_index) for poly in mesh.polygons]
+        if not materials and not any(poly_indices):
+            continue
+        restore_items.append((mesh, materials, poly_indices))
+        try:
+            mesh.materials.clear()
+            for poly in mesh.polygons:
+                poly.material_index = 0
+            mesh.update()
+        except Exception:
+            restore_items.pop()
+    return restore_items
+
+
+def _restore_collision_lod_materials_after_export(restore_items):
+    for mesh, materials, poly_indices in restore_items or []:
+        try:
+            mesh.materials.clear()
+            for mat in materials:
+                mesh.materials.append(mat)
+            for poly, material_index in zip(mesh.polygons, poly_indices):
+                poly.material_index = int(material_index)
+            mesh.update()
+        except Exception:
+            pass
+
+
+def _strip_a3ob_named_properties_for_export(export_objects):
+    restore_items = []
+    for obj in export_objects or []:
+        if obj is None or not hasattr(obj, "a3ob_properties_object"):
+            continue
+        try:
+            props = obj.a3ob_properties_object
+            items = getattr(props, "properties", None)
+        except Exception:
+            continue
+        if items is None or len(items) == 0:
+            continue
+
+        saved = []
+        try:
+            for item in items:
+                saved.append((str(getattr(item, "name", "") or ""), str(getattr(item, "value", "") or "")))
+            items.clear()
+        except Exception:
+            continue
+        restore_items.append((obj, saved))
+    return restore_items
+
+
+def _restore_a3ob_named_properties_after_export(restore_items):
+    for obj, saved in restore_items or []:
+        if obj is None or not hasattr(obj, "a3ob_properties_object"):
+            continue
+        try:
+            items = obj.a3ob_properties_object.properties
+            items.clear()
+            for name, value in saved:
+                item = items.add()
+                item.name = name
+                item.value = value
+        except Exception:
+            pass
+
+
 def _get_a3ob_export_p3d_module():
     return _import_first_available_module(
         (
@@ -3144,100 +3842,6 @@ def _iter_a3ob_export_meshes_for_lod_root(root_obj):
     return meshes
 
 
-def _geometry_lod_root_objects(export_objects):
-    roots = []
-    seen = set()
-    for obj in export_objects or []:
-        if not _is_a3ob_lod_root_object(obj):
-            continue
-        try:
-            lod_token = str(getattr(obj.a3ob_properties_object, "lod", "") or "").strip()
-        except Exception:
-            continue
-        if lod_token != _GEOMETRY_LOD_TOKEN:
-            continue
-        try:
-            ptr = obj.as_pointer()
-        except Exception:
-            ptr = id(obj)
-        if ptr in seen:
-            continue
-        seen.add(ptr)
-        roots.append(obj)
-    return roots
-
-
-def _read_mesh_mass_values(obj):
-    if obj is None or getattr(obj, "type", None) != "MESH" or obj.data is None:
-        return []
-    bm = bmesh.new()
-    try:
-        bm.from_mesh(obj.data)
-        layer = bm.verts.layers.float.get("a3ob_mass")
-        if layer is None:
-            return [0.0 for _vert in bm.verts]
-        return [float(vert[layer]) for vert in bm.verts]
-    finally:
-        bm.free()
-
-
-def _write_mesh_mass_uniform(obj, value_per_vertex: float):
-    if obj is None or getattr(obj, "type", None) != "MESH" or obj.data is None:
-        return 0
-    bm = bmesh.new()
-    try:
-        bm.from_mesh(obj.data)
-        bm.verts.ensure_lookup_table()
-        layer = bm.verts.layers.float.get("a3ob_mass")
-        if layer is None:
-            layer = bm.verts.layers.float.new("a3ob_mass")
-        for vert in bm.verts:
-            vert[layer] = value_per_vertex
-        changed = len(bm.verts)
-        bm.to_mesh(obj.data)
-        obj.data.update()
-        return changed
-    finally:
-        bm.free()
-
-
-def _prepare_geometry_lod_mass_for_export(export_objects):
-    prepared = []
-    for root_obj in _geometry_lod_root_objects(export_objects):
-        meshes = list(_iter_a3ob_export_meshes_for_lod_root(root_obj))
-        if not meshes:
-            continue
-
-        values_by_obj = []
-        total_verts = 0
-        total_mass = 0.0
-        has_missing_mass = False
-        for mesh_obj in meshes:
-            values = _read_mesh_mass_values(mesh_obj)
-            if not values:
-                continue
-            values_by_obj.append((mesh_obj, values))
-            total_verts += len(values)
-            total_mass += math.fsum(values)
-            if any(value <= 1e-7 for value in values):
-                has_missing_mass = True
-
-        if total_verts <= 0:
-            continue
-        if total_mass > 1e-7 and not has_missing_mass:
-            continue
-
-        target_total_mass = total_mass if total_mass > 1e-7 else _GEOMETRY_LOD_DEFAULT_TOTAL_MASS
-        value_per_vertex = target_total_mass / total_verts
-        changed_verts = 0
-        for mesh_obj, _values in values_by_obj:
-            changed_verts += _write_mesh_mass_uniform(mesh_obj, value_per_vertex)
-        if changed_verts:
-            prepared.append((root_obj.name, changed_verts, target_total_mass))
-
-    return prepared
-
-
 def _mesh_ngon_stats(mesh_obj):
     if mesh_obj is None or mesh_obj.type != "MESH" or mesh_obj.data is None:
         return 0, 0
@@ -3252,10 +3856,6 @@ def _mesh_ngon_stats(mesh_obj):
         if side_count > max_sides:
             max_sides = side_count
     return ngon_count, max_sides
-
-
-def _mesh_isolated_vertex_count(mesh_obj):
-    return len(_mesh_isolated_vertex_indices(mesh_obj))
 
 
 def _mesh_isolated_vertex_indices(mesh_obj):
@@ -3481,6 +4081,7 @@ def _collect_export_ngon_issues(root_collection, export_objects):
             if ngon_count <= 0:
                 continue
             _, actual_parts = _actual_top_level_collection_key_under_root(root_collection, mesh_obj)
+            display_path = _format_ngon_lod_display_path(getattr(root_collection, "name", ""), actual_parts, mesh_obj.name)
             issues.append(
                 {
                     "lod_object_name": obj.name,
@@ -3489,6 +4090,7 @@ def _collect_export_ngon_issues(root_collection, export_objects):
                     "ngon_count": ngon_count,
                     "max_sides": max_sides,
                     "actual_branch": actual_parts,
+                    "display_path": display_path,
                 }
             )
 
@@ -3499,6 +4101,25 @@ def _collect_export_ngon_issues(root_collection, export_objects):
         )
     )
     return issues
+
+
+def _format_ngon_lod_display_path(root_name, branch_parts, object_name=""):
+    parts = []
+    root_name = (root_name or "").strip()
+    if root_name:
+        parts.append(root_name)
+
+    for part in branch_parts or []:
+        part = (str(part) or "").strip()
+        if part and part not in parts:
+            parts.append(part)
+
+    object_name = (object_name or "").strip()
+    if object_name and object_name not in parts:
+        parts.append(object_name)
+
+    return " > ".join(parts) if parts else object_name or "<unknown LOD>"
+
 
 def _report_export_ngon_issues_in_console(collection_name: str, filepath: str, issues):
     if not issues:
@@ -3513,10 +4134,174 @@ def _report_export_ngon_issues_in_console(collection_name: str, filepath: str, i
     )
     for item in issues:
         actual_branch = " > ".join(item["actual_branch"])
+        display_path = item.get("display_path") or _format_ngon_lod_display_path(collection_name, item.get("actual_branch"), item.get("mesh_object_name", ""))
         print(
-            f" - LOD: {item['lod_name']} | root: {item['lod_object_name']} | "
+            f" - {display_path} has n-gons | LOD: {item['lod_name']} | root: {item['lod_object_name']} | "
             f"mesh: {item['mesh_object_name']} | n-gon faces: {item['ngon_count']} | "
             f"max verts on one face: {item['max_sides']} | branch: {actual_branch}"
+        )
+
+
+def _scene_collection_paths_for_object(context, obj):
+    scene = getattr(context, "scene", None)
+    scene_root = getattr(scene, "collection", None) if scene is not None else None
+    labels = []
+    seen = set()
+
+    for col in getattr(obj, "users_collection", []) or []:
+        label = getattr(col, "name", "") or "<unnamed collection>"
+        if scene_root is not None:
+            try:
+                path = _find_collection_path(scene_root, col.as_pointer())
+            except Exception:
+                path = None
+            if path:
+                names = [getattr(item, "name", "") or "<unnamed collection>" for item in path[1:]]
+                label = " > ".join(names) if names else getattr(scene_root, "name", "Scene Collection")
+
+        if label in seen:
+            continue
+        seen.add(label)
+        labels.append(label)
+
+    return labels or ["<not linked to scene collection>"]
+
+
+def _scene_ngon_display_path(context, obj, collection_paths=None):
+    root = None
+    try:
+        root = _find_p3d_root_collection_for_object(context, obj)
+    except Exception:
+        root = None
+
+    if root is not None:
+        try:
+            path = _best_object_collection_path_under_root(root, obj)
+        except Exception:
+            path = None
+        if path:
+            branch_parts = [getattr(col, "name", "") or "" for col in list(path)[1:]]
+            return _format_ngon_lod_display_path(getattr(root, "name", ""), branch_parts, getattr(obj, "name", ""))
+
+    collection_paths = list(collection_paths or _scene_collection_paths_for_object(context, obj))
+    if collection_paths:
+        return _format_ngon_lod_display_path("", [collection_paths[0]], getattr(obj, "name", ""))
+    return _format_ngon_lod_display_path("", [], getattr(obj, "name", ""))
+
+
+def _mesh_ngon_details(mesh_obj, *, use_edit_bmesh=False):
+    if mesh_obj is None or mesh_obj.type != "MESH" or mesh_obj.data is None:
+        return 0, 0, []
+
+    face_indices = []
+    max_sides = 0
+
+    if use_edit_bmesh:
+        try:
+            bm = bmesh.from_edit_mesh(mesh_obj.data)
+            bm.faces.ensure_lookup_table()
+            bm.faces.index_update()
+            for face in bm.faces:
+                if face is None or not face.is_valid:
+                    continue
+                side_count = len(face.verts)
+                if side_count <= 4:
+                    continue
+                face_indices.append(int(face.index))
+                max_sides = max(max_sides, side_count)
+            return len(face_indices), max_sides, face_indices
+        except Exception:
+            pass
+
+    for poly in getattr(mesh_obj.data, "polygons", []) or []:
+        side_count = int(getattr(poly, "loop_total", 0) or len(getattr(poly, "vertices", ()) or ()))
+        if side_count <= 4:
+            continue
+        face_indices.append(int(getattr(poly, "index", len(face_indices))))
+        max_sides = max(max_sides, side_count)
+
+    return len(face_indices), max_sides, face_indices
+
+
+def _collect_scene_ngon_mesh_records(context):
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        return []
+
+    edit_object_ptrs = set()
+    if getattr(context, "mode", "") == "EDIT_MESH":
+        for obj in getattr(context, "objects_in_mode", []) or [getattr(context, "active_object", None)]:
+            if obj is None:
+                continue
+            try:
+                edit_object_ptrs.add(obj.as_pointer())
+            except Exception:
+                pass
+
+    records = []
+    for obj in getattr(scene, "objects", []) or []:
+        if obj is None or obj.type != "MESH" or obj.data is None:
+            continue
+
+        try:
+            use_edit_bmesh = obj.as_pointer() in edit_object_ptrs
+        except Exception:
+            use_edit_bmesh = False
+
+        ngon_count, max_sides, face_indices = _mesh_ngon_details(obj, use_edit_bmesh=use_edit_bmesh)
+        if ngon_count <= 0:
+            continue
+
+        collection_paths = _scene_collection_paths_for_object(context, obj)
+        records.append(
+            {
+                "object_name": obj.name,
+                "mesh_name": getattr(obj.data, "name", ""),
+                "ngon_count": ngon_count,
+                "max_sides": max_sides,
+                "face_indices": face_indices,
+                "collection_paths": collection_paths,
+                "display_path": _scene_ngon_display_path(context, obj, collection_paths),
+            }
+        )
+
+    records.sort(
+        key=lambda rec: (
+            " | ".join(rec["collection_paths"]),
+            rec["object_name"].lower(),
+            rec["mesh_name"].lower(),
+        )
+    )
+    return records
+
+
+def _report_scene_ngon_mesh_records_in_console(context, records):
+    scene = getattr(context, "scene", None)
+    scene_name = getattr(scene, "name", "<unknown>")
+
+    print("")
+    print("=== N-gon Mesh Scan ===")
+    print(f"Scene: {scene_name}")
+
+    if not records:
+        print("No n-gons found in scene mesh objects.")
+        return
+
+    total_ngons = sum(int(rec["ngon_count"]) for rec in records)
+    print(f"Found {total_ngons} n-gon face(s) in {len(records)} mesh object(s).")
+    for rec in records:
+        indices = list(rec.get("face_indices", []) or [])
+        index_preview = ", ".join(str(idx) for idx in indices[:20])
+        if len(indices) > 20:
+            index_preview += ", ..."
+        if not index_preview:
+            index_preview = "<not available>"
+
+        display_path = rec.get("display_path") or rec.get("object_name", "<unknown>")
+        print(
+            f" - {display_path} has n-gons | object: {rec['object_name']} | mesh data: {rec['mesh_name']} | "
+            f"n-gons: {rec['ngon_count']} | max sides: {rec['max_sides']} | "
+            f"face indices: {index_preview} | collections: {'; '.join(rec['collection_paths'])}"
         )
 
 
@@ -3586,50 +4371,6 @@ def _read_lod_entries_if_possible(filepath: str):
         return _read_exported_lod_entries(filepath), ""
     except Exception as e:
         return None, _fmt_exc(e)
-
-
-def _should_create_export_backup(filepath: str, expected_entries):
-    backup_path = filepath + ".bak"
-    if not os.path.isfile(filepath):
-        return False, "target file does not exist", []
-
-    target_entries, target_err = _read_lod_entries_if_possible(filepath)
-    if target_entries is None:
-        return False, f"could not verify existing target LODs: {target_err}", []
-
-    missing_expected = []
-    if expected_entries:
-        missing_expected = sorted(
-            set(expected_entries.keys()) - set(target_entries.keys()),
-            key=lambda k: expected_entries[k]["signature"],
-        )
-        if missing_expected:
-            return (
-                False,
-                (
-                    "existing target already misses "
-                    f"{len(missing_expected)}/{len(expected_entries)} expected LOD signature(s)"
-                ),
-                missing_expected,
-            )
-
-    if os.path.isfile(backup_path):
-        backup_entries, backup_err = _read_lod_entries_if_possible(backup_path)
-        if backup_entries is not None and len(target_entries) < len(backup_entries):
-            return (
-                False,
-                (
-                    "existing target has fewer LOD signatures "
-                    f"({len(target_entries)}) than current backup ({len(backup_entries)})"
-                ),
-                [],
-            )
-        if backup_entries is None:
-            print("=== Batch Export Collections: Backup verification warning ===")
-            print(f"Backup: {backup_path}")
-            print(f"WARNING: Existing .bak could not be checked: {backup_err}")
-
-    return True, f"verified existing target with {len(target_entries)} LOD signature(s)", []
 
 
 def _pending_export_backup_path(filepath: str) -> str:
@@ -3930,7 +4671,7 @@ def _make_a3ob_export_diagnostic_operator(force_all_lods: bool):
     operator.validate_lods_warning_errors = False
     operator.generate_components = True
     operator.force_lowercase = True
-    operator.renumber_components = False
+    operator.renumber_components = True
     operator.translate_selections = False
     return operator
 
@@ -4069,12 +4810,6 @@ def _report_missing_lod_diagnostics_in_console(
 
 def _is_memory_lod_mesh_object(obj) -> bool:
     return _MemoryLodManager.is_memory_lod_mesh_object(obj)
-
-def _pick_memory_lod_object(context, source_obj):
-    return _MemoryLodManager(context, source_obj).pick_existing_object()
-
-def _set_memory_lod_a3ob_props(memory_obj):
-    _MemoryLodManager.apply_a3ob_props(memory_obj)
 
 def _ensure_memory_lod_object(context, source_obj, preferred_obj=None):
     return _MemoryLodManager(context, source_obj).ensure_object(preferred_obj=preferred_obj)
@@ -4561,6 +5296,67 @@ def _deselect_all_in_view_layer(context):
         if o.select_get():
             o.select_set(False)
 
+
+def _object_is_in_view_layer(context, obj) -> bool:
+    view_layer = getattr(context, "view_layer", None)
+    if view_layer is None or obj is None:
+        return False
+    try:
+        obj_ptr = obj.as_pointer()
+    except Exception:
+        return False
+
+    try:
+        found = view_layer.objects.get(obj.name)
+        if found is not None and found.as_pointer() == obj_ptr:
+            return True
+    except Exception:
+        pass
+
+    try:
+        for layer_obj in view_layer.objects:
+            if layer_obj is not None and layer_obj.as_pointer() == obj_ptr:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _ensure_object_selectable_in_view_layer(context, obj) -> bool:
+    if obj is None or bpy.data.objects.get(getattr(obj, "name", "")) is None:
+        return False
+
+    for col in list(getattr(obj, "users_collection", []) or []):
+        try:
+            _ensure_collection_visible_in_view_layer(context, col)
+        except Exception:
+            pass
+    try:
+        _set_object_view_visible(obj, True)
+    except Exception:
+        pass
+    try:
+        obj.hide_select = False
+    except Exception:
+        pass
+    try:
+        context.view_layer.update()
+    except Exception:
+        pass
+    return _object_is_in_view_layer(context, obj)
+
+
+def _select_object_in_view_layer(context, obj, *, active=False):
+    if not _ensure_object_selectable_in_view_layer(context, obj):
+        name = getattr(obj, "name", "<unknown>")
+        raise RuntimeError(f"Object '{name}' is not available in the current View Layer")
+
+    obj.select_set(True)
+    if active:
+        context.view_layer.objects.active = obj
+    return obj
+
+
 def _cleanup_imported_objects(imported_obj_names, pre_collection_ptrs):
     live = [bpy.data.objects.get(n) for n in imported_obj_names]
     live = [o for o in live if o is not None]
@@ -4985,22 +5781,30 @@ class CRAY_OT_SnapBatchProcess(Operator):
             if bpy.data.objects.get(model_obj.name) is not None:
                 context.view_layer.objects.active = bpy.data.objects.get(model_obj.name)
 
-            _, used_export, export_err = _call_first_available(
-                _A3OB_EXPORT_CANDIDATES,
-                filepath=filepath,
-                use_selection=True,
-                visible_only=True,
-                relative_paths=True,
-                preserve_normals=True,
-                validate_meshes=False,
-                apply_transforms=True,
-                apply_modifiers=True,
-                sort_sections=True,
-                lod_collisions="SKIP",
-                validate_lods=False,
-                generate_components=True,
-                force_lowercase=True,
+            named_property_restore = _strip_a3ob_named_properties_for_export(
+                [bpy.data.objects.get(name) for name in imported_names]
             )
+            try:
+                _, used_export, export_err = _call_first_available(
+                    _A3OB_EXPORT_CANDIDATES,
+                    filepath=filepath,
+                    use_selection=True,
+                    visible_only=True,
+                    relative_paths=True,
+                    preserve_normals=True,
+                    validate_meshes=False,
+                    apply_transforms=True,
+                    apply_modifiers=True,
+                    sort_sections=True,
+                    lod_collisions="SKIP",
+                    validate_lods=False,
+                    generate_components=True,
+                    renumber_components=True,
+                    translate_selections=False,
+                    force_lowercase=True,
+                )
+            finally:
+                _restore_a3ob_named_properties_after_export(named_property_restore)
             if used_export is None:
                 fail_count += 1
                 failures.append((filepath, f"export-failed: {_fmt_exc(export_err) if export_err else 'no operator'}"))
@@ -5231,24 +6035,6 @@ def _ensure_misc_collection(context, source_obj):
     return _ensure_named_child_collection(parent, _MISC_COLLECTION_NAME, _MISC_COLLECTION_COLOR)
 
 
-def _pick_named_lod_object(context, source_obj, lod_token, object_name):
-    if source_obj is not None:
-        for col in source_obj.users_collection:
-            obj = col.objects.get(object_name)
-            if obj is not None and obj.type == "MESH":
-                return obj
-
-    obj = bpy.data.objects.get(object_name)
-    if obj is not None and obj.type == "MESH":
-        return obj
-
-    for obj in context.scene.objects:
-        if _is_collider_lod_mesh_object(obj, lod_token=lod_token):
-            return obj
-
-    return None
-
-
 def _remove_a3ob_named_property(props, name: str):
     items = getattr(props, "properties", None)
     if items is None:
@@ -5285,7 +6071,13 @@ def _set_collider_lod_a3ob_props(target_obj, lod_token):
         pass
 
 
-def _collider_target_validation_error(target_obj, lod_token, source_obj=None, allow_same_source=False):
+def _collider_target_validation_error(
+    target_obj,
+    lod_token,
+    source_obj=None,
+    allow_same_source=False,
+    allow_any_collider_lod=False,
+):
     if target_obj is None:
         return None
     if target_obj.type != "MESH":
@@ -5305,6 +6097,8 @@ def _collider_target_validation_error(target_obj, lod_token, source_obj=None, al
         return None
 
     if current_lod and current_lod != str(lod_token):
+        if allow_any_collider_lod and current_lod in _COLLIDER_LOD_NAMES:
+            return None
         return (
             f"Target LOD Object '{target_obj.name}' is already "
             f"A3OB LOD '{_collider_lod_name(current_lod)}'"
@@ -5346,6 +6140,57 @@ def _set_collider_settings_object(context, attr_name, obj):
         context.view_layer.update()
     except Exception:
         pass
+    _tag_redraw_all_areas(context)
+
+
+def _flush_edit_mesh_normals_after_bmesh_write(context, mesh):
+    bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
+    try:
+        mesh.update()
+    except Exception:
+        pass
+    try:
+        context.view_layer.update()
+    except Exception:
+        pass
+    _tag_redraw_all_areas(context)
+
+
+def _force_edit_mesh_view_refresh_exp(context, obj):
+    if obj is None or getattr(obj, "type", None) != "MESH":
+        return
+    if getattr(obj, "mode", "") != "EDIT":
+        return
+
+    view_layer = getattr(context, "view_layer", None)
+    try:
+        if view_layer is not None:
+            _select_object_in_view_layer(context, obj, active=True)
+    except Exception:
+        pass
+
+    try:
+        bpy.ops.object.mode_set(mode="OBJECT")
+        try:
+            obj.data.update(calc_edges=True)
+        except Exception:
+            pass
+        try:
+            if view_layer is not None:
+                view_layer.update()
+        except Exception:
+            pass
+        bpy.ops.object.mode_set(mode="EDIT")
+        try:
+            bpy.ops.mesh.select_mode(type="FACE")
+        except Exception:
+            pass
+    except Exception:
+        try:
+            bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=True)
+        except Exception:
+            pass
+
     _tag_redraw_all_areas(context)
 
 
@@ -5430,6 +6275,44 @@ def _get_selected_material_from_object(obj, selected_name: str, *, create_name: 
     return mat
 
 
+def _get_selected_material_from_objects(objects, selected_name: str, *, create_name: str = ""):
+    objects = [
+        obj for obj in objects or []
+        if obj is not None and getattr(obj, "type", None) == "MESH"
+    ]
+    selected_name = (selected_name or "").strip()
+
+    if selected_name and selected_name not in {_MATERIAL_ADD_NEW, _ROADWAY_MATERIAL_NONE, _FIRE_GEOMETRY_MATERIAL_NONE}:
+        for obj in objects:
+            for slot in getattr(obj, "material_slots", []) or []:
+                mat = getattr(slot, "material", None)
+                if mat is not None and getattr(mat, "name", "") == selected_name:
+                    return mat
+        mat = bpy.data.materials.get(selected_name)
+        if mat is not None:
+            return mat
+
+    fallback_mat = None
+    for obj in objects:
+        for slot in getattr(obj, "material_slots", []) or []:
+            mat = getattr(slot, "material", None)
+            if mat is not None:
+                fallback_mat = mat
+                break
+        if fallback_mat is not None:
+            break
+
+    if fallback_mat is not None or not create_name:
+        return fallback_mat
+
+    target_obj = objects[0] if objects else None
+    if target_obj is None:
+        return None
+    mat = bpy.data.materials.new(create_name)
+    target_obj.data.materials.append(mat)
+    return mat
+
+
 def _get_selected_roadway_material(context):
     cs = getattr(getattr(context, "scene", None), "cray_collider_settings", None)
     if cs is None:
@@ -5447,7 +6330,105 @@ def _get_selected_fire_geometry_material(context, *, create_name: str = ""):
 
     fire_obj = _resolve_fire_geometry_object_for_material(context)
     selected_name = getattr(cs, "fire_geometry_material", "") or ""
-    return _get_selected_material_from_object(fire_obj, selected_name, create_name=create_name)
+    objects = _collider_material_selection_objects(context, "fire_geometry_object", fire_obj) if fire_obj is not None else []
+    if not objects and fire_obj is not None:
+        objects = [fire_obj]
+    return _get_selected_material_from_objects(objects, selected_name, create_name=create_name)
+
+
+def _material_slot_indices_for_material(obj, material):
+    if obj is None or getattr(obj, "type", None) != "MESH" or material is None:
+        return set()
+    target_name = (getattr(material, "name", "") or "").strip().lower()
+    indices = set()
+    for idx, slot in enumerate(getattr(obj, "material_slots", []) or []):
+        mat = getattr(slot, "material", None)
+        if mat is None:
+            continue
+        if mat == material or ((getattr(mat, "name", "") or "").strip().lower() == target_name and target_name):
+            indices.add(idx)
+    return indices
+
+
+def _select_material_faces_in_objects(context, objects, material):
+    objects = [
+        obj for obj in objects or []
+        if obj is not None and getattr(obj, "type", None) == "MESH" and getattr(obj, "data", None) is not None
+    ]
+    if not objects or material is None:
+        return {"objects": 0, "faces": 0}
+
+    objects = [
+        obj for obj in objects
+        if _ensure_object_selectable_in_view_layer(context, obj)
+    ]
+    if not objects:
+        return {"objects": 0, "faces": 0}
+
+    if context.mode != "OBJECT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+    _deselect_all_in_view_layer(context)
+    selected_objects = []
+    selected_faces = 0
+    slot_indices_by_object = {}
+    for obj in objects:
+        slot_indices = _material_slot_indices_for_material(obj, material)
+        if not slot_indices:
+            continue
+        object_selected_faces = 0
+        for poly in getattr(obj.data, "polygons", []) or []:
+            if int(getattr(poly, "material_index", 0) or 0) in slot_indices:
+                object_selected_faces += 1
+        if object_selected_faces <= 0:
+            continue
+        for poly in getattr(obj.data, "polygons", []) or []:
+            poly.select = False
+        try:
+            obj.data.update()
+        except Exception:
+            pass
+        _select_object_in_view_layer(context, obj)
+        selected_objects.append(obj)
+        selected_faces += object_selected_faces
+        try:
+            slot_indices_by_object[obj.as_pointer()] = slot_indices
+        except Exception:
+            slot_indices_by_object[id(obj)] = slot_indices
+
+    if selected_objects:
+        _select_object_in_view_layer(context, selected_objects[0], active=True)
+        bpy.ops.object.mode_set(mode="EDIT")
+        try:
+            context.tool_settings.mesh_select_mode = (False, False, True)
+        except Exception:
+            pass
+        try:
+            bpy.ops.mesh.select_mode(type="FACE")
+        except Exception:
+            pass
+        for obj in selected_objects:
+            try:
+                slot_indices = slot_indices_by_object.get(obj.as_pointer(), set())
+            except Exception:
+                slot_indices = slot_indices_by_object.get(id(obj), set())
+            if not slot_indices:
+                continue
+            try:
+                bm = bmesh.from_edit_mesh(obj.data)
+                bm.faces.ensure_lookup_table()
+                for vert in bm.verts:
+                    vert.select_set(False)
+                for edge in bm.edges:
+                    edge.select_set(False)
+                for face in bm.faces:
+                    face.select_set(int(face.material_index) in slot_indices)
+                bm.select_flush_mode()
+                bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+            except Exception:
+                pass
+    _tag_redraw_all_areas(context)
+    return {"objects": len(selected_objects), "faces": selected_faces}
 
 
 def _apply_collider_visual_style(target_obj):
@@ -5553,17 +6534,49 @@ def _is_existing_collider_target_for_lod(obj, lod_token) -> bool:
     expected_name = _logical_collection_name(_collider_lod_name(lod_token))
     return _logical_collection_name(getattr(obj, "name", "") or "") == expected_name
 
-def _ensure_collider_lod_object(context, source_obj, lod_token, preferred_obj=None, exclude_obj=None):
+
+def _allow_collider_exp_in_place_target_exp(source_obj, lod_token) -> bool:
+    if (
+        source_obj is None
+        or getattr(source_obj, "type", None) != "MESH"
+        or getattr(source_obj, "mode", "") != "EDIT"
+    ):
+        return False
+    if _is_collider_lod_mesh_object(source_obj, lod_token=lod_token):
+        return True
+    expected_name = _logical_collection_name(_collider_lod_name(lod_token))
+    return (
+        _object_in_logical_collection(source_obj, _COLLIDER_COLLECTION_NAME)
+        and _logical_collection_name(getattr(source_obj, "name", "") or "") == expected_name
+    )
+
+
+def _ensure_collider_lod_object(
+    context,
+    source_obj,
+    lod_token,
+    preferred_obj=None,
+    exclude_obj=None,
+    allow_any_preferred_lod=False,
+    preserve_existing_lod=False,
+):
     collider_collection = _ensure_collider_collection(context, source_obj)
     if collider_collection is None:
         collider_collection = context.scene.collection
 
-    if (
+    preferred_is_usable = (
         preferred_obj != exclude_obj
-        and
-        _is_existing_collider_target_for_lod(preferred_obj, lod_token)
+        and (
+            _is_existing_collider_target_for_lod(preferred_obj, lod_token)
+            or (
+                allow_any_preferred_lod
+                and getattr(preferred_obj, "type", None) == "MESH"
+                and _collider_lod_token_from_object(preferred_obj, allow_name_fallback=True) in _COLLIDER_LOD_NAMES
+            )
+        )
         and _collection_directly_contains_object(collider_collection, preferred_obj)
-    ):
+    )
+    if preferred_is_usable:
         target_obj = preferred_obj
     else:
         target_obj = _pick_collider_lod_object(context, source_obj, lod_token, exclude_obj=exclude_obj)
@@ -5576,7 +6589,9 @@ def _ensure_collider_lod_object(context, source_obj, lod_token, preferred_obj=No
         if source_obj is not None:
             target_obj.matrix_world = source_obj.matrix_world.copy()
 
-    _set_collider_lod_a3ob_props(target_obj, lod_token)
+    existing_lod = _actual_collider_lod_token_from_object(target_obj)
+    if not (preserve_existing_lod and existing_lod in _COLLIDER_LOD_NAMES):
+        _set_collider_lod_a3ob_props(target_obj, lod_token)
     _apply_collider_visual_style(target_obj)
     _enable_collider_object_color_preview(context)
     return target_obj
@@ -5980,11 +6995,54 @@ def _build_clean_hull_data_from_local_points(local_points, merge_distance=0.0, r
         bm.free()
 
 
-def _replace_selection_with_clean_hull_in_edit_object(
+def _selected_face_islands_for_reconvex(bm):
+    allowed_faces = {face for face in bm.faces if face is not None and face.is_valid and not face.hide}
+    touched_faces = set()
+    for face in allowed_faces:
+        if face.select:
+            touched_faces.add(face)
+            continue
+        if any(edge.select for edge in face.edges if edge is not None and edge.is_valid):
+            touched_faces.add(face)
+            continue
+        if any(vert.select for vert in face.verts if vert is not None and vert.is_valid):
+            touched_faces.add(face)
+
+    islands = []
+    processed = set()
+    for seed_face in sorted(touched_faces, key=lambda item: item.index):
+        if seed_face in processed or seed_face not in allowed_faces:
+            continue
+        island = [
+            face for face in _collect_connected_face_island(seed_face, allowed_faces)
+            if face is not None and face.is_valid
+        ]
+        island_set = set(island)
+        processed.update(island_set)
+        if island_set.intersection(touched_faces):
+            islands.append(island)
+    return islands
+
+
+def _most_common_material_index_from_faces(faces):
+    counts = {}
+    for face in faces or []:
+        if face is None or not face.is_valid:
+            continue
+        idx = int(getattr(face, "material_index", 0) or 0)
+        counts[idx] = counts.get(idx, 0) + 1
+    if not counts:
+        return 0
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+
+def _replace_face_islands_with_clean_hull_in_edit_object(
     context,
     target_obj,
     hull_data,
-    selected_geom,
+    island_faces,
+    *,
+    material_index=0,
     recalc_normals=True,
 ):
     if target_obj is None or target_obj.type != "MESH":
@@ -5998,22 +7056,51 @@ def _replace_selection_with_clean_hull_in_edit_object(
     bm.edges.ensure_lookup_table()
     bm.faces.ensure_lookup_table()
 
-    geom_to_delete = []
-    geom_to_delete.extend(selected_geom.get("faces", []))
-    geom_to_delete.extend(selected_geom.get("edges", []))
-    geom_to_delete.extend(selected_geom.get("verts", []))
-    if geom_to_delete:
-        _delete_bmesh_geom(bm, geom_to_delete)
+    faces_to_delete = [face for face in island_faces or [] if face is not None and face.is_valid]
+    if not faces_to_delete:
+        raise RuntimeError("No selected component faces to replace")
 
+    old_edges = {
+        edge for face in faces_to_delete
+        for edge in face.edges
+        if edge is not None and edge.is_valid
+    }
+    old_verts = {
+        vert for face in faces_to_delete
+        for vert in face.verts
+        if vert is not None and vert.is_valid
+    }
+    before_vert_count = len(bm.verts)
+    before_face_count = len(bm.faces)
+
+    bmesh.ops.delete(bm, geom=faces_to_delete, context="FACES")
     bm.verts.ensure_lookup_table()
     bm.edges.ensure_lookup_table()
     bm.faces.ensure_lookup_table()
 
-    new_verts = [bm.verts.new(point) for point in hull_data["verts"]]
+    loose_edges = [edge for edge in old_edges if edge.is_valid and len(edge.link_faces) == 0]
+    if loose_edges:
+        bmesh.ops.delete(bm, geom=loose_edges, context="EDGES")
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+
+    loose_verts = [
+        vert for vert in old_verts
+        if vert.is_valid and len(vert.link_edges) == 0 and len(vert.link_faces) == 0
+    ]
+    if loose_verts:
+        bmesh.ops.delete(bm, geom=loose_verts, context="VERTS")
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+
+    new_verts = [bm.verts.new(point.copy()) for point in hull_data.get("verts", [])]
     bm.verts.ensure_lookup_table()
 
+    material_index = max(0, int(material_index or 0))
     new_faces = []
-    for face_indices in hull_data["faces"]:
+    for face_indices in hull_data.get("faces", []):
         face_verts = [new_verts[idx] for idx in face_indices if 0 <= idx < len(new_verts)]
         if len(face_verts) < 3 or len(set(face_verts)) < 3:
             continue
@@ -6021,17 +7108,21 @@ def _replace_selection_with_clean_hull_in_edit_object(
             face = bm.faces.new(face_verts)
         except ValueError:
             continue
+        try:
+            face.material_index = material_index
+        except Exception:
+            pass
         new_faces.append(face)
 
     if not new_faces:
-        raise RuntimeError("Could not write clean convex hull back to the mesh")
+        raise RuntimeError("Could not write re-convex hull back to the mesh")
 
     if recalc_normals:
         bmesh.ops.recalc_face_normals(bm, faces=new_faces)
 
     _select_only_faces_in_bmesh(bm, new_faces)
     bm.normal_update()
-    bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=True)
+    _flush_edit_mesh_normals_after_bmesh_write(context, mesh)
     if context.mode == "EDIT_MESH":
         try:
             bpy.ops.mesh.select_mode(type="FACE")
@@ -6039,8 +7130,13 @@ def _replace_selection_with_clean_hull_in_edit_object(
             pass
 
     return {
+        "verts_before": before_vert_count,
+        "faces_before": before_face_count,
+        "verts_after": len(bm.verts),
+        "faces_after": len(bm.faces),
         "verts_added": len(new_verts),
         "faces_added": len(new_faces),
+        "faces_removed": len(faces_to_delete),
     }
 
 
@@ -6342,16 +7438,7 @@ def _activate_object_vertex_edit(context, obj, selected_indices=None):
         bpy.ops.object.mode_set(mode="OBJECT")
 
     _deselect_all_in_view_layer(context)
-    try:
-        obj.hide_set(False)
-    except Exception:
-        pass
-    try:
-        obj.hide_viewport = False
-    except Exception:
-        pass
-    obj.select_set(True)
-    context.view_layer.objects.active = obj
+    _select_object_in_view_layer(context, obj, active=True)
     bpy.ops.object.mode_set(mode="EDIT")
     bpy.ops.mesh.select_mode(type="VERT")
 
@@ -6374,46 +7461,9 @@ def _activate_object_edit_mode(context, obj, select_mode="VERT"):
         bpy.ops.object.mode_set(mode="OBJECT")
 
     _deselect_all_in_view_layer(context)
-    try:
-        obj.hide_set(False)
-    except Exception:
-        pass
-    try:
-        obj.hide_viewport = False
-    except Exception:
-        pass
-    obj.select_set(True)
-    context.view_layer.objects.active = obj
+    _select_object_in_view_layer(context, obj, active=True)
     bpy.ops.object.mode_set(mode="EDIT")
     bpy.ops.mesh.select_mode(type=select_mode)
-
-
-def _delete_loose_vertices_by_local_keys(target_obj, local_keys, tolerance=1e-6):
-    if target_obj is None or target_obj.type != "MESH" or not local_keys:
-        return 0
-
-    mesh = target_obj.data
-    bm = bmesh.new()
-    try:
-        bm.from_mesh(mesh)
-        remove_verts = [
-            vert for vert in bm.verts
-            if vert.is_valid
-            and len(vert.link_edges) == 0
-            and len(vert.link_faces) == 0
-            and _vector_quantized_key(vert.co, tolerance) in local_keys
-        ]
-        if not remove_verts:
-            return 0
-
-        removed_count = len(remove_verts)
-        bmesh.ops.delete(bm, geom=remove_verts, context="VERTS")
-        bm.normal_update()
-        bm.to_mesh(mesh)
-        mesh.update(calc_edges=True)
-        return removed_count
-    finally:
-        bm.free()
 
 
 def _build_convex_hull_from_loose_geometry_verts(context, target_obj, merge_distance=0.0, recalc_normals=True):
@@ -6676,15 +7726,947 @@ def _try_restore_edit_mode(context, obj):
     if bpy.data.objects.get(obj.name) is None:
         return
     try:
-        if context.view_layer.objects.active != obj:
-            context.view_layer.objects.active = obj
-        obj.select_set(True)
+        _select_object_in_view_layer(context, obj, active=True)
     except Exception:
         pass
     try:
         bpy.ops.object.mode_set(mode="EDIT")
     except Exception:
         pass
+
+
+def _resolve_fake_terrain_source_object(context, settings):
+    candidates = []
+    for obj in (
+        getattr(settings, "fake_terrain_source_object", None),
+        getattr(settings, "source_object", None),
+        getattr(getattr(context, "view_layer", None), "objects", None).active
+        if getattr(context, "view_layer", None) is not None
+        else None,
+    ):
+        if obj is not None and obj not in candidates:
+            candidates.append(obj)
+
+    for obj in getattr(context, "selected_objects", []) or []:
+        if obj is not None and obj not in candidates:
+            candidates.append(obj)
+
+    target_obj = getattr(settings, "fake_terrain_target_object", None)
+    for obj in candidates:
+        if obj is None or getattr(obj, "type", None) != "MESH":
+            continue
+        if obj == target_obj:
+            continue
+        return obj
+    return None
+
+
+def _resolve_fake_terrain_preferred_target(context, settings, lod_token=None):
+    if settings is None:
+        return None
+
+    choice = str(getattr(settings, "fake_terrain_target_choice", "") or "")
+    choice_target = bpy.data.objects.get(choice) if choice and choice != _FAKE_TERRAIN_TARGET_NONE else None
+    candidates = []
+
+    for obj in (
+        getattr(settings, "fake_terrain_target_object", None),
+        choice_target,
+    ):
+        if obj is not None and obj not in candidates:
+            candidates.append(obj)
+
+    for _candidate_lod, obj in _fake_terrain_target_candidates(context, settings):
+        if obj is not None and obj not in candidates:
+            candidates.append(obj)
+
+    if str(lod_token or "") == _FIRE_GEOMETRY_LOD_TOKEN:
+        obj = getattr(settings, "fire_geometry_object", None)
+        if obj is not None and obj not in candidates:
+            candidates.append(obj)
+    obj = getattr(settings, "geometry_object", None)
+    if obj is not None and obj not in candidates:
+        candidates.append(obj)
+
+    root = _fake_terrain_context_root_collection(context, settings)
+    for obj in candidates:
+        if getattr(obj, "type", None) != "MESH":
+            continue
+        if root is not None:
+            try:
+                if not _object_is_directly_or_indirectly_in_collection(root, obj):
+                    continue
+            except Exception:
+                pass
+        obj_lod = _collider_lod_token_from_object(obj, allow_name_fallback=True)
+        if obj_lod not in _COLLIDER_LOD_NAMES:
+            continue
+        if lod_token is None or str(lod_token) == obj_lod:
+            return obj
+    return None
+
+
+def _fake_terrain_selected_face_indices(source_obj):
+    if source_obj is None or getattr(source_obj, "type", None) != "MESH":
+        raise RuntimeError("Source Visual must be a mesh")
+    if getattr(source_obj, "mode", "") != "EDIT":
+        raise RuntimeError("Enter Edit Mode on Source Visual and select terrain faces")
+
+    selected = _fake_terrain_selected_face_indices_if_edit(source_obj)
+    if not selected:
+        raise RuntimeError("Select terrain faces on Source Visual in Edit Mode")
+    return selected
+
+
+def _fake_terrain_selected_face_indices_if_edit(source_obj):
+    if source_obj is None or getattr(source_obj, "type", None) != "MESH":
+        return set()
+    if getattr(source_obj, "mode", "") != "EDIT":
+        return set()
+
+    try:
+        source_obj.update_from_editmode()
+    except Exception:
+        pass
+
+    selected = {
+        int(poly.index)
+        for poly in getattr(source_obj.data, "polygons", []) or []
+        if bool(getattr(poly, "select", False))
+    }
+    return selected
+
+
+def _collect_fake_terrain_source_triangles(source_obj, selected_face_indices):
+    if source_obj is None or getattr(source_obj, "type", None) != "MESH":
+        raise RuntimeError("Source Visual must be a mesh")
+
+    mesh = source_obj.data
+    matrix_world = source_obj.matrix_world.copy()
+    selected_face_indices = set(selected_face_indices or [])
+    if not selected_face_indices:
+        raise RuntimeError("Select terrain faces on Source Visual in Edit Mode")
+
+    triangles = []
+    matched_faces = 0
+
+    for poly in mesh.polygons:
+        if int(poly.index) not in selected_face_indices:
+            continue
+
+        verts = [matrix_world @ mesh.vertices[idx].co for idx in poly.vertices]
+        if len(verts) < 3:
+            continue
+
+        matched_faces += 1
+        material_index = int(getattr(poly, "material_index", 0) or 0)
+        for idx in range(1, len(verts) - 1):
+            tri = (verts[0].copy(), verts[idx].copy(), verts[idx + 1].copy())
+            if (tri[1] - tri[0]).cross(tri[2] - tri[0]).length_squared <= 1e-12:
+                continue
+            center = (tri[0] + tri[1] + tri[2]) / 3.0
+            triangles.append({
+                "points": tri,
+                "center": center,
+                "source_obj": source_obj,
+                "material_index": material_index,
+            })
+
+    return triangles, matched_faces
+
+
+def _fake_terrain_source_candidates(context, primary_source_obj, target_obj=None):
+    candidates = []
+
+    def add_candidate(obj):
+        if obj is None or getattr(obj, "type", None) != "MESH":
+            return
+        if target_obj is not None and obj == target_obj:
+            return
+        if obj not in candidates:
+            candidates.append(obj)
+
+    add_candidate(primary_source_obj)
+    for attr_name in ("objects_in_mode_unique_data", "objects_in_mode"):
+        for obj in getattr(context, attr_name, []) or []:
+            add_candidate(obj)
+    active_obj = (
+        getattr(getattr(context, "view_layer", None), "objects", None).active
+        if getattr(context, "view_layer", None) is not None
+        else None
+    )
+    add_candidate(active_obj)
+    for obj in getattr(context, "selected_objects", []) or []:
+        add_candidate(obj)
+    return candidates
+
+
+def _collect_fake_terrain_edit_selection_triangles(context, primary_source_obj, target_obj=None):
+    triangles = []
+    matched_faces = 0
+    source_objects = []
+
+    for obj in _fake_terrain_source_candidates(context, primary_source_obj, target_obj=target_obj):
+        selected_face_indices = _fake_terrain_selected_face_indices_if_edit(obj)
+        if not selected_face_indices:
+            continue
+        obj_triangles, obj_matched_faces = _collect_fake_terrain_source_triangles(obj, selected_face_indices)
+        if obj_matched_faces > 0:
+            matched_faces += obj_matched_faces
+            source_objects.append(obj)
+        if obj_triangles:
+            triangles.extend(obj_triangles)
+
+    if source_objects:
+        if not triangles:
+            raise RuntimeError("Selected source faces did not contain valid triangles")
+        return triangles, matched_faces, source_objects
+
+    selected_face_indices = _fake_terrain_selected_face_indices(primary_source_obj)
+    triangles, matched_faces = _collect_fake_terrain_source_triangles(primary_source_obj, selected_face_indices)
+    if not triangles:
+        raise RuntimeError("Selected source faces did not contain valid triangles")
+    return triangles, matched_faces, [primary_source_obj]
+
+
+def _fake_terrain_det3(rows):
+    return (
+        rows[0][0] * (rows[1][1] * rows[2][2] - rows[1][2] * rows[2][1])
+        - rows[0][1] * (rows[1][0] * rows[2][2] - rows[1][2] * rows[2][0])
+        + rows[0][2] * (rows[1][0] * rows[2][1] - rows[1][1] * rows[2][0])
+    )
+
+
+def _fake_terrain_solve3(matrix_rows, values):
+    det = _fake_terrain_det3(matrix_rows)
+    if abs(det) <= 1e-12:
+        return None
+
+    solved = []
+    for col in range(3):
+        rows = [list(row) for row in matrix_rows]
+        for row_idx in range(3):
+            rows[row_idx][col] = values[row_idx]
+        solved.append(_fake_terrain_det3(rows) / det)
+    return solved
+
+
+def _fake_terrain_fit_plane(points):
+    if not points:
+        return (0.0, 0.0, 0.0, 0.0, 0.0)
+
+    count = float(len(points))
+    origin_x = sum(point.x for point in points) / count
+    origin_y = sum(point.y for point in points) / count
+
+    sx2 = sy2 = sxy = sx = sy = 0.0
+    sxz = syz = sz = 0.0
+    for point in points:
+        x = point.x - origin_x
+        y = point.y - origin_y
+        sx2 += x * x
+        sy2 += y * y
+        sxy += x * y
+        sx += x
+        sy += y
+        sxz += x * point.z
+        syz += y * point.z
+        sz += point.z
+
+    rows = (
+        (sx2, sxy, sx),
+        (sxy, sy2, sy),
+        (sx, sy, count),
+    )
+    solution = _fake_terrain_solve3(rows, (sxz, syz, sz))
+    if solution is None:
+        avg_z = sz / count
+        return (origin_x, origin_y, 0.0, 0.0, avg_z)
+
+    return (origin_x, origin_y, float(solution[0]), float(solution[1]), float(solution[2]))
+
+
+def _fake_terrain_plane_z(plane, x, y) -> float:
+    origin_x, origin_y, slope_x, slope_y, offset_z = plane
+    return slope_x * (x - origin_x) + slope_y * (y - origin_y) + offset_z
+
+
+def _fake_terrain_unique_xy(points):
+    unique = {}
+    for point in points:
+        key = (round(float(point.x), 5), round(float(point.y), 5))
+        unique[key] = key
+    return sorted(unique.values())
+
+
+def _fake_terrain_cross_2d(origin, a, b) -> float:
+    return (a[0] - origin[0]) * (b[1] - origin[1]) - (a[1] - origin[1]) * (b[0] - origin[0])
+
+
+def _fake_terrain_convex_hull_xy(points_xy):
+    points = sorted(set(points_xy))
+    if len(points) <= 1:
+        return points
+
+    lower = []
+    for point in points:
+        while len(lower) >= 2 and _fake_terrain_cross_2d(lower[-2], lower[-1], point) <= 1e-10:
+            lower.pop()
+        lower.append(point)
+
+    upper = []
+    for point in reversed(points):
+        while len(upper) >= 2 and _fake_terrain_cross_2d(upper[-2], upper[-1], point) <= 1e-10:
+            upper.pop()
+        upper.append(point)
+
+    return lower[:-1] + upper[:-1]
+
+
+def _fake_terrain_polygon_area_xy(points_xy) -> float:
+    if len(points_xy) < 3:
+        return 0.0
+    area = 0.0
+    for idx, point in enumerate(points_xy):
+        nxt = points_xy[(idx + 1) % len(points_xy)]
+        area += point[0] * nxt[1] - nxt[0] * point[1]
+    return area * 0.5
+
+
+def _fake_terrain_polygon_area_from_vectors_xy(points) -> float:
+    if len(points) < 3:
+        return 0.0
+    area = 0.0
+    for idx, point in enumerate(points):
+        nxt = points[(idx + 1) % len(points)]
+        area += point.x * nxt.y - nxt.x * point.y
+    return area * 0.5
+
+
+def _fake_terrain_bbox_from_points_xy(points):
+    if not points:
+        return None
+    return (
+        min(point.x for point in points),
+        max(point.x for point in points),
+        min(point.y for point in points),
+        max(point.y for point in points),
+    )
+
+
+def _fake_terrain_bbox_from_xy(points_xy):
+    if not points_xy:
+        return None
+    return (
+        min(point[0] for point in points_xy),
+        max(point[0] for point in points_xy),
+        min(point[1] for point in points_xy),
+        max(point[1] for point in points_xy),
+    )
+
+
+def _fake_terrain_bbox_overlaps_rect_xy(bbox, x0, x1, y0, y1, eps=1e-8) -> bool:
+    if bbox is None:
+        return False
+    return (
+        min(float(bbox[1]), float(x1)) - max(float(bbox[0]), float(x0)) > eps
+        and min(float(bbox[3]), float(y1)) - max(float(bbox[2]), float(y0)) > eps
+    )
+
+
+def _fake_terrain_bbox_overlaps_bbox_xy(a, b, eps=1e-8) -> bool:
+    if a is None or b is None:
+        return False
+    return (
+        min(float(a[1]), float(b[1])) - max(float(a[0]), float(b[0])) > eps
+        and min(float(a[3]), float(b[3])) - max(float(a[2]), float(b[2])) > eps
+    )
+
+
+def _fake_terrain_polygon_area_2d(points_xy) -> float:
+    if len(points_xy) < 3:
+        return 0.0
+    area = 0.0
+    for idx, point in enumerate(points_xy):
+        nxt = points_xy[(idx + 1) % len(points_xy)]
+        area += point[0] * nxt[1] - nxt[0] * point[1]
+    return area * 0.5
+
+
+def _fake_terrain_clean_xy_polygon(points_xy, eps=1e-8):
+    cleaned = []
+    for point in points_xy:
+        item = (float(point[0]), float(point[1]))
+        if cleaned and abs(item[0] - cleaned[-1][0]) <= eps and abs(item[1] - cleaned[-1][1]) <= eps:
+            continue
+        cleaned.append(item)
+    if len(cleaned) > 1 and abs(cleaned[0][0] - cleaned[-1][0]) <= eps and abs(cleaned[0][1] - cleaned[-1][1]) <= eps:
+        cleaned.pop()
+    return cleaned
+
+
+
+def _fake_terrain_line_intersection_2d(a, b, c, d, eps=1e-12):
+    ax, ay = a
+    bx, by = b
+    cx, cy = c
+    dx, dy = d
+    sx = bx - ax
+    sy = by - ay
+    rx = dx - cx
+    ry = dy - cy
+    denom = sx * ry - sy * rx
+    if abs(denom) <= eps:
+        return b
+    factor = ((cx - ax) * ry - (cy - ay) * rx) / denom
+    factor = max(0.0, min(1.0, factor))
+    return (ax + sx * factor, ay + sy * factor)
+
+
+def _fake_terrain_clip_polygon_by_edge_2d(subject, edge_a, edge_b, eps=1e-8):
+    if not subject:
+        return []
+
+    ax, ay = edge_a
+    bx, by = edge_b
+
+    def inside(point):
+        return (bx - ax) * (point[1] - ay) - (by - ay) * (point[0] - ax) >= -eps
+
+    clipped = []
+    previous = subject[-1]
+    previous_inside = inside(previous)
+    for current in subject:
+        current_inside = inside(current)
+        if current_inside:
+            if not previous_inside:
+                clipped.append(_fake_terrain_line_intersection_2d(previous, current, edge_a, edge_b))
+            clipped.append(current)
+        elif previous_inside:
+            clipped.append(_fake_terrain_line_intersection_2d(previous, current, edge_a, edge_b))
+        previous = current
+        previous_inside = current_inside
+
+    return _fake_terrain_clean_xy_polygon(clipped, eps=eps)
+
+
+def _fake_terrain_polygon_overlap_area_xy(subject_xy, clip_xy):
+    subject = _fake_terrain_clean_xy_polygon(subject_xy)
+    clip = _fake_terrain_clean_xy_polygon(clip_xy)
+    if len(subject) < 3 or len(clip) < 3:
+        return 0.0
+    if _fake_terrain_polygon_area_2d(subject) < 0.0:
+        subject = list(reversed(subject))
+    if _fake_terrain_polygon_area_2d(clip) < 0.0:
+        clip = list(reversed(clip))
+
+    clipped = list(subject)
+    for idx, edge_a in enumerate(clip):
+        edge_b = clip[(idx + 1) % len(clip)]
+        clipped = _fake_terrain_clip_polygon_by_edge_2d(clipped, edge_a, edge_b)
+        if len(clipped) < 3:
+            return 0.0
+    return abs(_fake_terrain_polygon_area_2d(clipped))
+
+
+def _fake_terrain_clean_polygon_points(points, eps=1e-8):
+    cleaned = []
+    eps_sq = eps * eps
+    for point in points:
+        if cleaned and (point - cleaned[-1]).length_squared <= eps_sq:
+            continue
+        cleaned.append(point)
+    if len(cleaned) > 1 and (cleaned[0] - cleaned[-1]).length_squared <= eps_sq:
+        cleaned.pop()
+    return cleaned
+
+
+def _fake_terrain_clip_polygon_axis_xy(points, axis, limit, keep_greater, eps=1e-8):
+    if not points:
+        return []
+
+    limit = float(limit)
+
+    def coord(point):
+        return point.x if axis == 0 else point.y
+
+    def inside(point):
+        value = coord(point)
+        return value >= limit - eps if keep_greater else value <= limit + eps
+
+    def intersect(a, b):
+        delta = coord(b) - coord(a)
+        if abs(delta) <= eps:
+            point = b.copy()
+        else:
+            factor = max(0.0, min(1.0, (limit - coord(a)) / delta))
+            point = a.lerp(b, factor)
+        if axis == 0:
+            point.x = limit
+        else:
+            point.y = limit
+        return point
+
+    clipped = []
+    previous = points[-1]
+    previous_inside = inside(previous)
+    for current in points:
+        current_inside = inside(current)
+        if current_inside:
+            if not previous_inside:
+                clipped.append(intersect(previous, current))
+            clipped.append(current.copy())
+        elif previous_inside:
+            clipped.append(intersect(previous, current))
+        previous = current
+        previous_inside = current_inside
+
+    return _fake_terrain_clean_polygon_points(clipped, eps=eps)
+
+
+def _fake_terrain_clip_polygon_to_rect_xy(points, x0, x1, y0, y1):
+    clipped = [point.copy() for point in points]
+    clipped = _fake_terrain_clip_polygon_axis_xy(clipped, 0, x0, True)
+    clipped = _fake_terrain_clip_polygon_axis_xy(clipped, 0, x1, False)
+    clipped = _fake_terrain_clip_polygon_axis_xy(clipped, 1, y0, True)
+    clipped = _fake_terrain_clip_polygon_axis_xy(clipped, 1, y1, False)
+    if len(clipped) < 3 or abs(_fake_terrain_polygon_area_from_vectors_xy(clipped)) <= 1e-8:
+        return []
+    return clipped
+
+
+def _fake_terrain_clipped_cell_points(cell_tris, x0, x1, y0, y1):
+    points = []
+    for tri in cell_tris:
+        clipped = _fake_terrain_clip_polygon_to_rect_xy(tri["points"], x0, x1, y0, y1)
+        if clipped:
+            points.extend(clipped)
+    return points
+
+
+
+def _fake_terrain_hull_overlaps_occupied_bboxes(hull_xy, occupied_bboxes) -> bool:
+    hull_bbox = _fake_terrain_bbox_from_xy(hull_xy)
+    if hull_bbox is None:
+        return False
+    for item in occupied_bboxes:
+        if isinstance(item, dict):
+            bbox = item.get("bbox")
+            poly = item.get("poly")
+        else:
+            bbox = item
+            poly = None
+        if _fake_terrain_bbox_overlaps_bbox_xy(hull_bbox, bbox):
+            if poly is None:
+                return True
+            if _fake_terrain_polygon_overlap_area_xy(hull_xy, poly) > 1e-7:
+                return True
+    return False
+
+
+def _append_fake_terrain_component(world_vertices, faces, hull_xy, plane, thickness, z_by_xy=None):
+    if len(hull_xy) < 3:
+        return False
+
+    area = _fake_terrain_polygon_area_xy(hull_xy)
+    if abs(area) <= 1e-8:
+        return False
+    if area < 0.0:
+        hull_xy = list(reversed(hull_xy))
+
+    top_indices = []
+    bottom_indices = []
+    for x, y in hull_xy:
+        z = None
+        if z_by_xy:
+            z = z_by_xy.get((round(float(x), 5), round(float(y), 5)))
+        if z is None:
+            z = _fake_terrain_plane_z(plane, x, y)
+        top_indices.append(len(world_vertices))
+        world_vertices.append(Vector((x, y, z)))
+    for x, y in hull_xy:
+        z = None
+        if z_by_xy:
+            z = z_by_xy.get((round(float(x), 5), round(float(y), 5)))
+        if z is None:
+            z = _fake_terrain_plane_z(plane, x, y)
+        z -= thickness
+        bottom_indices.append(len(world_vertices))
+        world_vertices.append(Vector((x, y, z)))
+
+    center_x = sum(x for x, _y in hull_xy) / len(hull_xy)
+    center_y = sum(y for _x, y in hull_xy) / len(hull_xy)
+    center_z = _fake_terrain_plane_z(plane, center_x, center_y)
+    top_center_idx = len(world_vertices)
+    world_vertices.append(Vector((center_x, center_y, center_z)))
+    bottom_center_idx = len(world_vertices)
+    world_vertices.append(Vector((center_x, center_y, center_z - thickness)))
+
+    count = len(hull_xy)
+    for idx in range(count):
+        nxt = (idx + 1) % count
+        faces.append((top_center_idx, top_indices[idx], top_indices[nxt]))
+        faces.append((bottom_center_idx, bottom_indices[nxt], bottom_indices[idx]))
+        faces.append((top_indices[idx], bottom_indices[idx], bottom_indices[nxt], top_indices[nxt]))
+
+    return True
+
+
+def _dedupe_fake_terrain_mesh_vertices(world_vertices, faces, precision=5):
+    if not world_vertices or not faces:
+        return world_vertices, faces
+
+    vertex_map = {}
+    remap = {}
+    deduped_vertices = []
+    for old_index, point in enumerate(world_vertices):
+        key = (
+            round(float(point.x), precision),
+            round(float(point.y), precision),
+            round(float(point.z), precision),
+        )
+        new_index = vertex_map.get(key)
+        if new_index is None:
+            new_index = len(deduped_vertices)
+            vertex_map[key] = new_index
+            deduped_vertices.append(point.copy())
+        remap[old_index] = new_index
+
+    deduped_faces = []
+    seen_faces = set()
+    for face in faces:
+        remapped = []
+        for old_index in face:
+            new_index = remap.get(int(old_index))
+            if new_index is None:
+                continue
+            if remapped and remapped[-1] == new_index:
+                continue
+            remapped.append(new_index)
+        if len(remapped) > 1 and remapped[0] == remapped[-1]:
+            remapped.pop()
+        if len(set(remapped)) < 3:
+            continue
+        face_key = tuple(remapped)
+        reverse_key = tuple(reversed(remapped))
+        if face_key in seen_faces or reverse_key in seen_faces:
+            continue
+        seen_faces.add(face_key)
+        deduped_faces.append(tuple(remapped))
+
+    return deduped_vertices, deduped_faces
+
+
+
+
+
+
+
+
+
+
+
+def _build_fake_terrain_mesh_from_triangles(
+    triangles,
+    *,
+    patch_size,
+    min_patch_size,
+    depression_error,
+    hill_error,
+    thickness,
+    existing_footprint_bboxes=None,
+):
+    if not triangles:
+        raise RuntimeError("No matching source faces found for fake terrain")
+
+    patch_size = max(float(patch_size), 0.25)
+    min_patch_size = max(0.05, min(float(min_patch_size), patch_size))
+    depression_error = max(0.0, float(depression_error))
+    hill_error = max(0.0, float(hill_error))
+    thickness = max(0.05, float(thickness))
+
+    all_points = [point for tri in triangles for point in tri["points"]]
+    min_x = min(point.x for point in all_points)
+    min_y = min(point.y for point in all_points)
+
+    tiles = {}
+    for tri in triangles:
+        bbox = _fake_terrain_bbox_from_points_xy(tri["points"])
+        if bbox is None:
+            continue
+        tri["bbox_xy"] = bbox
+        ix0 = int(math.floor((bbox[0] - min_x) / patch_size))
+        ix1 = int(math.floor((bbox[1] - min_x) / patch_size))
+        iy0 = int(math.floor((bbox[2] - min_y) / patch_size))
+        iy1 = int(math.floor((bbox[3] - min_y) / patch_size))
+        for ix in range(ix0, ix1 + 1):
+            x0 = min_x + ix * patch_size
+            x1 = x0 + patch_size
+            for iy in range(iy0, iy1 + 1):
+                y0 = min_y + iy * patch_size
+                y1 = y0 + patch_size
+                if _fake_terrain_bbox_overlaps_rect_xy(bbox, x0, x1, y0, y1):
+                    tiles.setdefault((ix, iy), []).append(tri)
+
+    world_vertices = []
+    faces = []
+    occupied_bboxes = list(existing_footprint_bboxes or [])
+    stats = {
+        "components": 0,
+        "source_tris": len(triangles),
+        "split_cells": 0,
+        "max_depth": 0,
+        "existing_footprints": len(occupied_bboxes),
+        "skipped_existing": 0,
+        "build_mode": "GRID_PATCHES",
+    }
+
+    def build_cell(cell_tris, x0, x1, y0, y1, depth):
+        if not cell_tris:
+            return
+
+        points = _fake_terrain_clipped_cell_points(cell_tris, x0, x1, y0, y1)
+        unique_xy = _fake_terrain_unique_xy(points)
+        if len(unique_xy) < 3:
+            return
+        z_values_by_xy = {}
+        for point in points:
+            key = (round(float(point.x), 5), round(float(point.y), 5))
+            z_values_by_xy.setdefault(key, []).append(float(point.z))
+        z_by_xy = {
+            key: sum(values) / len(values)
+            for key, values in z_values_by_xy.items()
+            if values
+        }
+
+        plane = _fake_terrain_fit_plane(points)
+        max_depression = 0.0
+        max_hill = 0.0
+        for point in points:
+            patch_z = _fake_terrain_plane_z(plane, point.x, point.y)
+            max_depression = max(max_depression, patch_z - point.z)
+            max_hill = max(max_hill, point.z - patch_z)
+
+        size_x = max(0.0, x1 - x0)
+        size_y = max(0.0, y1 - y0)
+        size = max(size_x, size_y)
+        should_split = (
+            len(cell_tris) > 1
+            and size > min_patch_size * 1.01
+            and (max_depression > depression_error or max_hill > hill_error)
+            and depth < 16
+        )
+
+        if should_split:
+            mx = (x0 + x1) * 0.5
+            my = (y0 + y1) * 0.5
+            children = [[], [], [], []]
+            child_bounds = (
+                (x0, mx, y0, my),
+                (mx, x1, y0, my),
+                (x0, mx, my, y1),
+                (mx, x1, my, y1),
+            )
+            for tri in cell_tris:
+                bbox = tri.get("bbox_xy") or _fake_terrain_bbox_from_points_xy(tri["points"])
+                for child_idx, bounds in enumerate(child_bounds):
+                    if _fake_terrain_bbox_overlaps_rect_xy(bbox, bounds[0], bounds[1], bounds[2], bounds[3]):
+                        children[child_idx].append(tri)
+
+            stats["split_cells"] += 1
+            for child_tris, bounds in zip(children, child_bounds):
+                if child_tris:
+                    build_cell(child_tris, bounds[0], bounds[1], bounds[2], bounds[3], depth + 1)
+            return
+
+        hull_xy = _fake_terrain_convex_hull_xy(unique_xy)
+        if _fake_terrain_hull_overlaps_occupied_bboxes(hull_xy, occupied_bboxes):
+            stats["skipped_existing"] += 1
+            return
+        if _append_fake_terrain_component(world_vertices, faces, hull_xy, plane, thickness, z_by_xy=z_by_xy):
+            stats["components"] += 1
+            stats["max_depth"] = max(stats["max_depth"], depth)
+            bbox = _fake_terrain_bbox_from_xy(hull_xy)
+            if bbox is not None:
+                occupied_bboxes.append({"bbox": bbox, "poly": list(hull_xy)})
+
+    for (ix, iy), tile_tris in tiles.items():
+        x0 = min_x + ix * patch_size
+        y0 = min_y + iy * patch_size
+        build_cell(tile_tris, x0, x0 + patch_size, y0, y0 + patch_size, 0)
+
+    if not world_vertices or not faces or stats["components"] <= 0:
+        if stats["skipped_existing"] > 0:
+            stats["verts"] = 0
+            stats["faces"] = 0
+            return [], [], stats
+        raise RuntimeError("Could not build fake terrain components from the matched faces")
+
+    # Keep slab vertices separate across patch boundaries. Sharing identical
+    # coordinates here would weld adjacent fake terrain slabs into one connected
+    # component in Blender.
+    if not world_vertices or not faces:
+        raise RuntimeError("Could not build valid fake terrain faces")
+
+    stats["verts"] = len(world_vertices)
+    stats["faces"] = len(faces)
+    return world_vertices, faces, stats
+
+
+class CRAY_OT_GenerateFakeTerrainGeometry(Operator):
+    """Generate closed fake terrain components from selected visual terrain faces"""
+
+    bl_idname = "cray.generate_fake_terrain_geometry"
+    bl_label = "Generate Fake Terrain Geometry"
+    bl_description = "Build adaptive closed fake terrain slabs from selected Source Visual faces in Edit Mode"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        cs = context.scene.cray_collider_settings
+        source_obj = _resolve_fake_terrain_source_object(context, cs)
+        if source_obj is None or source_obj.type != "MESH":
+            self.report({"ERROR"}, "Set Source Visual to the terrain mesh")
+            return {"CANCELLED"}
+
+        preferred_target = _resolve_fake_terrain_preferred_target(context, cs)
+        if preferred_target is not None:
+            lod_token = _collider_lod_token_from_object(preferred_target, allow_name_fallback=True)
+        else:
+            lod_token = str(getattr(cs, "fake_terrain_target_lod", "") or _FIRE_GEOMETRY_LOD_TOKEN)
+        if lod_token not in _COLLIDER_LOD_NAMES:
+            self.report({"ERROR"}, "Target LOD must be Geometry, View Geometry, or Fire Geometry")
+            return {"CANCELLED"}
+
+        preferred_any_lod = (
+            getattr(preferred_target, "type", None) == "MESH"
+            and _collider_lod_token_from_object(preferred_target, allow_name_fallback=True) in _COLLIDER_LOD_NAMES
+        )
+
+        err = _collider_target_validation_error(
+            preferred_target,
+            lod_token,
+            source_obj=source_obj,
+            allow_any_collider_lod=preferred_any_lod,
+        )
+        if err:
+            self.report({"ERROR"}, err)
+            return {"CANCELLED"}
+
+        try:
+            source_was_edit = getattr(source_obj, "mode", "") == "EDIT"
+            source_tris, matched_faces, source_objects = _collect_fake_terrain_edit_selection_triangles(
+                context,
+                source_obj,
+                target_obj=preferred_target,
+            )
+            if context.mode != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+
+            target_obj = _ensure_collider_lod_object(
+                context,
+                source_obj,
+                lod_token,
+                preferred_obj=preferred_target,
+                exclude_obj=source_obj,
+                allow_any_preferred_lod=preferred_any_lod,
+                preserve_existing_lod=preferred_any_lod,
+            )
+            if target_obj == source_obj:
+                raise RuntimeError("Target LOD Object must be separate from the Source Visual")
+            actual_target_lod = _collider_lod_token_from_object(target_obj, allow_name_fallback=True) or lod_token
+
+            _set_fake_terrain_target_object(context, cs, target_obj, sync_choice=True)
+            _set_collider_settings_object(context, "geometry_object", target_obj)
+            if actual_target_lod == _FIRE_GEOMETRY_LOD_TOKEN:
+                _set_collider_settings_object(context, "fire_geometry_object", target_obj)
+                _sync_fire_geometry_material_selection(context)
+
+            exp_settings = getattr(context.scene, "cray_collider_exp_settings", None)
+            if exp_settings is not None:
+                try:
+                    exp_settings.geometry_object = target_obj
+                    exp_settings.target_lod = actual_target_lod
+                except Exception:
+                    pass
+
+            material_index, material_name = _ensure_collider_placeholder_material(
+                target_obj,
+                source_obj,
+                source_objects=source_objects,
+                data_items=source_tris,
+            )
+            existing_footprints = []
+            world_vertices, faces, build_stats = _build_fake_terrain_mesh_from_triangles(
+                source_tris,
+                patch_size=cs.fake_terrain_patch_size,
+                min_patch_size=cs.fake_terrain_min_patch_size,
+                depression_error=cs.fake_terrain_depression_error,
+                hill_error=cs.fake_terrain_hill_error,
+                thickness=cs.fake_terrain_thickness,
+                existing_footprint_bboxes=existing_footprints,
+            )
+            if not world_vertices or not faces:
+                self.report(
+                    {"INFO"},
+                    (
+                        f"No new fake terrain added to {target_obj.name}: "
+                        f"{build_stats.get('skipped_existing', 0)} patch(es) already overlap target geometry"
+                    ),
+                )
+                _restore_collider_exp_source_context_exp(context, source_obj, restore_edit_mode=source_was_edit)
+                return {"FINISHED"}
+            append_stats = _append_collider_exp_mesh_to_object_exp(
+                target_obj,
+                world_vertices,
+                faces,
+                merge_distance=0.0,
+                recalc_normals=True,
+                material_index=material_index,
+            )
+            source_obj_for_props = source_objects[0] if source_objects else source_obj
+            _set_collider_exp_custom_props_exp(
+                target_obj,
+                "FAKE_TERRAIN",
+                source_obj_for_props,
+                {
+                    "vertex_indices": append_stats.get("vertex_indices", []),
+                    "face_indices": append_stats.get("face_indices", []),
+                    "source_object": source_obj_for_props.name,
+                    "source_objects": [obj.name for obj in source_objects],
+                    "source_mode": "SELECTED_FACES",
+                    "build_mode": build_stats.get("build_mode", "GRID_PATCHES"),
+                    "selected_faces": matched_faces,
+                    "target_lod": actual_target_lod,
+                    "material_name": material_name,
+                    "components": build_stats.get("components", 0),
+                    "existing_footprints": build_stats.get("existing_footprints", 0),
+                    "skipped_existing": build_stats.get("skipped_existing", 0),
+                    "matched_faces": matched_faces,
+                    "source_tris": build_stats.get("source_tris", 0),
+                    "patch_size": float(cs.fake_terrain_patch_size),
+                    "min_patch_size": float(cs.fake_terrain_min_patch_size),
+                    "depression_error": float(cs.fake_terrain_depression_error),
+                    "hill_error": float(cs.fake_terrain_hill_error),
+                    "thickness": float(cs.fake_terrain_thickness),
+                },
+            )
+
+            _restore_collider_exp_source_context_exp(context, source_obj, restore_edit_mode=source_was_edit)
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        self.report(
+            {"INFO"},
+            (
+                f"Fake terrain added to {target_obj.name}: "
+                f"{build_stats.get('components', 0)} components, "
+                f"+{append_stats.get('verts_added', 0)} verts, +{append_stats.get('faces_added', 0)} faces, "
+                f"from {matched_faces} selected face(s), "
+                f"skipped {build_stats.get('skipped_existing', 0)} occupied patch(es)"
+            ),
+        )
+        return {"FINISHED"}
 
 
 class CRAY_OT_CopySelectedVertsToGeometry(Operator):
@@ -6806,15 +8788,61 @@ class CRAY_OT_ColliderHotkeysInfo(Operator):
     @classmethod
     def description(cls, context, properties):
         del context, properties
-        return (
-            "Ctrl+Shift+C: Copy Selected Verts To Geometry\n"
-            "Ctrl+Shift+X: Select Isolated Verts\n"
-            "Mouse4: Selection -> Hull\n"
-            "Mouse5: Selection -> Box"
-        )
+        lines = []
+        for operator_idname, action, default_shortcut, status_key in _CUSTOM_KEYBIND_DEFINITIONS:
+            shortcut = _keymap_item_shortcut_label(
+                _find_nh_keymap_item(operator_idname),
+                default_shortcut,
+            )
+            if status_key == "plain_axis" and not _PLAIN_AXIS_HOTKEY_REGISTERED:
+                shortcut = f"{shortcut} (busy)"
+            lines.append(f"{shortcut}: {action}")
+        return "\n".join(lines)
 
     def execute(self, context):
         del context
+        return {"FINISHED"}
+
+
+class CRAY_OT_OpenNHKeymapPreferences(Operator):
+    """Open Blender preferences where NH Plugin keymaps can be edited"""
+
+    bl_idname = "cray.open_nh_keymap_preferences"
+    bl_label = "Open Blender Keymap"
+    bl_description = "Open Edit > Preferences > Keymap; search for cray or NH actions to change these shortcuts"
+    bl_options = {"INTERNAL"}
+
+    def execute(self, context):
+        try:
+            context.preferences.active_section = "KEYMAP"
+        except Exception:
+            pass
+        try:
+            bpy.ops.screen.userpref_show("INVOKE_DEFAULT")
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class CRAY_OT_RestoreNHDefaultKeymaps(Operator):
+    """Restore NH Plugin collider keymaps to their bundled defaults"""
+
+    bl_idname = "cray.restore_nh_default_keymaps"
+    bl_label = "Restore NH Defaults"
+    bl_description = "Restore NH Plugin default collider shortcuts in the Blender add-on keymap"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        del context
+        try:
+            removed = _remove_nh_keymap_user_overrides()
+            _register_collider_keymaps()
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+        suffix = f" ({removed} user override(s) cleared)" if removed else ""
+        self.report({"INFO"}, f"NH default keymaps restored{suffix}")
         return {"FINISHED"}
 
 
@@ -6887,6 +8915,55 @@ class CRAY_OT_SetColliderTargetFromActive(Operator):
         return {"FINISHED"}
 
 
+class CRAY_OT_SetFakeTerrainTargetFromActive(Operator):
+    """Use the active selected Geometry/View/Fire mesh as the Fake Terrain target"""
+
+    bl_idname = "cray.set_fake_terrain_target_from_active"
+    bl_label = "Use Active Fake Terrain Target"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        cs = context.scene.cray_collider_settings
+        objects = []
+
+        active = getattr(getattr(context, "view_layer", None), "objects", None)
+        active_obj = getattr(active, "active", None) if active is not None else None
+        if active_obj is not None:
+            objects.append(active_obj)
+        for obj in getattr(context, "selected_objects", []) or []:
+            if obj is not None and obj not in objects:
+                objects.append(obj)
+
+        target_obj = None
+        for obj in objects:
+            if obj is None or getattr(obj, "type", None) != "MESH":
+                continue
+            if _collider_lod_token_from_object(obj, allow_name_fallback=True) in _COLLIDER_LOD_NAMES:
+                target_obj = obj
+                break
+
+        if target_obj is None:
+            self.report({"ERROR"}, "Select a Geometry, View Geometry, or Fire Geometry mesh first")
+            return {"CANCELLED"}
+
+        root = _fake_terrain_context_root_collection(context, cs)
+        if root is not None:
+            try:
+                if not _object_is_directly_or_indirectly_in_collection(root, target_obj):
+                    self.report({"ERROR"}, f"Target must be inside current model collection '{root.name}'")
+                    return {"CANCELLED"}
+            except Exception:
+                pass
+
+        if not _set_fake_terrain_target_object(context, cs, target_obj, sync_choice=True):
+            self.report({"ERROR"}, "Active mesh must be Geometry, View Geometry, or Fire Geometry")
+            return {"CANCELLED"}
+
+        lod_name = _collider_lod_name(_collider_lod_token_from_object(target_obj, allow_name_fallback=True))
+        self.report({"INFO"}, f"Fake Terrain target set to {lod_name}: {target_obj.name}")
+        return {"FINISHED"}
+
+
 class CRAY_OT_EnsureRoadwayLOD(Operator):
     """Create or find the Roadway LOD mesh inside Misc collection"""
 
@@ -6953,7 +9030,6 @@ class CRAY_OT_CopySelectedFacesToRoadway(Operator):
                 recalc_normals=bool(cs.recalc_normals),
                 weld_distance=cs.roadway_weld_distance,
             )
-            _activate_object_edit_mode(context, roadway_obj, select_mode="FACE")
         except Exception as e:
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
@@ -7005,18 +9081,18 @@ class CRAY_OT_WeldRoadwayVertices(Operator):
 
 
 class CRAY_OT_OpenRoadwayMaterialFolder(Operator):
-    """Pick a roadway material file inside Blender and assign it to the selected Roadway material"""
+    """Pick a roadway texture file inside Blender and assign it to the selected Roadway material"""
 
     bl_idname = "cray.open_roadway_material_folder"
-    bl_label = "Choose Roadway Material Path"
+    bl_label = "Choose Roadway Texture Path"
     bl_options = {"REGISTER", "UNDO"}
 
     filepath: StringProperty(
-        name="Material File",
-        description="Choose an .rvmat or .paa file for the selected Roadway material",
+        name="Texture File",
+        description="Choose a texture file for the selected Roadway material",
         subtype="FILE_PATH",
     )
-    filter_glob: StringProperty(default="*.rvmat;*.paa", options={"HIDDEN"})
+    filter_glob: StringProperty(default="*.paa;*.dds", options={"HIDDEN"})
 
     def invoke(self, context, event):
         del event
@@ -7051,17 +9127,15 @@ class CRAY_OT_OpenRoadwayMaterialFolder(Operator):
             return {"CANCELLED"}
 
         if not filepath or not os.path.isfile(filepath):
-            self.report({"ERROR"}, "Choose an existing .rvmat or .paa file")
+            self.report({"ERROR"}, "Choose an existing .paa or .dds texture file")
             return {"CANCELLED"}
 
         ext = os.path.splitext(filepath)[1].lower()
         try:
-            if ext == ".rvmat":
-                _set_a3ob_material_paths(mat, None, _norm_path(filepath))
-            elif ext == ".paa":
-                _set_a3ob_material_paths(mat, _norm_path(filepath), None)
+            if ext in {".paa", ".dds"}:
+                _set_a3ob_material_paths(mat, _norm_path(filepath), None, clear_rvmat=True)
             else:
-                self.report({"ERROR"}, "Unsupported file type. Choose .rvmat or .paa")
+                self.report({"ERROR"}, "Unsupported file type. Choose .paa or .dds")
                 return {"CANCELLED"}
         except Exception as e:
             self.report({"ERROR"}, _fmt_exc(e))
@@ -7075,10 +9149,7 @@ class CRAY_OT_OpenRoadwayMaterialFolder(Operator):
                 pass
 
         _sync_roadway_material_selection(context, mat.name)
-        if ext == ".rvmat":
-            self.report({"INFO"}, f"Assigned .rvmat to roadway material: {mat.name}")
-        else:
-            self.report({"INFO"}, f"Assigned .paa to roadway material: {mat.name}")
+        self.report({"INFO"}, f"Assigned texture to Roadway material: {mat.name}")
         return {"FINISHED"}
 
 
@@ -7142,7 +9213,7 @@ class CRAY_OT_OpenFireGeometryRvmatFolder(Operator):
             return {"CANCELLED"}
 
         try:
-            _set_a3ob_material_paths(mat, None, _norm_path(filepath))
+            _set_a3ob_material_paths(mat, None, _norm_path(filepath), clear_paa=True)
         except Exception as e:
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
@@ -7154,6 +9225,61 @@ class CRAY_OT_OpenFireGeometryRvmatFolder(Operator):
 
         _sync_fire_geometry_material_selection(context, mat.name)
         self.report({"INFO"}, f"Assigned Fire Geometry .rvmat: {mat.name}")
+        return {"FINISHED"}
+
+
+class CRAY_OT_SelectColliderMaterialFaces(Operator):
+    """Select faces that use the currently chosen collider material"""
+
+    bl_idname = "cray.select_collider_material_faces"
+    bl_label = "Select Material Faces"
+    bl_options = {"REGISTER", "UNDO"}
+
+    target_attr: EnumProperty(
+        name="Target",
+        items=(
+            ("FIRE", "Fire Geometry", "Select Fire Geometry faces with the chosen material"),
+            ("ROADWAY", "Roadway", "Select Roadway faces with the chosen material"),
+        ),
+        default="FIRE",
+    )
+
+    def execute(self, context):
+        target_attr = str(getattr(self, "target_attr", "FIRE") or "FIRE")
+        cs = getattr(getattr(context, "scene", None), "cray_collider_settings", None)
+        if target_attr == "ROADWAY":
+            target_obj = getattr(cs, "roadway_object", None) if cs is not None else None
+            material = _get_selected_roadway_material(context)
+            object_attr = "roadway_object"
+            label = "Roadway"
+        else:
+            target_obj = _resolve_fire_geometry_object_for_material(context)
+            material = _get_selected_fire_geometry_material(context)
+            object_attr = "fire_geometry_object"
+            label = "Fire Geometry"
+
+        if target_obj is None or getattr(target_obj, "type", None) != "MESH":
+            self.report({"ERROR"}, f"{label} object must be a mesh")
+            return {"CANCELLED"}
+        if material is None:
+            self.report({"ERROR"}, f"Select or create a {label} material first")
+            return {"CANCELLED"}
+
+        objects = _collider_material_selection_objects(context, object_attr, target_obj)
+
+        try:
+            stats = _select_material_faces_in_objects(context, objects, material)
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        if int(stats.get("faces", 0)) <= 0:
+            self.report({"WARNING"}, f"No faces use material '{material.name}'")
+            return {"CANCELLED"}
+        self.report(
+            {"INFO"},
+            f"Selected {stats['faces']} face(s) using '{material.name}' on {stats['objects']} object(s)",
+        )
         return {"FINISHED"}
 
 
@@ -7291,6 +9417,36 @@ class CRAY_OT_SelectLooseVerticesOutsideMemory(Operator):
         return {"FINISHED"}
 
 
+class CRAY_OT_ReportNgonMeshes(Operator):
+    """Print all scene mesh objects that contain n-gons"""
+
+    bl_idname = "cray.report_ngon_meshes"
+    bl_label = "Report N-gon Meshes"
+    bl_description = "Print scene mesh objects that contain faces with more than 4 vertices"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        try:
+            records = _collect_scene_ngon_mesh_records(context)
+        except Exception as e:
+            self.report({"ERROR"}, f"N-gon scan failed: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+
+        _report_scene_ngon_mesh_records_in_console(context, records)
+
+        if not records:
+            self.report({"INFO"}, "No n-gons found in scene mesh objects")
+            return {"FINISHED"}
+
+        total_ngons = sum(int(rec.get("ngon_count", 0) or 0) for rec in records)
+        first_path = records[0].get("display_path") or records[0].get("object_name", "<unknown>")
+        self.report(
+            {"WARNING"},
+            f"Found {total_ngons} n-gon face(s) in {len(records)} mesh object(s); first: {first_path} has n-gons (see System Console)",
+        )
+        return {"FINISHED"}
+
+
 def _iter_split_planar_candidate_faces(bm):
     visible_faces = [face for face in bm.faces if face.is_valid and not face.hide]
     if not visible_faces:
@@ -7340,36 +9496,6 @@ def _split_planar_face_matches_seed_plane(face, plane_point, plane_normal, cos_l
             return False
     return True
 
-
-def _collect_split_planar_region(seed_face, allowed_faces, cos_limit, plane_tolerance):
-    plane_normal = seed_face.normal.copy()
-    if plane_normal.length_squared <= 1e-12 or len(seed_face.verts) < 3:
-        return []
-    plane_normal.normalize()
-    plane_point = seed_face.verts[0].co.copy()
-
-    region_faces = []
-    region_set = {seed_face}
-    stack = [seed_face]
-
-    while stack:
-        face = stack.pop()
-        region_faces.append(face)
-        for edge in face.edges:
-            for neighbor in edge.link_faces:
-                if neighbor == face or neighbor not in allowed_faces or neighbor in region_set:
-                    continue
-                if _split_planar_face_matches_seed_plane(
-                    neighbor,
-                    plane_point,
-                    plane_normal,
-                    cos_limit,
-                    plane_tolerance,
-                ):
-                    region_set.add(neighbor)
-                    stack.append(neighbor)
-
-    return region_faces
 
 
 def _collect_connected_face_island(seed_face, allowed_faces):
@@ -7452,28 +9578,6 @@ def _split_planar_region_is_thin(region_faces, plane_point, plane_normal, cos_li
                 return False
     return True
 
-
-def _add_split_region_match(matches_by_signature, region_faces, boundary_edges, boundary_verts, match_kind):
-    face_set = {face for face in region_faces if face is not None and face.is_valid}
-    if not face_set:
-        return False
-
-    signature = frozenset(face_set)
-    existing = matches_by_signature.get(signature)
-    if existing is None:
-        matches_by_signature[signature] = {
-            "faces": list(face_set),
-            "boundary_edges": [edge for edge in boundary_edges if edge is not None and edge.is_valid],
-            "boundary_verts": [vert for vert in boundary_verts if vert is not None and vert.is_valid],
-            "kind": match_kind,
-        }
-        return True
-
-    if existing.get("kind") != "tiny" and match_kind == "tiny":
-        existing["kind"] = "tiny"
-    elif existing.get("kind") not in {"tiny", "coplanar"} and match_kind == "coplanar":
-        existing["kind"] = "coplanar"
-    return False
 
 
 def _classify_split_planar_region_edges(region_faces):
@@ -7595,6 +9699,17 @@ def _select_face_island_matches(bm, matches):
         vert.select = True
 
     bm.select_flush_mode()
+
+
+def _ngon_faces_from_bmesh(bm, *, selected_only=False):
+    faces = []
+    for face in bm.faces:
+        if face is None or not face.is_valid or len(face.verts) <= 4:
+            continue
+        if selected_only and not face.select:
+            continue
+        faces.append(face)
+    return faces
 
 
 def _find_small_trash_face_islands(bm):
@@ -7808,6 +9923,140 @@ class CRAY_OT_SelectCoplanarPlateIslands(Operator):
         return {"FINISHED"}
 
 
+class CRAY_OT_SelectNgonFaces(Operator):
+    """Select all n-gon faces on the active edit mesh"""
+
+    bl_idname = "cray.select_ngon_faces"
+    bl_label = "Find N-gons"
+    bl_description = "In Edit Mode, select all faces with more than 4 vertices on the active mesh"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            context.mode == "EDIT_MESH"
+            and obj is not None
+            and obj.type == "MESH"
+            and obj.mode == "EDIT"
+        )
+
+    def execute(self, context):
+        obj = context.active_object
+        if obj is None or obj.type != "MESH" or context.mode != "EDIT_MESH" or obj.mode != "EDIT":
+            self.report({"ERROR"}, "Active object must be a mesh in Edit Mode")
+            return {"CANCELLED"}
+
+        mesh = obj.data
+        bm = bmesh.from_edit_mesh(mesh)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+
+        ngons = _ngon_faces_from_bmesh(bm)
+        if not ngons:
+            self.report({"WARNING"}, "No n-gons found on active mesh")
+            return {"CANCELLED"}
+
+        context.tool_settings.mesh_select_mode = (False, False, True)
+        for face in bm.faces:
+            face.select_set(False)
+        for edge in bm.edges:
+            edge.select_set(False)
+        for vert in bm.verts:
+            vert.select_set(False)
+        for face in ngons:
+            face.select_set(True)
+        bm.select_flush_mode()
+        bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=False)
+
+        max_sides = max(len(face.verts) for face in ngons)
+        self.report({"INFO"}, f"Selected {len(ngons)} n-gon face(s), max sides: {max_sides}")
+        return {"FINISHED"}
+
+
+class CRAY_OT_TriangulateNgonFaces(Operator):
+    """Triangulate selected n-gons, or all n-gons if none are selected"""
+
+    bl_idname = "cray.triangulate_ngon_faces"
+    bl_label = "Triangulate N-gons"
+    bl_description = (
+        "In Edit Mode, triangulate selected n-gons. "
+        "If no selected n-gons exist, triangulate all n-gons on the active mesh"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            context.mode == "EDIT_MESH"
+            and obj is not None
+            and obj.type == "MESH"
+            and obj.mode == "EDIT"
+        )
+
+    def execute(self, context):
+        obj = context.active_object
+        if obj is None or obj.type != "MESH" or context.mode != "EDIT_MESH" or obj.mode != "EDIT":
+            self.report({"ERROR"}, "Active object must be a mesh in Edit Mode")
+            return {"CANCELLED"}
+
+        mesh = obj.data
+        bm = bmesh.from_edit_mesh(mesh)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+
+        selected_ngons = _ngon_faces_from_bmesh(bm, selected_only=True)
+        if selected_ngons:
+            ngons = selected_ngons
+            scope_label = "selected"
+        else:
+            ngons = _ngon_faces_from_bmesh(bm)
+            scope_label = "all"
+
+        if not ngons:
+            self.report({"WARNING"}, "No n-gons found to triangulate")
+            return {"CANCELLED"}
+
+        affected_vert_sets = [set(face.verts) for face in ngons if face.is_valid]
+
+        try:
+            bmesh.ops.triangulate(
+                bm,
+                faces=ngons,
+                quad_method="BEAUTY",
+                ngon_method="BEAUTY",
+            )
+        except Exception as e:
+            self.report({"ERROR"}, f"Failed to triangulate n-gons: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+
+        bm.faces.ensure_lookup_table()
+        for face in bm.faces:
+            face.select_set(False)
+        selected_triangles = 0
+        for face in bm.faces:
+            if not face.is_valid or len(face.verts) != 3:
+                continue
+            face_verts = set(face.verts)
+            if any(face_verts.issubset(source_verts) for source_verts in affected_vert_sets):
+                face.select_set(True)
+                selected_triangles += 1
+
+        context.tool_settings.mesh_select_mode = (False, False, True)
+        bm.select_flush_mode()
+        bm.normal_update()
+        bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
+
+        self.report(
+            {"INFO"},
+            f"Triangulated {len(ngons)} {scope_label} n-gon face(s) into {selected_triangles} triangle(s)",
+        )
+        return {"FINISHED"}
+
+
 class CRAY_OT_EnsureColliderLOD(Operator):
     """Create or find the Geometry LOD object and move it into the Geometries collection"""
 
@@ -7841,11 +10090,10 @@ class CRAY_OT_EnsureColliderLOD(Operator):
             pass
         if context.mode == "OBJECT" and source_obj is None:
             _deselect_all_in_view_layer(context)
-            target_obj.select_set(True)
-            context.view_layer.objects.active = target_obj
+            _select_object_in_view_layer(context, target_obj, active=True)
         elif context.mode == "OBJECT" and previous_active is not None:
             try:
-                context.view_layer.objects.active = previous_active
+                _select_object_in_view_layer(context, previous_active, active=True)
             except Exception:
                 pass
         self.report({"INFO"}, f"Collider LOD ready: {target_obj.name}")
@@ -8019,6 +10267,8 @@ _COLLIDER_EXP_TYPE_PROP = "nh_collider_exp_type"
 _COLLIDER_EXP_SOURCE_PROP = "nh_collider_exp_source"
 _COLLIDER_EXP_UUID_PROP = "nh_collider_exp_uuid"
 _COLLIDER_EXP_PARAMS_PROP = "nh_collider_exp_params"
+_COLLIDER_EXP_HISTORY_PROP = "nh_collider_exp_history"
+_COLLIDER_EXP_HISTORY_LIMIT = 30
 _COLLIDER_EXP_GUIDE_PROP = "nh_collider_exp_guide_type"
 _COLLIDER_EXP_GUIDE_SOURCE_PROP = "nh_collider_exp_guide_source"
 _COLLIDER_EXP_COMMON_PROPS = (
@@ -8032,12 +10282,14 @@ _COLLIDER_EXP_COMMON_PROPS = (
     "offset_z",
     "floor_contact",
     "minimum_size",
+    "normal_minimum_size",
     "merge_distance",
     "recalc_normals",
 )
 _COLLIDER_EXP_PERSISTENT_OPERATOR_PROPS = {
     "target_lod",
     "minimum_size",
+    "normal_minimum_size",
 }
 _COLLIDER_EXP_BOX_FACES = (
     (0, 3, 2, 1),
@@ -8171,6 +10423,8 @@ def _draw_collider_exp_common_operator_props_exp(layout, op):
     )
     if hasattr(op, "minimum_size"):
         box.prop(op, "minimum_size")
+    if hasattr(op, "normal_minimum_size"):
+        box.prop(op, "normal_minimum_size")
     if hasattr(op, "floor_contact"):
         box.prop(op, "floor_contact")
     if hasattr(op, "merge_distance"):
@@ -8234,11 +10488,22 @@ def _ensure_collider_exp_target_object_exp(context, settings, source_obj, op=Non
 
     lod_token = str(getattr(op, "target_lod", getattr(settings, "target_lod", "6")) or "6")
     preferred_obj = _sanitize_collider_exp_geometry_object_exp(context, settings)
-    if preferred_obj == source_obj:
+    allow_in_place_source = _allow_collider_exp_in_place_target_exp(source_obj, lod_token)
+    if preferred_obj == source_obj and not allow_in_place_source:
         preferred_obj = None
-    if not _is_existing_collider_target_for_lod(preferred_obj, lod_token):
+    preferred_any_lod = (
+        getattr(preferred_obj, "type", None) == "MESH"
+        and _collider_lod_token_from_object(preferred_obj, allow_name_fallback=True) in _COLLIDER_LOD_NAMES
+    )
+    if not preferred_any_lod and not _is_existing_collider_target_for_lod(preferred_obj, lod_token):
         preferred_obj = None
-    err = _collider_target_validation_error(preferred_obj, lod_token, source_obj=source_obj)
+    err = _collider_target_validation_error(
+        preferred_obj,
+        lod_token,
+        source_obj=source_obj,
+        allow_same_source=allow_in_place_source,
+        allow_any_collider_lod=preferred_any_lod,
+    )
     if err:
         raise RuntimeError(err)
 
@@ -8247,7 +10512,9 @@ def _ensure_collider_exp_target_object_exp(context, settings, source_obj, op=Non
         source_obj,
         lod_token,
         preferred_obj=preferred_obj,
-        exclude_obj=source_obj,
+        exclude_obj=None if allow_in_place_source else source_obj,
+        allow_any_preferred_lod=preferred_any_lod,
+        preserve_existing_lod=preferred_any_lod,
     )
     _set_collider_exp_settings_object_exp(context, target_obj)
     try:
@@ -8260,6 +10527,26 @@ def _ensure_collider_exp_target_object_exp(context, settings, source_obj, op=Non
     except Exception:
         pass
     return target_obj
+
+
+def _restore_collider_exp_source_context_exp(context, source_obj, restore_edit_mode=False):
+    if not _is_live_blender_object_exp(source_obj) or getattr(source_obj, "type", None) != "MESH":
+        return
+    try:
+        if context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+    except Exception:
+        pass
+    try:
+        _deselect_all_in_view_layer(context)
+        _select_object_in_view_layer(context, source_obj, active=True)
+    except Exception:
+        return
+    if restore_edit_mode:
+        try:
+            bpy.ops.object.mode_set(mode="EDIT")
+        except Exception:
+            pass
 
 
 def _collider_exp_guide_source_object_exp(context, guide_obj, settings=None):
@@ -8298,19 +10585,6 @@ def _resolve_collider_exp_guide_creation_source_exp(context, settings):
         source_obj = _collider_exp_guide_source_object_exp(context, source_obj, settings)
     return source_obj
 
-
-def _require_collider_exp_guide_source_exp(op, context, settings, guide_type):
-    source_obj = _resolve_collider_exp_source_object_exp(
-        context,
-        getattr(settings, "source_object", None) if settings is not None else None,
-    )
-    if not _is_collider_exp_guide_object_exp(source_obj, guide_type):
-        op.report({"ERROR"}, f"Select an NH {guide_type.title()} Guide first")
-        return None, None
-    target_source_obj = _collider_exp_guide_source_object_exp(context, source_obj, settings)
-    if target_source_obj is None:
-        target_source_obj = source_obj
-    return source_obj, target_source_obj
 
 
 def _collider_exp_vec_from_props_exp(op, prefix):
@@ -8362,6 +10636,328 @@ def _bounds_from_points_exp(points):
     return min_v, max_v
 
 
+def _safe_normalized_vector_exp(vec):
+    if vec is None:
+        return None
+    try:
+        if vec.length_squared <= 1e-12:
+            return None
+        out = vec.copy()
+        out.normalize()
+        return out
+    except Exception:
+        return None
+
+
+def _average_vector_exp(points):
+    if not points:
+        return Vector((0.0, 0.0, 0.0))
+    total = Vector((0.0, 0.0, 0.0))
+    for point in points:
+        total += point
+    return total / len(points)
+
+
+def _cluster_points_by_projection_exp(points, axis, span, diagonal):
+    if not points:
+        return []
+    projected = sorted((float(point.dot(axis)), point) for point in points)
+    tol = max(float(span) * 0.035, float(diagonal) * 1e-5, 1e-6)
+    clusters = []
+    current = [projected[0][1]]
+    last_projection = projected[0][0]
+    for projection, point in projected[1:]:
+        if abs(projection - last_projection) <= tol:
+            current.append(point)
+        else:
+            clusters.append(current)
+            current = [point]
+        last_projection = projection
+    clusters.append(current)
+    return clusters
+
+
+def _candidate_ring_axis_score_exp(points, axis, diagonal):
+    axis = _safe_normalized_vector_exp(axis)
+    if axis is None:
+        return None
+    projections = [float(point.dot(axis)) for point in points]
+    span = max(projections) - min(projections)
+    if span <= max(diagonal * 1e-5, 1e-6):
+        return None
+    clusters = _cluster_points_by_projection_exp(points, axis, span, diagonal)
+    if len(clusters) < 2:
+        return None
+    first = clusters[0]
+    last = clusters[-1]
+    if len(first) < 3 or len(last) < 3:
+        return None
+    center_first = _average_vector_exp(first)
+    center_last = _average_vector_exp(last)
+    depth_axis = _safe_normalized_vector_exp(center_last - center_first)
+    if depth_axis is None:
+        return None
+    if depth_axis.dot(axis) < 0.0:
+        depth_axis.negate()
+    center = (center_first + center_last) * 0.5
+    ring_points = list(first) + list(last)
+    radial_vectors = [
+        point - center - depth_axis * ((point - center).dot(depth_axis))
+        for point in ring_points
+    ]
+    radial_vectors = [vec for vec in radial_vectors if vec.length_squared > 1e-12]
+    if len(radial_vectors) < 3:
+        return None
+    axis_a = max(radial_vectors, key=lambda vec: vec.length_squared)
+    axis_a = _safe_normalized_vector_exp(axis_a)
+    if axis_a is None:
+        return None
+    axis_b = _safe_normalized_vector_exp(depth_axis.cross(axis_a))
+    if axis_b is None:
+        return None
+    axis_a = _safe_normalized_vector_exp(axis_b.cross(depth_axis))
+    if axis_a is None:
+        return None
+    radius_a = max(abs(vec.dot(axis_a)) for vec in radial_vectors)
+    radius_b = max(abs(vec.dot(axis_b)) for vec in radial_vectors)
+    if min(radius_a, radius_b) <= max(diagonal * 1e-5, 1e-6):
+        return None
+    depth = (center_last - center_first).length
+    min_ring_count = min(len(first), len(last))
+    middle_count = max(0, len(points) - len(first) - len(last))
+    score = (
+        min_ring_count,
+        len(first) + len(last),
+        depth,
+        -middle_count,
+    )
+    return {
+        "score": score,
+        "center": center,
+        "axis_a": axis_a,
+        "axis_b": axis_b,
+        "depth_axis": depth_axis,
+        "radius_a": radius_a,
+        "radius_b": radius_b,
+        "depth": depth,
+        "edge_count": min_ring_count,
+        "ignored_between_rings": middle_count,
+    }
+
+
+def _add_unique_axis_candidate_exp(candidates, axis):
+    axis = _safe_normalized_vector_exp(axis)
+    if axis is None:
+        return
+    for existing in candidates:
+        if abs(existing.dot(axis)) > 0.9975:
+            return
+    candidates.append(axis)
+
+
+def _radial_direction_count_for_profile_exp(radial_vectors, axis_a, axis_b):
+    keys = set()
+    for vec in radial_vectors:
+        u = float(vec.dot(axis_a))
+        v = float(vec.dot(axis_b))
+        if (u * u + v * v) <= 1e-12:
+            continue
+        angle = (math.atan2(v, u) + (2.0 * math.pi)) % (2.0 * math.pi)
+        keys.add(int(round(angle / (2.0 * math.pi) * 4096.0)) % 4096)
+    return len(keys)
+
+
+def _candidate_cylinder_axis_profile_exp(points, axis, diagonal):
+    axis = _safe_normalized_vector_exp(axis)
+    if axis is None or len(points) < 4:
+        return None
+
+    projected = sorted((float(point.dot(axis)), point) for point in points)
+    min_projection = projected[0][0]
+    max_projection = projected[-1][0]
+    span = max_projection - min_projection
+    if span <= max(float(diagonal) * 1e-5, 1e-6):
+        return None
+
+    end_tolerance = max(span * 0.06, float(diagonal) * 1e-5, 1e-6)
+    first = [point for projection, point in projected if projection <= min_projection + end_tolerance]
+    last = [point for projection, point in projected if projection >= max_projection - end_tolerance]
+    minimum_end_points = 2 if len(points) >= 6 else 1
+    if len(first) < minimum_end_points or len(last) < minimum_end_points:
+        pick_count = max(minimum_end_points, min(max(1, len(points) // 8), 12))
+        first = [point for _projection, point in projected[:pick_count]]
+        last = [point for _projection, point in projected[-pick_count:]]
+
+    center_first = _average_vector_exp(first)
+    center_last = _average_vector_exp(last)
+    depth_axis = _safe_normalized_vector_exp(center_last - center_first)
+    if depth_axis is None:
+        center_all = _average_vector_exp(points)
+        center_first = center_all + axis * (min_projection - float(center_all.dot(axis)))
+        center_last = center_all + axis * (max_projection - float(center_all.dot(axis)))
+        depth_axis = axis
+    if depth_axis.dot(axis) < 0.0:
+        depth_axis.negate()
+
+    depth = (center_last - center_first).length
+    if depth <= max(float(diagonal) * 1e-5, 1e-6):
+        return None
+
+    center = (center_first + center_last) * 0.5
+    radial_vectors = []
+    radial_lengths = []
+    for point in points:
+        offset = point - center
+        radial = offset - depth_axis * float(offset.dot(depth_axis))
+        length = radial.length
+        if length <= max(float(diagonal) * 1e-6, 1e-8):
+            continue
+        radial_vectors.append(radial)
+        radial_lengths.append(length)
+    if len(radial_vectors) < 3:
+        return None
+
+    axis_a = _safe_normalized_vector_exp(max(radial_vectors, key=lambda vec: vec.length_squared))
+    if axis_a is None:
+        return None
+    axis_b = _safe_normalized_vector_exp(depth_axis.cross(axis_a))
+    if axis_b is None:
+        return None
+    axis_a = _safe_normalized_vector_exp(axis_b.cross(depth_axis))
+    if axis_a is None:
+        return None
+
+    radius_a = max(abs(float(vec.dot(axis_a))) for vec in radial_vectors)
+    radius_b = max(abs(float(vec.dot(axis_b))) for vec in radial_vectors)
+    min_radius = max(float(diagonal) * 1e-5, 1e-6)
+    if min(radius_a, radius_b) <= min_radius:
+        return None
+
+    avg_radius = sum(radial_lengths) / len(radial_lengths)
+    max_radius = max(radial_lengths)
+    min_radial = min(radial_lengths)
+    radial_spread = (max_radius - min_radial) / max(avg_radius, min_radius)
+    ellipse_imbalance = abs(radius_a - radius_b) / max((radius_a + radius_b) * 0.5, min_radius)
+    edge_count = max(4, min(_radial_direction_count_for_profile_exp(radial_vectors, axis_a, axis_b), 128))
+    min_end_count = min(len(first), len(last))
+    min_reliable_end_count = max(3, min(12, int(math.ceil(edge_count * 0.35))))
+    if min_end_count < min_reliable_end_count:
+        return None
+    score = (
+        min_end_count,
+        len(first) + len(last),
+        -radial_spread,
+        -ellipse_imbalance,
+        depth / max(float(diagonal), 1e-6),
+    )
+    return {
+        "score": score,
+        "center": center,
+        "axis_a": axis_a,
+        "axis_b": axis_b,
+        "depth_axis": depth_axis,
+        "radius_a": radius_a,
+        "radius_b": radius_b,
+        "depth": depth,
+        "edge_count": edge_count,
+        "end_points_a": len(first),
+        "end_points_b": len(last),
+        "end_ring_ratio": min_end_count / max(float(edge_count), 1.0),
+    }
+
+
+def _inferred_cylinder_axis_profile_exp(data):
+    points = [point.copy() for point in (data.get("local_points") or [])]
+    if len(points) < 4:
+        return None
+
+    min_v, max_v = _bounds_from_points_exp(points)
+    size = max_v - min_v
+    diagonal = size.length
+    if diagonal <= 1e-8:
+        return None
+
+    candidates = []
+    try:
+        _add_unique_axis_candidate_exp(candidates, _collider_exp_principal_axis_exp(points))
+    except Exception:
+        pass
+
+    for axis_index in sorted(range(3), key=lambda idx: abs(size[idx]), reverse=True):
+        _add_unique_axis_candidate_exp(candidates, _axis_vector_exp(axis_index))
+
+    edge_vectors = sorted(
+        [
+            vec.copy() for vec in (data.get("edge_vectors_local") or [])
+            if getattr(vec, "length_squared", 0.0) > 1e-12
+        ],
+        key=lambda vec: vec.length_squared,
+        reverse=True,
+    )
+    for vec in edge_vectors[:24]:
+        _add_unique_axis_candidate_exp(candidates, vec)
+
+    best = None
+    for candidate in candidates:
+        scored = _candidate_cylinder_axis_profile_exp(points, candidate, diagonal)
+        if scored is None:
+            continue
+        if best is None or scored["score"] > best["score"]:
+            best = scored
+    if best is None:
+        return None
+    best.pop("score", None)
+    return best
+
+
+def _selected_two_ring_profile_exp(source_obj):
+    if source_obj is None or source_obj.type != "MESH" or source_obj.mode != "EDIT":
+        return None
+    bm = bmesh.from_edit_mesh(source_obj.data)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+
+    selected_verts = {vert for vert in bm.verts if vert.is_valid and vert.select}
+    for edge in bm.edges:
+        if edge.is_valid and edge.select:
+            selected_verts.update(vert for vert in edge.verts if vert.is_valid)
+    for face in bm.faces:
+        if face.is_valid and face.select:
+            selected_verts.update(vert for vert in face.verts if vert.is_valid)
+
+    points = [vert.co.copy() for vert in selected_verts]
+    if len(points) < 6:
+        return None
+    min_v, max_v = _bounds_from_points_exp(points)
+    diagonal = (max_v - min_v).length
+    if diagonal <= 1e-8:
+        return None
+
+    candidates = [
+        Vector((1.0, 0.0, 0.0)),
+        Vector((0.0, 1.0, 0.0)),
+        Vector((0.0, 0.0, 1.0)),
+        max_v - min_v,
+    ]
+    try:
+        candidates.append(_collider_exp_principal_axis_exp(points))
+    except Exception:
+        pass
+
+    best = None
+    for candidate in candidates:
+        scored = _candidate_ring_axis_score_exp(points, candidate, diagonal)
+        if scored is None:
+            continue
+        if best is None or scored["score"] > best["score"]:
+            best = scored
+    if best is None:
+        return None
+    best.pop("score", None)
+    return best
+
+
 def _selected_local_points_and_faces_exp(source_obj):
     bm = bmesh.from_edit_mesh(source_obj.data)
     selected_faces = [face for face in bm.faces if face.select and face.is_valid]
@@ -8398,14 +10994,22 @@ def _selected_local_points_and_faces_exp(source_obj):
         if edge.is_valid and len(edge.verts) == 2 and all(vert.is_valid for vert in edge.verts):
             _add_edge_vector(edge.verts[0], edge.verts[1])
 
-    for face in selected_faces:
-        if face.is_valid and face.verts:
-            face_centers.append(sum((vert.co for vert in face.verts), Vector((0.0, 0.0, 0.0))) / len(face.verts))
-            if face.normal.length_squared > 1e-12:
-                face_normals.append(face.normal.copy())
-            verts = [vert for vert in face.verts if vert.is_valid]
-            for idx, vert in enumerate(verts):
-                _add_edge_vector(vert, verts[(idx + 1) % len(verts)])
+    selected_topology_faces = []
+    for face in bm.faces:
+        if not face.is_valid or not face.verts:
+            continue
+        verts = [vert for vert in face.verts if vert.is_valid]
+        if not verts:
+            continue
+        if face.select or all(vert in selected_vert_set for vert in verts):
+            selected_topology_faces.append((face, verts))
+
+    for face, verts in selected_topology_faces:
+        face_centers.append(sum((vert.co for vert in verts), Vector((0.0, 0.0, 0.0))) / len(verts))
+        if face.normal.length_squared > 1e-12:
+            face_normals.append(face.normal.copy())
+        for idx, vert in enumerate(verts):
+            _add_edge_vector(vert, verts[(idx + 1) % len(verts)])
 
     return [vert.co.copy() for vert in selected_verts], face_centers, edge_vectors, face_normals
 
@@ -8448,10 +11052,6 @@ def _object_local_topology_exp(source_obj):
     return centers, edge_vectors, face_normals
 
 
-def _object_local_face_centers_exp(source_obj):
-    centers, _edge_vectors, _face_normals = _object_local_topology_exp(source_obj)
-    return centers
-
 
 def _collect_collider_exp_input_data_exp(context, source_obj, *, bounds_only=False):
     if source_obj is None or source_obj.type != "MESH":
@@ -8461,22 +11061,27 @@ def _collect_collider_exp_input_data_exp(context, source_obj, *, bounds_only=Fal
     face_centers = []
     edge_vectors = []
     face_normals = []
+    two_ring_profile = None
     if source_obj.mode == "EDIT":
+        two_ring_profile = _selected_two_ring_profile_exp(source_obj)
         local_points, face_centers, edge_vectors, face_normals = _selected_local_points_and_faces_exp(source_obj)
+        material_counts = _source_edit_selection_material_counts(source_obj)
     elif bounds_only:
         local_points = [Vector(corner) for corner in source_obj.bound_box]
+        material_counts = _source_object_material_counts(source_obj)
     else:
         local_points = [vert.co.copy() for vert in source_obj.data.vertices]
         face_centers, edge_vectors, face_normals = _object_local_topology_exp(source_obj)
         if not local_points:
             local_points = [Vector(corner) for corner in source_obj.bound_box]
+        material_counts = _source_object_material_counts(source_obj)
 
     if not local_points:
         raise RuntimeError("Source Object has no usable geometry")
 
     min_v, max_v = _bounds_from_points_exp(local_points)
     world_points = [matrix_world @ point for point in local_points]
-    return {
+    data = {
         "source_obj": source_obj,
         "matrix_world": matrix_world,
         "local_points": local_points,
@@ -8484,15 +11089,19 @@ def _collect_collider_exp_input_data_exp(context, source_obj, *, bounds_only=Fal
         "face_centers_local": face_centers,
         "edge_vectors_local": [vec.copy() for vec in edge_vectors],
         "face_normals_local": [normal.copy() for normal in face_normals],
+        "material_counts": dict(material_counts or {}),
         "min": min_v,
         "max": max_v,
         "center": (min_v + max_v) * 0.5,
         "size": max_v - min_v,
         "world_floor_z": min((point.z for point in world_points), default=0.0),
+        "two_ring_profile": two_ring_profile,
     }
+    data["cylinder_axis_profile"] = _inferred_cylinder_axis_profile_exp(data)
+    return data
 
 
-def _collider_exp_data_from_local_points_exp(source_obj, local_points, *, face_centers=None):
+def _collider_exp_data_from_local_points_exp(source_obj, local_points, *, face_centers=None, material_counts=None):
     if source_obj is None or source_obj.type != "MESH":
         raise RuntimeError("Source Object must be a mesh")
     if not local_points:
@@ -8501,7 +11110,7 @@ def _collider_exp_data_from_local_points_exp(source_obj, local_points, *, face_c
     matrix_world = source_obj.matrix_world.copy()
     min_v, max_v = _bounds_from_points_exp(local_points)
     world_points = [matrix_world @ point for point in local_points]
-    return {
+    data = {
         "source_obj": source_obj,
         "matrix_world": matrix_world,
         "local_points": [point.copy() for point in local_points],
@@ -8509,12 +11118,15 @@ def _collider_exp_data_from_local_points_exp(source_obj, local_points, *, face_c
         "face_centers_local": list(face_centers or []),
         "edge_vectors_local": [],
         "face_normals_local": [],
+        "material_counts": dict(material_counts or {}),
         "min": min_v,
         "max": max_v,
         "center": (min_v + max_v) * 0.5,
         "size": max_v - min_v,
         "world_floor_z": min((point.z for point in world_points), default=0.0),
     }
+    data["cylinder_axis_profile"] = _inferred_cylinder_axis_profile_exp(data)
+    return data
 
 
 def _collider_exp_all_object_data_exp(source_obj):
@@ -8524,6 +11136,7 @@ def _collider_exp_all_object_data_exp(source_obj):
     face_centers = []
     edge_vectors = []
     face_normals = []
+    material_counts = {}
     if source_obj.mode == "EDIT":
         bm = bmesh.from_edit_mesh(source_obj.data)
         bm.verts.ensure_lookup_table()
@@ -8536,6 +11149,8 @@ def _collider_exp_all_object_data_exp(source_obj):
                     edge_vectors.append(vec.copy())
         for face in bm.faces:
             if face.is_valid and face.verts:
+                material_index = int(getattr(face, "material_index", 0) or 0)
+                material_counts[material_index] = material_counts.get(material_index, 0) + 1
                 face_centers.append(sum((vert.co for vert in face.verts), Vector((0.0, 0.0, 0.0))) / len(face.verts))
                 if face.normal.length_squared > 1e-12:
                     face_normals.append(face.normal.copy())
@@ -8544,15 +11159,24 @@ def _collider_exp_all_object_data_exp(source_obj):
         face_centers, edge_vectors, face_normals = _object_local_topology_exp(source_obj)
         if not local_points:
             local_points = [Vector(corner) for corner in source_obj.bound_box]
+        material_counts = _source_object_material_counts(source_obj)
 
-    data = _collider_exp_data_from_local_points_exp(source_obj, local_points, face_centers=face_centers)
+    data = _collider_exp_data_from_local_points_exp(
+        source_obj,
+        local_points,
+        face_centers=face_centers,
+        material_counts=material_counts,
+    )
     data["edge_vectors_local"] = [vec.copy() for vec in edge_vectors]
     data["face_normals_local"] = [normal.copy() for normal in face_normals]
+    data["cylinder_axis_profile"] = _inferred_cylinder_axis_profile_exp(data)
     return data
 
 
 def _collider_exp_selected_source_objects_exp(context, settings):
     target_obj = _sanitize_collider_exp_geometry_object_exp(context, settings)
+    target_lod = str(getattr(settings, "target_lod", "6") or "6") if settings is not None else "6"
+    allow_target_as_source = _allow_collider_exp_in_place_target_exp(target_obj, target_lod)
     active = getattr(getattr(context, "view_layer", None), "objects", None)
     active_obj = getattr(active, "active", None) if active is not None else None
 
@@ -8560,7 +11184,7 @@ def _collider_exp_selected_source_objects_exp(context, settings):
         return (
             _is_live_blender_object_exp(obj)
             and getattr(obj, "type", None) == "MESH"
-            and obj != target_obj
+            and (obj != target_obj or allow_target_as_source)
             and not _is_collider_exp_guide_object_exp(obj)
         )
 
@@ -8712,7 +11336,8 @@ def _collider_exp_connect_duplicate_graph_points_exp(coords, adjacency, toleranc
         buckets.setdefault(key, []).append(index)
 
 
-def _collider_exp_connected_components_exp(source_obj, seed_indices=None, *, selected_only=False):
+
+def _collider_exp_connected_component_indices_exp(source_obj, seed_indices=None, *, selected_only=False):
     seeds = set(seed_indices or [])
     allowed = seeds if selected_only and seeds else None
     coords, adjacency = _collider_exp_mesh_graph_exp(source_obj, allowed_indices=allowed)
@@ -8737,8 +11362,94 @@ def _collider_exp_connected_components_exp(source_obj, seed_indices=None, *, sel
                 visited.add(nxt)
                 stack.append(nxt)
         if component.intersection(seed_filter):
-            components.append([coords[idx].copy() for idx in sorted(component)])
+            components.append(sorted(component))
     return components
+
+
+def _collider_exp_component_data_from_indices_exp(source_obj, component_indices):
+    indices = {int(idx) for idx in component_indices or []}
+    if source_obj is None or source_obj.type != "MESH" or not indices:
+        raise RuntimeError("Source Object has no usable component geometry")
+
+    local_points_by_index = {}
+    face_centers = []
+    edge_vectors = []
+    face_normals = []
+    material_counts = {}
+
+    if source_obj.mode == "EDIT":
+        bm = bmesh.from_edit_mesh(source_obj.data)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        bm.verts.index_update()
+
+        for vert in bm.verts:
+            if vert.is_valid and vert.index in indices:
+                local_points_by_index[int(vert.index)] = vert.co.copy()
+
+        for edge in bm.edges:
+            if not edge.is_valid or len(edge.verts) != 2:
+                continue
+            if all(vert.is_valid and int(vert.index) in indices for vert in edge.verts):
+                vec = edge.verts[1].co - edge.verts[0].co
+                if vec.length_squared > 1e-12:
+                    edge_vectors.append(vec.copy())
+
+        for face in bm.faces:
+            if not face.is_valid or not face.verts:
+                continue
+            verts = [vert for vert in face.verts if vert.is_valid]
+            if not verts or not all(int(vert.index) in indices for vert in verts):
+                continue
+            material_index = int(getattr(face, "material_index", 0) or 0)
+            material_counts[material_index] = material_counts.get(material_index, 0) + 1
+            face_centers.append(sum((vert.co for vert in verts), Vector((0.0, 0.0, 0.0))) / len(verts))
+            if face.normal.length_squared > 1e-12:
+                face_normals.append(face.normal.copy())
+            for idx, vert in enumerate(verts):
+                vec = verts[(idx + 1) % len(verts)].co - vert.co
+                if vec.length_squared > 1e-12:
+                    edge_vectors.append(vec.copy())
+    else:
+        mesh = source_obj.data
+        for vert in mesh.vertices:
+            idx = int(vert.index)
+            if idx in indices:
+                local_points_by_index[idx] = vert.co.copy()
+
+        for edge in mesh.edges:
+            a, b = (int(edge.vertices[0]), int(edge.vertices[1]))
+            if a in indices and b in indices and a in local_points_by_index and b in local_points_by_index:
+                vec = local_points_by_index[b] - local_points_by_index[a]
+                if vec.length_squared > 1e-12:
+                    edge_vectors.append(vec.copy())
+
+        for poly in mesh.polygons:
+            verts = [int(idx) for idx in poly.vertices]
+            if not verts or not all(idx in indices and idx in local_points_by_index for idx in verts):
+                continue
+            material_index = int(getattr(poly, "material_index", 0) or 0)
+            material_counts[material_index] = material_counts.get(material_index, 0) + 1
+            face_centers.append(sum((local_points_by_index[idx] for idx in verts), Vector((0.0, 0.0, 0.0))) / len(verts))
+            if poly.normal.length_squared > 1e-12:
+                face_normals.append(poly.normal.copy())
+            for idx, vert_idx in enumerate(verts):
+                vec = local_points_by_index[verts[(idx + 1) % len(verts)]] - local_points_by_index[vert_idx]
+                if vec.length_squared > 1e-12:
+                    edge_vectors.append(vec.copy())
+
+    local_points = [local_points_by_index[idx] for idx in sorted(local_points_by_index.keys())]
+    data = _collider_exp_data_from_local_points_exp(
+        source_obj,
+        local_points,
+        face_centers=face_centers,
+        material_counts=material_counts,
+    )
+    data["edge_vectors_local"] = [vec.copy() for vec in edge_vectors]
+    data["face_normals_local"] = [normal.copy() for normal in face_normals]
+    data["cylinder_axis_profile"] = _inferred_cylinder_axis_profile_exp(data)
+    return data
 
 
 def _collect_collider_exp_scope_input_data_exp(context, settings, *, bounds_only=False):
@@ -8760,19 +11471,19 @@ def _collect_collider_exp_scope_input_data_exp(context, settings, *, bounds_only
     elif mode == "PER_SHELLS":
         for source_obj in sources:
             selected = _collider_exp_selected_vertex_indices_exp(source_obj)
-            components = _collider_exp_connected_components_exp(source_obj, selected if selected else None)
-            for local_points in components:
-                data_items.append(_collider_exp_data_from_local_points_exp(source_obj, local_points))
+            components = _collider_exp_connected_component_indices_exp(source_obj, selected if selected else None)
+            for component_indices in components:
+                data_items.append(_collider_exp_component_data_from_indices_exp(source_obj, component_indices))
     elif mode == "PER_OBJECT_COMPONENTS":
         for source_obj in sources:
             selected = _collider_exp_selected_vertex_indices_exp(source_obj)
-            components = _collider_exp_connected_components_exp(
+            components = _collider_exp_connected_component_indices_exp(
                 source_obj,
                 selected if selected else None,
                 selected_only=bool(selected),
             )
-            for local_points in components:
-                data_items.append(_collider_exp_data_from_local_points_exp(source_obj, local_points))
+            for component_indices in components:
+                data_items.append(_collider_exp_component_data_from_indices_exp(source_obj, component_indices))
     else:
         source_obj = _resolve_collider_exp_guide_creation_source_exp(context, settings)
         if source_obj is None:
@@ -8788,8 +11499,31 @@ def _prepare_collider_exp_scope_build_exp(context, settings, op, *, bounds_only=
     data_items = _collect_collider_exp_scope_input_data_exp(context, settings, bounds_only=bounds_only)
     source_obj = data_items[0]["source_obj"]
     target_obj = _ensure_collider_exp_target_object_exp(context, settings, source_obj, op=op)
+    lod_token = str(getattr(op, "target_lod", getattr(settings, "target_lod", "6")) or "6")
     for data in data_items:
-        if target_obj == data.get("source_obj"):
+        data_source = data.get("source_obj")
+        if target_obj == data_source and not _allow_collider_exp_in_place_target_exp(data_source, lod_token):
+            raise RuntimeError("Target Geometry LOD must be separate from the Source Object")
+    return target_obj, source_obj, data_items
+
+
+def _prepare_collider_exp_direct_boxes_build_exp(context, settings, op, *, bounds_only=False):
+    mode = str(getattr(settings, "collider_scope", "FROM_SELECTED") or "FROM_SELECTED")
+    if mode == "FROM_SELECTED":
+        sources = _collider_exp_selected_source_objects_exp(context, settings)
+        if not sources:
+            raise RuntimeError("Select a source mesh or set Source Object")
+        source_obj = sources[0]
+        data_items = [_collect_collider_exp_input_data_exp(context, source_obj, bounds_only=bounds_only)]
+    else:
+        data_items = _collect_collider_exp_scope_input_data_exp(context, settings, bounds_only=bounds_only)
+        source_obj = data_items[0]["source_obj"]
+
+    target_obj = _ensure_collider_exp_target_object_exp(context, settings, source_obj, op=op)
+    lod_token = str(getattr(op, "target_lod", getattr(settings, "target_lod", "6")) or "6")
+    for data in data_items:
+        data_source = data.get("source_obj")
+        if target_obj == data_source and not _allow_collider_exp_in_place_target_exp(data_source, lod_token):
             raise RuntimeError("Target Geometry LOD must be separate from the Source Object")
     return target_obj, source_obj, data_items
 
@@ -8936,7 +11670,7 @@ def _collider_exp_matrix_basis_world_exp(matrix_world):
     return axis_x, axis_y, axis_z
 
 
-def _collider_exp_world_normal_from_data_exp(data, world_points):
+def _collider_exp_world_face_normal_from_data_exp(data):
     matrix_world = data["matrix_world"]
     try:
         normal_matrix = matrix_world.to_3x3().inverted_safe().transposed()
@@ -8956,6 +11690,13 @@ def _collider_exp_world_normal_from_data_exp(data, world_points):
             normal += world_normal
 
     normal = _collider_exp_safe_normalized_exp(normal)
+    if normal is not None:
+        return normal
+    return None
+
+
+def _collider_exp_world_normal_from_data_exp(data, world_points):
+    normal = _collider_exp_world_face_normal_from_data_exp(data)
     if normal is not None:
         return normal
     return _estimate_world_points_normal(world_points)
@@ -9208,6 +11949,37 @@ def _collider_exp_box_frame_from_data_exp(data):
     return world_points, axis_u, axis_v, axis_w
 
 
+def _collider_exp_box_axis_center_half_exp(
+    min_value,
+    max_value,
+    axis,
+    source_normal,
+    minimum_size,
+    scale,
+    use_normal_minimum_size,
+):
+    span = max(float(max_value) - float(min_value), 0.0)
+    half = max(span, float(minimum_size)) * float(scale) * 0.5
+    center = (float(min_value) + float(max_value)) * 0.5
+    if not bool(use_normal_minimum_size) or span >= float(minimum_size):
+        return center, half
+
+    axis = _collider_exp_safe_normalized_exp(axis)
+    source_normal = _collider_exp_safe_normalized_exp(source_normal)
+    if axis is None or source_normal is None:
+        return center, half
+
+    normal_alignment = float(axis.dot(source_normal))
+    if abs(normal_alignment) < 0.75:
+        return center, half
+
+    if normal_alignment >= 0.0:
+        center = float(max_value) - half
+    else:
+        center = float(min_value) + half
+    return center, half
+
+
 def _box_vertices_from_bounds_data_exp(data, op):
     world_points, axis_u, axis_v, axis_w = _collider_exp_box_frame_from_data_exp(data)
     u_values = [point.dot(axis_u) for point in world_points]
@@ -9220,16 +11992,45 @@ def _box_vertices_from_bounds_data_exp(data, op):
     minimum_size = max(float(getattr(op, "minimum_size", 0.0)), 1e-6)
     scale_vec = _collider_exp_scale_vec_exp(op)
     offset_vec = _collider_exp_vec_from_props_exp(op, "offset")
-    half = Vector((
-        max(max_u - min_u, minimum_size) * scale_vec.x * 0.5,
-        max(max_v - min_v, minimum_size) * scale_vec.y * 0.5,
-        max(max_w - min_w, minimum_size) * scale_vec.z * 0.5,
-    ))
+    source_normal = (
+        _collider_exp_world_face_normal_from_data_exp(data)
+        if bool(getattr(op, "normal_minimum_size", False))
+        else None
+    )
+    use_normal_minimum_size = source_normal is not None
+    center_u, half_u = _collider_exp_box_axis_center_half_exp(
+        min_u,
+        max_u,
+        axis_u,
+        source_normal,
+        minimum_size,
+        scale_vec.x,
+        use_normal_minimum_size,
+    )
+    center_v, half_v = _collider_exp_box_axis_center_half_exp(
+        min_v,
+        max_v,
+        axis_v,
+        source_normal,
+        minimum_size,
+        scale_vec.y,
+        use_normal_minimum_size,
+    )
+    center_w, half_w = _collider_exp_box_axis_center_half_exp(
+        min_w,
+        max_w,
+        axis_w,
+        source_normal,
+        minimum_size,
+        scale_vec.z,
+        use_normal_minimum_size,
+    )
+    half = Vector((half_u, half_v, half_w))
 
     center = (
-        axis_u * ((min_u + max_u) * 0.5)
-        + axis_v * ((min_v + max_v) * 0.5)
-        + axis_w * ((min_w + max_w) * 0.5)
+        axis_u * center_u
+        + axis_v * center_v
+        + axis_w * center_w
         + axis_u * offset_vec.x
         + axis_v * offset_vec.y
         + axis_w * offset_vec.z
@@ -9251,6 +12052,72 @@ def _box_vertices_from_bounds_data_exp(data, op):
     return world_verts
 
 
+def _append_collider_exp_mesh_to_bmesh_exp(
+    bm,
+    target_obj,
+    world_vertices,
+    faces,
+    *,
+    merge_distance=0.0,
+    recalc_normals=True,
+    material_index=None,
+):
+    before_vert_count = len(bm.verts)
+    before_face_count = len(bm.faces)
+    to_local = target_obj.matrix_world.inverted_safe()
+
+    new_verts = [bm.verts.new(to_local @ point) for point in world_vertices]
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+
+    if merge_distance > 0.0 and new_verts:
+        bmesh.ops.remove_doubles(bm, verts=new_verts, dist=merge_distance)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        new_verts = [vert for vert in new_verts if vert.is_valid]
+
+    new_faces = []
+    for face_indices in faces:
+        face_verts = [
+            new_verts[idx]
+            for idx in face_indices
+            if 0 <= idx < len(new_verts) and new_verts[idx].is_valid
+        ]
+        if len(face_verts) < 3 or len(set(face_verts)) < 3:
+            continue
+        try:
+            face = bm.faces.new(face_verts)
+        except ValueError:
+            continue
+        if material_index is not None:
+            try:
+                face.material_index = max(0, int(material_index))
+            except Exception:
+                pass
+        new_faces.append(face)
+
+    if not new_faces:
+        rollback_verts = [vert for vert in new_verts if vert.is_valid]
+        if rollback_verts:
+            bmesh.ops.delete(bm, geom=rollback_verts, context="VERTS")
+        raise RuntimeError("Could not append collider faces")
+
+    if recalc_normals:
+        bmesh.ops.recalc_face_normals(bm, faces=new_faces)
+
+    bm.normal_update()
+    bm.verts.index_update()
+    bm.faces.index_update()
+    return {
+        "verts_added": len(bm.verts) - before_vert_count,
+        "faces_added": len(bm.faces) - before_face_count,
+        "vertex_indices": [vert.index for vert in new_verts if vert.is_valid],
+        "face_indices": [face.index for face in new_faces if face.is_valid],
+    }
+
+
 def _append_collider_exp_mesh_to_object_exp(
     target_obj,
     world_vertices,
@@ -9258,67 +12125,51 @@ def _append_collider_exp_mesh_to_object_exp(
     *,
     merge_distance=0.0,
     recalc_normals=True,
+    material_index=None,
 ):
     if target_obj is None or target_obj.type != "MESH":
         raise RuntimeError("Target Geometry LOD object must be a mesh")
-    if target_obj.mode == "EDIT":
-        raise RuntimeError("Target Geometry LOD must not be in Edit Mode")
     if not world_vertices or not faces:
         raise RuntimeError("No collider geometry to append")
 
     mesh = target_obj.data
+    if target_obj.mode == "EDIT":
+        bm = bmesh.from_edit_mesh(mesh)
+        try:
+            stats = _append_collider_exp_mesh_to_bmesh_exp(
+                bm,
+                target_obj,
+                world_vertices,
+                faces,
+                merge_distance=merge_distance,
+                recalc_normals=recalc_normals,
+                material_index=material_index,
+            )
+        except Exception:
+            bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
+            raise
+        bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
+        try:
+            mesh.update(calc_edges=True)
+        except Exception:
+            pass
+        return stats
+
     bm = bmesh.new()
     try:
         bm.from_mesh(mesh)
-        before_vert_count = len(bm.verts)
-        before_face_count = len(bm.faces)
-        to_local = target_obj.matrix_world.inverted_safe()
-
-        new_verts = [bm.verts.new(to_local @ point) for point in world_vertices]
-        bm.verts.ensure_lookup_table()
-        bm.edges.ensure_lookup_table()
-        bm.faces.ensure_lookup_table()
-
-        if merge_distance > 0.0 and new_verts:
-            bmesh.ops.remove_doubles(bm, verts=new_verts, dist=merge_distance)
-            bm.verts.ensure_lookup_table()
-            bm.edges.ensure_lookup_table()
-            bm.faces.ensure_lookup_table()
-            new_verts = [vert for vert in new_verts if vert.is_valid]
-
-        new_faces = []
-        for face_indices in faces:
-            face_verts = [
-                new_verts[idx]
-                for idx in face_indices
-                if 0 <= idx < len(new_verts) and new_verts[idx].is_valid
-            ]
-            if len(face_verts) < 3 or len(set(face_verts)) < 3:
-                continue
-            try:
-                new_faces.append(bm.faces.new(face_verts))
-            except ValueError:
-                continue
-
-        if not new_faces:
-            raise RuntimeError("Could not append collider faces")
-
-        if recalc_normals:
-            bmesh.ops.recalc_face_normals(bm, faces=new_faces)
-
-        bm.normal_update()
-        bm.verts.index_update()
-        bm.faces.index_update()
-        vertex_indices = [vert.index for vert in new_verts if vert.is_valid]
-        face_indices = [face.index for face in new_faces if face.is_valid]
+        stats = _append_collider_exp_mesh_to_bmesh_exp(
+            bm,
+            target_obj,
+            world_vertices,
+            faces,
+            merge_distance=merge_distance,
+            recalc_normals=recalc_normals,
+            material_index=material_index,
+        )
         bm.to_mesh(mesh)
         mesh.update(calc_edges=True)
-        return {
-            "verts_added": len(mesh.vertices) - before_vert_count,
-            "faces_added": len(mesh.polygons) - before_face_count,
-            "vertex_indices": vertex_indices,
-            "face_indices": face_indices,
-        }
+        return stats
     finally:
         bm.free()
 
@@ -9343,19 +12194,205 @@ def _points_from_list_exp(items):
     return [Vector((float(item[0]), float(item[1]), float(item[2]))) for item in items if len(item) >= 3]
 
 
-def _set_collider_exp_custom_props_exp(target_obj, exp_type, source_obj, params):
-    exp_uuid = str(params.get("uuid") or uuid.uuid4().hex)
-    params = dict(params)
-    params["uuid"] = exp_uuid
+def _collider_exp_params_json_exp(params):
     try:
-        params_text = json.dumps(params, ensure_ascii=False, sort_keys=True)
+        return json.dumps(params, ensure_ascii=False, sort_keys=True)
     except Exception:
-        params_text = "{}"
+        return "{}"
+
+
+def _set_collider_exp_current_props_exp(target_obj, exp_type, source_name, params):
+    if target_obj is None:
+        return
+    params = dict(params)
+    exp_uuid = str(params.get("uuid") or uuid.uuid4().hex)
+    params["uuid"] = exp_uuid
 
     target_obj[_COLLIDER_EXP_TYPE_PROP] = str(exp_type)
-    target_obj[_COLLIDER_EXP_SOURCE_PROP] = getattr(source_obj, "name", "") or ""
+    target_obj[_COLLIDER_EXP_SOURCE_PROP] = str(source_name or "")
     target_obj[_COLLIDER_EXP_UUID_PROP] = exp_uuid
-    target_obj[_COLLIDER_EXP_PARAMS_PROP] = params_text
+    target_obj[_COLLIDER_EXP_PARAMS_PROP] = _collider_exp_params_json_exp(params)
+
+
+def _coerce_collider_exp_history_entry_exp(entry):
+    if not isinstance(entry, dict):
+        return None
+
+    raw_params = entry.get("params")
+    if isinstance(raw_params, dict):
+        params = dict(raw_params)
+        exp_type = str(entry.get("exp_type", "") or "")
+        source_name = str(entry.get("source_name", "") or "")
+        exp_uuid = str(entry.get("uuid", "") or params.get("uuid", "") or "")
+    else:
+        params = dict(entry)
+        exp_type = str(params.pop("__exp_type", params.pop("exp_type", "")) or "")
+        source_name = str(params.pop("__source_name", params.pop("source_name", "")) or "")
+        exp_uuid = str(params.get("uuid", "") or "")
+
+    if not params.get("vertex_indices"):
+        return None
+    if not exp_uuid:
+        exp_uuid = uuid.uuid4().hex
+    params["uuid"] = exp_uuid
+    return {
+        "uuid": exp_uuid,
+        "exp_type": exp_type,
+        "source_name": source_name,
+        "params": params,
+    }
+
+
+def _get_collider_exp_history_entries_exp(target_obj):
+    if target_obj is None:
+        return []
+    try:
+        raw = target_obj.get(_COLLIDER_EXP_HISTORY_PROP, "")
+    except Exception:
+        raw = ""
+    if not raw:
+        return []
+
+    if isinstance(raw, str):
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return []
+    elif isinstance(raw, (list, tuple)):
+        data = list(raw)
+    else:
+        return []
+
+    if isinstance(data, dict):
+        data = data.get("items", [])
+    if not isinstance(data, list):
+        return []
+
+    entries = []
+    for item in data:
+        entry = _coerce_collider_exp_history_entry_exp(item)
+        if entry is not None:
+            entries.append(entry)
+    return entries[-_COLLIDER_EXP_HISTORY_LIMIT:]
+
+
+def _write_collider_exp_history_entries_exp(target_obj, entries):
+    if target_obj is None:
+        return []
+
+    history = []
+    for item in entries or []:
+        entry = _coerce_collider_exp_history_entry_exp(item)
+        if entry is not None:
+            history.append(entry)
+    history = history[-_COLLIDER_EXP_HISTORY_LIMIT:]
+
+    if not history:
+        _clear_collider_exp_history_exp(target_obj)
+        return []
+
+    try:
+        target_obj[_COLLIDER_EXP_HISTORY_PROP] = json.dumps(history, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        pass
+    return history
+
+
+def _append_collider_exp_history_entry_exp(target_obj, exp_type, source_name, params):
+    if target_obj is None:
+        return []
+    params = dict(params)
+    if not params.get("vertex_indices"):
+        return _get_collider_exp_history_entries_exp(target_obj)
+
+    exp_uuid = str(params.get("uuid") or uuid.uuid4().hex)
+    params["uuid"] = exp_uuid
+    entry = {
+        "uuid": exp_uuid,
+        "exp_type": str(exp_type),
+        "source_name": str(source_name or ""),
+        "params": params,
+    }
+    history = [
+        item
+        for item in _get_collider_exp_history_entries_exp(target_obj)
+        if str(item.get("uuid", "") or "") != exp_uuid
+    ]
+    history.append(entry)
+    return _write_collider_exp_history_entries_exp(target_obj, history)
+
+
+def _seed_collider_exp_history_from_current_exp(target_obj):
+    if target_obj is None or _get_collider_exp_history_entries_exp(target_obj):
+        return
+    try:
+        params = _get_collider_exp_custom_params_exp(target_obj)
+    except Exception:
+        return
+    if not params.get("vertex_indices"):
+        return
+    try:
+        exp_type = str(target_obj.get(_COLLIDER_EXP_TYPE_PROP, "") or "")
+        source_name = str(target_obj.get(_COLLIDER_EXP_SOURCE_PROP, "") or "")
+    except Exception:
+        exp_type = ""
+        source_name = ""
+    _append_collider_exp_history_entry_exp(target_obj, exp_type, source_name, params)
+
+
+def _apply_collider_exp_current_from_history_exp(target_obj, history=None):
+    if target_obj is None:
+        return None
+    if history is None:
+        history = _get_collider_exp_history_entries_exp(target_obj)
+    else:
+        history = _write_collider_exp_history_entries_exp(target_obj, history)
+
+    if not history:
+        _clear_last_collider_exp_params_exp(target_obj)
+        return None
+
+    entry = history[-1]
+    params = dict(entry.get("params", {}) or {})
+    _set_collider_exp_current_props_exp(
+        target_obj,
+        entry.get("exp_type", ""),
+        entry.get("source_name", ""),
+        params,
+    )
+    return params
+
+
+def _pop_last_collider_exp_history_entry_exp(target_obj):
+    history = _get_collider_exp_history_entries_exp(target_obj)
+    if history:
+        history = history[:-1]
+        _apply_collider_exp_current_from_history_exp(target_obj, history)
+        return len(history)
+
+    _clear_last_collider_exp_params_exp(target_obj)
+    return 0
+
+
+def _clear_collider_exp_history_exp(target_obj):
+    if target_obj is None:
+        return
+    try:
+        if _COLLIDER_EXP_HISTORY_PROP in target_obj:
+            del target_obj[_COLLIDER_EXP_HISTORY_PROP]
+    except Exception:
+        pass
+
+
+def _set_collider_exp_custom_props_exp(target_obj, exp_type, source_obj, params):
+    source_name = getattr(source_obj, "name", "") or ""
+    params = dict(params)
+    exp_uuid = str(params.get("uuid") or uuid.uuid4().hex)
+    params["uuid"] = exp_uuid
+
+    _seed_collider_exp_history_from_current_exp(target_obj)
+    _set_collider_exp_current_props_exp(target_obj, exp_type, source_name, params)
+    _append_collider_exp_history_entry_exp(target_obj, exp_type, source_name, params)
 
 
 def _is_live_blender_object_exp(obj):
@@ -9479,6 +12516,80 @@ def _delete_collider_exp_vertices_exp(target_obj, vertex_indices):
         return {"verts_removed": removed}
     finally:
         bm.free()
+
+
+def _delete_collider_exp_vertices_any_mode_exp(target_obj, vertex_indices):
+    if target_obj is None or target_obj.type != "MESH":
+        raise RuntimeError("Target Geometry LOD object must be a mesh")
+    if not vertex_indices:
+        return {"verts_removed": 0}
+
+    wanted = {int(idx) for idx in vertex_indices if isinstance(idx, int) or str(idx).isdigit()}
+    if not wanted:
+        return {"verts_removed": 0}
+
+    if target_obj.mode == "EDIT":
+        mesh = target_obj.data
+        bm = bmesh.from_edit_mesh(mesh)
+        bm.verts.ensure_lookup_table()
+        verts = [bm.verts[idx] for idx in wanted if 0 <= idx < len(bm.verts) and bm.verts[idx].is_valid]
+        if not verts:
+            raise RuntimeError("Stored experimental collider vertices are no longer available")
+        bmesh.ops.delete(bm, geom=verts, context="VERTS")
+        bm.normal_update()
+        bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=True)
+        return {"verts_removed": len(verts)}
+
+    return _delete_collider_exp_vertices_exp(target_obj, list(wanted))
+
+
+def _clear_last_collider_exp_params_exp(target_obj):
+    if target_obj is None:
+        return
+    try:
+        if _COLLIDER_EXP_PARAMS_PROP in target_obj:
+            del target_obj[_COLLIDER_EXP_PARAMS_PROP]
+    except Exception:
+        pass
+
+
+def _resolve_last_collider_exp_target_exp(context, settings=None):
+    candidates = []
+    active_obj = getattr(getattr(context, "view_layer", None), "objects", None)
+    active_obj = getattr(active_obj, "active", None) if active_obj is not None else None
+    edit_obj = getattr(context, "edit_object", None)
+    for obj in (edit_obj, active_obj):
+        if obj is not None and obj not in candidates:
+            candidates.append(obj)
+
+    try:
+        target_obj = getattr(settings, "geometry_object", None) if settings is not None else None
+    except ReferenceError:
+        target_obj = None
+    except Exception:
+        target_obj = None
+    if target_obj is not None and target_obj not in candidates:
+        candidates.append(target_obj)
+
+    for obj in getattr(context, "selected_objects", []) or []:
+        if obj is not None and obj not in candidates:
+            candidates.append(obj)
+
+    for obj in candidates:
+        if obj is None or getattr(obj, "type", None) != "MESH":
+            continue
+        history = _get_collider_exp_history_entries_exp(obj)
+        if history:
+            params = dict(history[-1].get("params", {}) or {})
+            if params.get("vertex_indices"):
+                return obj, params
+        try:
+            params = _get_collider_exp_custom_params_exp(obj)
+        except Exception:
+            continue
+        if params.get("vertex_indices"):
+            return obj, params
+    return None, {}
 
 
 def _delete_all_collider_exp_vertices_exp(target_obj):
@@ -9624,51 +12735,85 @@ def _build_collider_exp_hull_data_for_budget_exp(target_obj, world_points, op):
     return best
 
 
-def _append_collider_exp_hull_data_to_object_exp(target_obj, hull_data, recalc_normals=True):
+def _append_collider_exp_hull_data_to_bmesh_exp(bm, hull_data, recalc_normals=True, material_index=None):
+    before_vert_count = len(bm.verts)
+    before_face_count = len(bm.faces)
+
+    new_verts = [bm.verts.new(point.copy()) for point in hull_data.get("verts", [])]
+    bm.verts.ensure_lookup_table()
+
+    new_faces = []
+    for face_indices in hull_data.get("faces", []):
+        face_verts = [new_verts[idx] for idx in face_indices if 0 <= idx < len(new_verts)]
+        if len(face_verts) < 3 or len(set(face_verts)) < 3:
+            continue
+        try:
+            face = bm.faces.new(face_verts)
+        except ValueError:
+            continue
+        if material_index is not None:
+            try:
+                face.material_index = max(0, int(material_index))
+            except Exception:
+                pass
+        new_faces.append(face)
+
+    if not new_faces:
+        rollback_verts = [vert for vert in new_verts if vert.is_valid]
+        if rollback_verts:
+            bmesh.ops.delete(bm, geom=rollback_verts, context="VERTS")
+        raise RuntimeError("Could not append simplified convex hull to the target mesh")
+
+    if recalc_normals:
+        bmesh.ops.recalc_face_normals(bm, faces=new_faces)
+
+    bm.normal_update()
+    bm.verts.index_update()
+    bm.faces.index_update()
+    return {
+        "verts_added": len(bm.verts) - before_vert_count,
+        "faces_added": len(bm.faces) - before_face_count,
+        "vertex_indices": [vert.index for vert in new_verts if vert.is_valid],
+        "face_indices": [face.index for face in new_faces if face.is_valid],
+    }
+
+
+def _append_collider_exp_hull_data_to_object_exp(target_obj, hull_data, recalc_normals=True, material_index=None):
     if target_obj is None or target_obj.type != "MESH":
         raise RuntimeError("Target Geometry LOD object must be a mesh")
-    if target_obj.mode == "EDIT":
-        raise RuntimeError("Target Geometry LOD must not be in Edit Mode")
 
     mesh = target_obj.data
+    if target_obj.mode == "EDIT":
+        bm = bmesh.from_edit_mesh(mesh)
+        try:
+            stats = _append_collider_exp_hull_data_to_bmesh_exp(
+                bm,
+                hull_data,
+                recalc_normals=recalc_normals,
+                material_index=material_index,
+            )
+        except Exception:
+            bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
+            raise
+        bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
+        try:
+            mesh.update(calc_edges=True)
+        except Exception:
+            pass
+        return stats
+
     bm = bmesh.new()
     try:
         bm.from_mesh(mesh)
-        before_vert_count = len(bm.verts)
-        before_face_count = len(bm.faces)
-
-        new_verts = [bm.verts.new(point.copy()) for point in hull_data.get("verts", [])]
-        bm.verts.ensure_lookup_table()
-
-        new_faces = []
-        for face_indices in hull_data.get("faces", []):
-            face_verts = [new_verts[idx] for idx in face_indices if 0 <= idx < len(new_verts)]
-            if len(face_verts) < 3 or len(set(face_verts)) < 3:
-                continue
-            try:
-                new_faces.append(bm.faces.new(face_verts))
-            except ValueError:
-                continue
-
-        if not new_faces:
-            raise RuntimeError("Could not append simplified convex hull to the target mesh")
-
-        if recalc_normals:
-            bmesh.ops.recalc_face_normals(bm, faces=new_faces)
-
-        bm.normal_update()
-        bm.verts.index_update()
-        bm.faces.index_update()
-        vertex_indices = [vert.index for vert in new_verts if vert.is_valid]
-        face_indices = [face.index for face in new_faces if face.is_valid]
+        stats = _append_collider_exp_hull_data_to_bmesh_exp(
+            bm,
+            hull_data,
+            recalc_normals=recalc_normals,
+            material_index=material_index,
+        )
         bm.to_mesh(mesh)
         mesh.update(calc_edges=True)
-        return {
-            "verts_added": len(mesh.vertices) - before_vert_count,
-            "faces_added": len(mesh.polygons) - before_face_count,
-            "vertex_indices": vertex_indices,
-            "face_indices": face_indices,
-        }
+        return stats
     finally:
         bm.free()
 
@@ -9681,14 +12826,109 @@ def _apply_collider_exp_hull_build_stats_exp(stats, build):
     return stats
 
 
-def _append_collider_exp_hull_to_object_exp(target_obj, world_points, op):
+def _append_collider_exp_hull_to_object_exp(target_obj, world_points, op, material_index=None):
     build = _build_collider_exp_hull_data_for_budget_exp(target_obj, world_points, op)
     stats = _append_collider_exp_hull_data_to_object_exp(
         target_obj,
         build["hull_data"],
         recalc_normals=bool(getattr(op, "recalc_normals", True)),
+        material_index=material_index,
     )
     return _apply_collider_exp_hull_build_stats_exp(stats, build)
+
+
+def _build_collider_exp_hull_from_selected_loose_verts_in_place_exp(context, target_obj, op, material_index=None):
+    if target_obj is None or getattr(target_obj, "type", None) != "MESH":
+        raise RuntimeError("Target Geometry LOD object must be a mesh")
+    if getattr(target_obj, "mode", "") != "EDIT":
+        raise RuntimeError("Target Geometry LOD must be active in Edit Mode")
+
+    mesh = target_obj.data
+    bm = bmesh.from_edit_mesh(mesh)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+
+    before_vert_count = len(bm.verts)
+    before_face_count = len(bm.faces)
+    merge_distance = float(getattr(op, "merge_distance", 0.0) or 0.0)
+    recalc_normals = bool(getattr(op, "recalc_normals", True))
+
+    loose_verts = [
+        vert for vert in bm.verts
+        if vert.is_valid and vert.select and len(vert.link_edges) == 0 and len(vert.link_faces) == 0
+    ]
+    if len(loose_verts) < 4:
+        raise RuntimeError("Need at least 4 selected loose vertices in Geometry to build a collider")
+
+    if merge_distance > 0.0:
+        bmesh.ops.remove_doubles(bm, verts=loose_verts, dist=merge_distance)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        loose_verts = [
+            vert for vert in bm.verts
+            if vert.is_valid and vert.select and len(vert.link_edges) == 0 and len(vert.link_faces) == 0
+        ]
+
+    unique_point_keys = {_vector_quantized_key(vert.co) for vert in loose_verts if vert.is_valid}
+    if len(unique_point_keys) < 4:
+        raise RuntimeError("Selected loose vertices collapse below 4 unique points")
+
+    try:
+        hull = bmesh.ops.convex_hull(bm, input=loose_verts, use_existing_faces=False)
+        final_faces = _finalize_convex_hull_geometry(
+            bm,
+            hull,
+            loose_verts,
+            recalc_normals=recalc_normals,
+        )
+        if material_index is not None:
+            for face in final_faces:
+                if not face.is_valid:
+                    continue
+                try:
+                    face.material_index = max(0, int(material_index))
+                except Exception:
+                    pass
+        _select_only_faces_in_bmesh(bm, final_faces)
+        bm.normal_update()
+        bm.verts.index_update()
+        bm.faces.index_update()
+        vertex_indices = sorted({
+            int(vert.index)
+            for face in final_faces
+            if face is not None and face.is_valid
+            for vert in face.verts
+            if vert.is_valid
+        })
+        face_indices = [int(face.index) for face in final_faces if face is not None and face.is_valid]
+        triangle_count = sum(max(0, len(face.verts) - 2) for face in final_faces if face is not None and face.is_valid)
+    except Exception:
+        bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
+        raise
+
+    bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
+    try:
+        mesh.update(calc_edges=True)
+    except Exception:
+        pass
+    try:
+        bpy.ops.mesh.select_mode(type="FACE")
+    except Exception:
+        pass
+    _tag_redraw_all_areas(context)
+
+    return {
+        "verts_added": max(0, len(bm.verts) - before_vert_count),
+        "faces_added": len(bm.faces) - before_face_count,
+        "vertex_indices": vertex_indices,
+        "face_indices": face_indices,
+        "used_verts": len(unique_point_keys),
+        "actual_detail": int(getattr(op, "convex_detail", len(unique_point_keys)) or len(unique_point_keys)),
+        "triangles": triangle_count,
+        "max_triangles": max(0, int(getattr(op, "convex_max_triangles", 0) or 0)),
+    }
 
 
 def _collider_exp_collection_path_names_exp(context, obj):
@@ -9959,12 +13199,283 @@ def _axis_vector_exp(axis_index):
     return vec
 
 
+def _is_valid_cylinder_profile_exp(profile):
+    if not isinstance(profile, dict):
+        return False
+    required = ("center", "axis_a", "axis_b", "depth_axis", "radius_a", "radius_b", "depth")
+    if not all(key in profile for key in required):
+        return False
+    try:
+        if float(profile.get("depth", 0.0)) <= 1e-8:
+            return False
+        if min(float(profile.get("radius_a", 0.0)), float(profile.get("radius_b", 0.0))) <= 1e-8:
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _two_ring_profile_from_data_exp(data):
+    profile = data.get("two_ring_profile") if isinstance(data, dict) else None
+    if not _is_valid_cylinder_profile_exp(profile):
+        return None
+    return profile
+
+
+def _cylinder_profile_from_data_exp(data):
+    profile = _two_ring_profile_from_data_exp(data)
+    if profile is not None:
+        return profile
+    if not isinstance(data, dict):
+        return None
+    profile = data.get("cylinder_axis_profile")
+    if not _is_valid_cylinder_profile_exp(profile):
+        profile = _inferred_cylinder_axis_profile_exp(data)
+        if _is_valid_cylinder_profile_exp(profile):
+            data["cylinder_axis_profile"] = profile
+    return profile if _is_valid_cylinder_profile_exp(profile) else None
+
+
+def _two_ring_uniform_scale_exp(op):
+    try:
+        return max(float(getattr(op, "scale_multiplier", 1.0)), 0.001)
+    except Exception:
+        return 1.0
+
+
+def _two_ring_offset_center_exp(profile, op):
+    return profile["center"] + _collider_exp_vec_from_props_exp(op, "offset")
+
+
+def _two_ring_cylinder_mesh_exp(data, op):
+    profile = _cylinder_profile_from_data_exp(data)
+    if profile is None:
+        return None
+    scale = _two_ring_uniform_scale_exp(op)
+    minimum_size = max(float(getattr(op, "minimum_size", 0.0)), 1e-6)
+    center = _two_ring_offset_center_exp(profile, op)
+    axis_a = profile["axis_a"]
+    axis_b = profile["axis_b"]
+    depth_axis = profile["depth_axis"]
+    radius_a = max(float(profile["radius_a"]) * scale, minimum_size * 0.5)
+    radius_b = max(float(profile["radius_b"]) * scale, minimum_size * 0.5)
+    depth = max(float(profile["depth"]) * scale, minimum_size)
+    segments = max(4, min(int(getattr(op, "cylinder_segments", profile.get("edge_count", 16)) or 16), 128))
+    half_depth_vec = depth_axis * (depth * 0.5)
+
+    vertices = []
+    bottom = []
+    top = []
+    for idx in range(segments):
+        angle = (2.0 * math.pi * idx) / segments
+        ring_vec = axis_a * (math.cos(angle) * radius_a) + axis_b * (math.sin(angle) * radius_b)
+        bottom.append(len(vertices))
+        vertices.append(center + ring_vec - half_depth_vec)
+        top.append(len(vertices))
+        vertices.append(center + ring_vec + half_depth_vec)
+
+    bottom_center = len(vertices)
+    vertices.append(center - half_depth_vec)
+    top_center = len(vertices)
+    vertices.append(center + half_depth_vec)
+    faces = []
+    for idx in range(segments):
+        nxt = (idx + 1) % segments
+        faces.append((bottom[idx], bottom[nxt], top[nxt], top[idx]))
+        faces.append((bottom_center, bottom[nxt], bottom[idx]))
+        faces.append((top_center, top[idx], top[nxt]))
+    return vertices, faces
+
+
+def _two_ring_pipe_mesh_exp(data, op):
+    profile = _two_ring_profile_from_data_exp(data)
+    if profile is None:
+        return None
+    scale = _two_ring_uniform_scale_exp(op)
+    minimum_size = max(float(getattr(op, "minimum_size", 0.0)), 1e-6)
+    center = _two_ring_offset_center_exp(profile, op)
+    axis_a = profile["axis_a"]
+    axis_b = profile["axis_b"]
+    depth_axis = profile["depth_axis"]
+    outer_multiplier = max(float(getattr(op, "pipe_outer_radius", 1.0)), 0.001)
+    radius_a = max(float(profile["radius_a"]) * outer_multiplier * scale, minimum_size * 0.5)
+    radius_b = max(float(profile["radius_b"]) * outer_multiplier * scale, minimum_size * 0.5)
+    depth = max(float(profile["depth"]) * scale, max(float(getattr(op, "pipe_depth", 0.25)), 0.001), minimum_size)
+    inner_factor = max(0.0, min(float(getattr(op, "pipe_inner_radius", 0.5)), 0.98))
+    thickness = max(float(getattr(op, "pipe_thickness", 0.0)), 0.0)
+    if thickness > 0.0:
+        avg_radius = max((radius_a + radius_b) * 0.5, minimum_size)
+        inner_factor = min(inner_factor, max(0.0, 1.0 - thickness / avg_radius))
+    inner_radius_a = max(radius_a * inner_factor, minimum_size * 0.05)
+    inner_radius_b = max(radius_b * inner_factor, minimum_size * 0.05)
+    segments = max(4, min(int(getattr(op, "pipe_segments", profile.get("edge_count", 24)) or 24), 128))
+    half_depth_vec = depth_axis * (depth * 0.5)
+
+    vertices = []
+    outer_bottom = []
+    outer_top = []
+    inner_bottom = []
+    inner_top = []
+    for idx in range(segments):
+        angle = (2.0 * math.pi * idx) / segments
+        outer_vec = axis_a * (math.cos(angle) * radius_a) + axis_b * (math.sin(angle) * radius_b)
+        inner_vec = axis_a * (math.cos(angle) * inner_radius_a) + axis_b * (math.sin(angle) * inner_radius_b)
+        outer_bottom.append(len(vertices))
+        vertices.append(center + outer_vec - half_depth_vec)
+        outer_top.append(len(vertices))
+        vertices.append(center + outer_vec + half_depth_vec)
+        inner_bottom.append(len(vertices))
+        vertices.append(center + inner_vec - half_depth_vec)
+        inner_top.append(len(vertices))
+        vertices.append(center + inner_vec + half_depth_vec)
+
+    faces = []
+    for idx in range(segments):
+        nxt = (idx + 1) % segments
+        faces.append((outer_bottom[idx], outer_bottom[nxt], outer_top[nxt], outer_top[idx]))
+        faces.append((inner_bottom[nxt], inner_bottom[idx], inner_top[idx], inner_top[nxt]))
+        faces.append((outer_top[idx], outer_top[nxt], inner_top[nxt], inner_top[idx]))
+        faces.append((outer_bottom[nxt], outer_bottom[idx], inner_bottom[idx], inner_bottom[nxt]))
+    return vertices, faces
+
+
+def _two_ring_ellipse_vector_exp(axis_a, axis_b, radius_a, radius_b, angle):
+    return axis_a * (math.cos(angle) * radius_a) + axis_b * (math.sin(angle) * radius_b)
+
+
+def _two_ring_ellipse_radius_exp(radius_a, radius_b, angle):
+    radius_a = max(float(radius_a), 1e-6)
+    radius_b = max(float(radius_b), 1e-6)
+    c = math.cos(angle)
+    s = math.sin(angle)
+    denom = ((c / radius_a) ** 2 + (s / radius_b) ** 2) ** 0.5
+    if denom <= 1e-12:
+        return min(radius_a, radius_b)
+    return 1.0 / denom
+
+
+def _two_ring_radial_axis_exp(axis_a, axis_b, angle):
+    axis = axis_a * math.cos(angle) + axis_b * math.sin(angle)
+    if axis.length_squared <= 1e-12:
+        return axis_a
+    return axis.normalized()
+
+
+def _two_ring_tangent_axis_exp(axis_a, axis_b, radius_a, radius_b, angle):
+    tangent = axis_a * (-math.sin(angle) * radius_a) + axis_b * (math.cos(angle) * radius_b)
+    if tangent.length_squared <= 1e-12:
+        tangent = axis_b
+    if tangent.length_squared <= 1e-12:
+        tangent = axis_a.cross(Vector((0.0, 0.0, 1.0)))
+    if tangent.length_squared <= 1e-12:
+        tangent = Vector((0.0, 1.0, 0.0))
+    return tangent.normalized()
+
+
+def _two_ring_cylinder_boxes_mesh_exp(data, op):
+    profile = _cylinder_profile_from_data_exp(data)
+    if profile is None:
+        return None
+    scale = _two_ring_uniform_scale_exp(op)
+    minimum_size = max(float(getattr(op, "minimum_size", 0.0)), 1e-6)
+    center = _two_ring_offset_center_exp(profile, op)
+    axis_a = profile["axis_a"]
+    axis_b = profile["axis_b"]
+    depth_axis = profile["depth_axis"]
+    radius_a = max(float(profile["radius_a"]) * scale, minimum_size * 0.5)
+    radius_b = max(float(profile["radius_b"]) * scale, minimum_size * 0.5)
+    depth = max(float(profile["depth"]) * scale, minimum_size)
+    segments = max(2, min(int(getattr(op, "cylinder_segments", profile.get("edge_count", 16)) or 16), 128))
+    step = math.pi / segments
+    vertices = []
+    faces = []
+    for idx in range(segments):
+        angle = idx * step
+        a0 = angle - step * 0.5
+        a1 = angle + step * 0.5
+        radial_axis = _two_ring_radial_axis_exp(axis_a, axis_b, angle)
+        tangent_axis = _two_ring_tangent_axis_exp(axis_a, axis_b, radius_a, radius_b, angle)
+        edge0 = _two_ring_ellipse_vector_exp(axis_a, axis_b, radius_a, radius_b, a0)
+        edge1 = _two_ring_ellipse_vector_exp(axis_a, axis_b, radius_a, radius_b, a1)
+        radial_len = max(_two_ring_ellipse_radius_exp(radius_a, radius_b, angle) * 2.0, minimum_size)
+        tangent_len = max(abs((edge1 - edge0).dot(tangent_axis)), minimum_size)
+        box = _make_oriented_box_world_exp(
+            data["matrix_world"],
+            center,
+            radial_axis,
+            tangent_axis,
+            depth_axis,
+            radial_len,
+            tangent_len,
+            depth,
+        )
+        _append_box_data_exp(vertices, faces, box)
+    return vertices, faces, 0.0
+
+
+def _two_ring_pipe_boxes_mesh_exp(data, op):
+    profile = _two_ring_profile_from_data_exp(data)
+    if profile is None:
+        return None
+    scale = _two_ring_uniform_scale_exp(op)
+    minimum_size = max(float(getattr(op, "minimum_size", 0.0)), 1e-6)
+    center = _two_ring_offset_center_exp(profile, op)
+    axis_a = profile["axis_a"]
+    axis_b = profile["axis_b"]
+    depth_axis = profile["depth_axis"]
+    outer_multiplier = max(float(getattr(op, "pipe_outer_radius", 1.0)), 0.001)
+    radius_a = max(float(profile["radius_a"]) * outer_multiplier * scale, minimum_size * 0.5)
+    radius_b = max(float(profile["radius_b"]) * outer_multiplier * scale, minimum_size * 0.5)
+    depth = max(float(profile["depth"]) * scale, max(float(getattr(op, "pipe_depth", 0.25)), 0.001), minimum_size)
+    inner_factor = max(0.0, min(float(getattr(op, "pipe_inner_radius", 0.5)), 0.98))
+    thickness = max(float(getattr(op, "pipe_thickness", 0.0)), 0.0)
+    if thickness > 0.0:
+        avg_radius = max((radius_a + radius_b) * 0.5, minimum_size)
+        inner_factor = min(inner_factor, max(0.0, 1.0 - thickness / avg_radius))
+    segments = max(4, min(int(getattr(op, "pipe_segments", profile.get("edge_count", 24)) or 24), 128))
+    step = (2.0 * math.pi) / segments
+    vertices = []
+    faces = []
+    for idx in range(segments):
+        angle = (idx + 0.5) * step
+        outer_vec = _two_ring_ellipse_vector_exp(axis_a, axis_b, radius_a, radius_b, angle)
+        inner_vec = outer_vec * inner_factor
+        radial_vec = outer_vec - inner_vec
+        if radial_vec.length_squared <= 1e-12:
+            radial_axis = _two_ring_radial_axis_exp(axis_a, axis_b, angle)
+        else:
+            radial_axis = radial_vec.normalized()
+        tangent_axis = _two_ring_tangent_axis_exp(axis_a, axis_b, radius_a, radius_b, angle)
+        center_vec = (outer_vec + inner_vec) * 0.5
+        radial_len = max(radial_vec.length, minimum_size)
+        tangent_len = max(outer_vec.length * math.tan(step * 0.5) * 2.08, minimum_size)
+        box = _make_oriented_box_world_exp(
+            data["matrix_world"],
+            center + center_vec,
+            radial_axis,
+            tangent_axis,
+            depth_axis,
+            radial_len,
+            tangent_len,
+            depth,
+        )
+        _append_box_data_exp(vertices, faces, box)
+    return vertices, faces
+
+
 def _ring_axes_from_data_exp(data):
     size = data["size"]
     sizes = [abs(size.x), abs(size.y), abs(size.z)]
     sorted_axes = sorted(range(3), key=lambda axis: sizes[axis])
-    if sizes[sorted_axes[0]] <= sizes[sorted_axes[1]] * 0.75:
-        depth_axis = sorted_axes[0]
+    smallest_axis, middle_axis, largest_axis = sorted_axes
+    smallest = sizes[smallest_axis]
+    middle = max(sizes[middle_axis], 1e-6)
+    largest = sizes[largest_axis]
+
+    if largest >= middle * 1.5:
+        depth_axis = largest_axis
+    elif smallest <= middle * 0.75:
+        depth_axis = smallest_axis
     else:
         depth_axis = 2
     plane_axes = [axis for axis in range(3) if axis != depth_axis]
@@ -10174,6 +13685,10 @@ def _axis_offset_exp(axis_index, amount):
 
 
 def _cylinder_guide_mesh_from_data_exp(data, op):
+    profile_mesh = _two_ring_cylinder_mesh_exp(data, op)
+    if profile_mesh is not None:
+        return profile_mesh
+
     axis_a, axis_b, depth_axis = _ring_axes_from_data_exp(data)
     center = data["center"] + _collider_exp_vec_from_props_exp(op, "offset")
     scale_vec = _collider_exp_scale_vec_exp(op)
@@ -10196,12 +13711,17 @@ def _cylinder_guide_mesh_from_data_exp(data, op):
         top.append(len(vertices))
         vertices.append(center + ring_vec + half_depth_vec)
 
+    bottom_center = len(vertices)
+    vertices.append(center - half_depth_vec)
+    top_center = len(vertices)
+    vertices.append(center + half_depth_vec)
+
     faces = []
     for idx in range(segments):
         nxt = (idx + 1) % segments
         faces.append((bottom[idx], bottom[nxt], top[nxt], top[idx]))
-    faces.append(tuple(reversed(bottom)))
-    faces.append(tuple(top))
+        faces.append((bottom_center, bottom[nxt], bottom[idx]))
+        faces.append((top_center, top[idx], top[nxt]))
     return vertices, faces
 
 
@@ -10211,11 +13731,22 @@ def _pipe_inner_factor_for_data_exp(data, axis_a, axis_b, radius_a, radius_b, op
         inner_factor = _infer_inner_factor_exact_from_source_exp(data, axis_a, axis_b)
         return max(0.0, min(inner_factor, 0.98))
 
-    configured_inner = max(float(getattr(op, "pipe_inner_radius", 0.5)), 0.0)
+    configured_inner_raw = float(getattr(op, "pipe_inner_radius", 0.5))
+    configured_inner = max(configured_inner_raw, 0.0)
     thickness = max(float(getattr(op, "pipe_thickness", 0.001)), minimum_size)
     avg_radius = max((radius_a + radius_b) * 0.5, minimum_size)
     inferred_inner = _infer_inner_factor_from_source_exp(data, axis_a, axis_b)
-    if inferred_inner > 0.0:
+
+    if configured_inner_raw >= 0.0:
+        # The UI value is an explicit override. Values <= 0.98 behave as an
+        # outer-radius factor; larger values behave as an absolute world radius.
+        # Source inference is only a fallback for legacy/invalid negative values.
+        # This lets users make a pipe hole smaller than the source mesh hole.
+        if configured_inner <= 0.98:
+            inner_factor = configured_inner
+        else:
+            inner_factor = configured_inner / avg_radius
+    elif inferred_inner > 0.0:
         inner_factor = inferred_inner
     elif configured_inner <= 0.98:
         inner_factor = configured_inner
@@ -10226,6 +13757,10 @@ def _pipe_inner_factor_for_data_exp(data, axis_a, axis_b, radius_a, radius_b, op
 
 
 def _pipe_guide_mesh_from_data_exp(data, op):
+    profile_mesh = _two_ring_pipe_mesh_exp(data, op)
+    if profile_mesh is not None:
+        return profile_mesh
+
     axis_a, axis_b, depth_axis = _ring_axes_from_data_exp(data)
     center = data["center"] + _collider_exp_vec_from_props_exp(op, "offset")
     scale_vec = _collider_exp_scale_vec_exp(op)
@@ -10240,8 +13775,9 @@ def _pipe_guide_mesh_from_data_exp(data, op):
     radius_b = max(source_radius_b * outer_multiplier * scale_vec[axis_b], minimum_size * 0.5)
     depth = max(abs(size[depth_axis]) * scale_vec[depth_axis], configured_depth * scale_vec[depth_axis], minimum_size)
     inner_factor = _pipe_inner_factor_for_data_exp(data, axis_a, axis_b, radius_a, radius_b, op)
-    inner_radius_a = max(radius_a * inner_factor, minimum_size * 0.5)
-    inner_radius_b = max(radius_b * inner_factor, minimum_size * 0.5)
+    inner_min_radius = max(min(radius_a, radius_b) * 0.001, 1e-5)
+    inner_radius_a = max(radius_a * inner_factor, inner_min_radius)
+    inner_radius_b = max(radius_b * inner_factor, inner_min_radius)
     segments = max(4, min(int(getattr(op, "pipe_segments", 24)), 128))
     half_depth_vec = _axis_offset_exp(depth_axis, depth * 0.5)
 
@@ -10273,45 +13809,15 @@ def _pipe_guide_mesh_from_data_exp(data, op):
     return vertices, faces
 
 
-def _create_collider_exp_guide_object_exp(context, data, op, guide_type):
-    if str(guide_type) == "PIPE":
-        vertices, faces = _pipe_guide_mesh_from_data_exp(data, op)
-        name = "NH Pipe Guide"
-    else:
-        vertices, faces = _cylinder_guide_mesh_from_data_exp(data, op)
-        guide_type = "CYLINDER"
-        name = "NH Cylinder Guide"
 
-    mesh = bpy.data.meshes.new(f"{name} Mesh")
-    mesh.from_pydata([tuple(vertex) for vertex in vertices], [], faces)
-    mesh.update(calc_edges=True)
-
-    obj = bpy.data.objects.new(name, mesh)
-    obj.matrix_world = data["matrix_world"].copy()
-    obj[_COLLIDER_EXP_GUIDE_PROP] = str(guide_type)
-    obj[_COLLIDER_EXP_GUIDE_SOURCE_PROP] = getattr(data.get("source_obj"), "name", "") or ""
-    try:
-        obj.show_wire = True
-        obj.show_in_front = True
-        obj.color = (0.2, 0.9, 0.75, 0.45)
-    except Exception:
-        pass
-
-    source_obj = data.get("source_obj")
-    guide_collection = None
-    if source_obj is not None:
-        guide_collection = next(iter(getattr(source_obj, "users_collection", []) or []), None)
-    if guide_collection is None:
-        guide_collection = getattr(context, "collection", None)
-    if guide_collection is None:
-        guide_collection = getattr(getattr(context, "scene", None), "collection", None)
-    if guide_collection is not None:
-        guide_collection.objects.link(obj)
-    else:
-        context.collection.objects.link(obj)
-
-    _enable_collider_object_color_preview(context)
-    return obj
+def _collider_exp_local_vertices_to_world_exp(data, vertices, op):
+    matrix_world = data["matrix_world"]
+    world_vertices = [matrix_world @ vertex for vertex in vertices]
+    return _apply_floor_contact_to_vertices_exp(
+        world_vertices,
+        data["world_floor_z"],
+        bool(getattr(op, "floor_contact", False)),
+    )
 
 
 def _cylinder_guide_box_mesh_from_data_exp(data, axis_a, axis_b, depth_axis, center, depth, minimum_size):
@@ -10354,30 +13860,47 @@ def _cylinder_guide_box_mesh_from_data_exp(data, axis_a, axis_b, depth_axis, cen
     return vertices, faces
 
 
-def _pipe_guide_trapezoid_mesh_from_data_exp(data, axis_a, axis_b, depth_axis, center, depth):
+
+def _pipe_guide_box_mesh_from_data_exp(data, axis_a, axis_b, depth_axis, center, depth, minimum_size):
     ring_pairs = _ring_bounds_vectors_from_data_exp(data, axis_a, axis_b)
     segment_count = len(ring_pairs)
     if segment_count < 4:
         return None
 
-    half_depth_vec = _axis_offset_exp(depth_axis, depth * 0.5)
+    depth_axis_vector = _axis_vector_exp(depth_axis)
+    depth_len = max(float(depth), float(minimum_size))
     vertices = []
     faces = []
     for idx in range(segment_count):
         inner0, outer0 = ring_pairs[idx]
         inner1, outer1 = ring_pairs[(idx + 1) % segment_count]
-        if outer0.length_squared <= 1e-12 or outer1.length_squared <= 1e-12:
+        inner_mid = (inner0 + inner1) * 0.5
+        outer_mid = (outer0 + outer1) * 0.5
+        segment_center_vec = (inner_mid + outer_mid) * 0.5
+        radial_vec = outer_mid - inner_mid
+        centerline0 = (inner0 + outer0) * 0.5
+        centerline1 = (inner1 + outer1) * 0.5
+        tangent_vec = centerline1 - centerline0
+        if radial_vec.length_squared <= 1e-12 or tangent_vec.length_squared <= 1e-12:
             continue
-        box_vertices = [
-            data["matrix_world"] @ (center + inner0 - half_depth_vec),
-            data["matrix_world"] @ (center + outer0 - half_depth_vec),
-            data["matrix_world"] @ (center + outer1 - half_depth_vec),
-            data["matrix_world"] @ (center + inner1 - half_depth_vec),
-            data["matrix_world"] @ (center + inner0 + half_depth_vec),
-            data["matrix_world"] @ (center + outer0 + half_depth_vec),
-            data["matrix_world"] @ (center + outer1 + half_depth_vec),
-            data["matrix_world"] @ (center + inner1 + half_depth_vec),
-        ]
+
+        radial_axis = radial_vec.normalized()
+        tangent_axis = tangent_vec - radial_axis * tangent_vec.dot(radial_axis)
+        if tangent_axis.length_squared <= 1e-12:
+            tangent_axis = _perpendicular_axis_in_plane_exp(axis_a, axis_b, radial_axis)
+        if tangent_axis.length_squared <= 1e-12:
+            continue
+
+        box_vertices = _make_oriented_box_world_exp(
+            data["matrix_world"],
+            center + segment_center_vec,
+            radial_axis,
+            tangent_axis,
+            depth_axis_vector,
+            max(radial_vec.length, minimum_size),
+            max(tangent_vec.length, minimum_size),
+            depth_len,
+        )
         _append_box_data_exp(vertices, faces, box_vertices)
 
     return vertices, faces
@@ -10389,7 +13912,6 @@ def _cylinder_box_mesh_from_data_exp(data, op):
     scale_vec = _collider_exp_shape_scale_vec_exp(data, op)
     size = data["size"]
     minimum_size = max(float(getattr(op, "minimum_size", 0.0)), 1e-6)
-
     radius_a = max(abs(size[axis_a]) * 0.5 * scale_vec[axis_a], minimum_size * 0.5)
     radius_b = max(abs(size[axis_b]) * 0.5 * scale_vec[axis_b], minimum_size * 0.5)
     depth = max(abs(size[depth_axis]) * scale_vec[depth_axis], minimum_size)
@@ -10404,6 +13926,16 @@ def _cylinder_box_mesh_from_data_exp(data, op):
                 bool(getattr(op, "floor_contact", False)),
             )
             return vertices, faces, inner_factor
+
+    profile_mesh = _two_ring_cylinder_boxes_mesh_exp(data, op)
+    if profile_mesh is not None:
+        vertices, faces, inner_factor = profile_mesh
+        vertices = _apply_floor_contact_to_vertices_exp(
+            vertices,
+            data["world_floor_z"],
+            bool(getattr(op, "floor_contact", False)),
+        )
+        return vertices, faces, inner_factor
 
     segments = max(2, min(int(getattr(op, "cylinder_segments", 16)), 128))
     step = math.pi / segments
@@ -10490,7 +14022,7 @@ def _pipe_box_mesh_from_data_exp(data, op):
 
     inner_factor = _pipe_inner_factor_for_data_exp(data, axis_a, axis_b, radius_a, radius_b, op)
     if _collider_exp_data_is_guide_exp(data, "PIPE"):
-        guide_mesh = _pipe_guide_trapezoid_mesh_from_data_exp(data, axis_a, axis_b, depth_axis, center, depth)
+        guide_mesh = _pipe_guide_box_mesh_from_data_exp(data, axis_a, axis_b, depth_axis, center, depth, minimum_size)
         if guide_mesh is not None:
             vertices, faces = guide_mesh
             vertices = _apply_floor_contact_to_vertices_exp(
@@ -10499,6 +14031,16 @@ def _pipe_box_mesh_from_data_exp(data, op):
                 bool(getattr(op, "floor_contact", False)),
             )
             return vertices, faces
+
+    profile_mesh = _two_ring_pipe_boxes_mesh_exp(data, op)
+    if profile_mesh is not None:
+        vertices, faces = profile_mesh
+        vertices = _apply_floor_contact_to_vertices_exp(
+            vertices,
+            data["world_floor_z"],
+            bool(getattr(op, "floor_contact", False)),
+        )
+        return vertices, faces
 
     guide_edge_count = _radial_direction_count_from_data_exp(data, axis_a, axis_b) if _collider_exp_data_is_guide_exp(data, "PIPE") else 0
     segments = max(4, min(int(getattr(op, "pipe_segments", 24)), 128))
@@ -10876,6 +14418,11 @@ class CRAY_OT_GenerateBoxColliderExp(Operator):
     offset_z: FloatProperty(name="Offset Z", default=0.0)
     floor_contact: BoolProperty(name="Floor Contact", default=False)
     minimum_size: FloatProperty(name="Minimum Size", default=0.05, min=0.0)
+    normal_minimum_size: BoolProperty(
+        name="Normal Min Size",
+        description="For flat box sources, add missing Minimum Size thickness opposite to the averaged face normal instead of centering it",
+        default=False,
+    )
     merge_distance: FloatProperty(name="Merge Distance", default=0.0, min=0.0)
     recalc_normals: BoolProperty(name="Recalculate Normals", default=True)
 
@@ -10899,6 +14446,11 @@ class CRAY_OT_GenerateBoxColliderExp(Operator):
                 self,
                 bounds_only=False,
             )
+            material_index, material_name = _ensure_collider_placeholder_material(
+                target_obj,
+                source_obj,
+                data_items=data_items,
+            )
             stats = _collider_exp_empty_stats_exp()
             for data in data_items:
                 vertices = _box_vertices_from_bounds_data_exp(data, self)
@@ -10908,6 +14460,7 @@ class CRAY_OT_GenerateBoxColliderExp(Operator):
                     _COLLIDER_EXP_BOX_FACES,
                     merge_distance=self.merge_distance,
                     recalc_normals=bool(self.recalc_normals),
+                    material_index=material_index,
                 )
                 _merge_collider_exp_stats_exp(stats, part_stats)
         except Exception as e:
@@ -10926,6 +14479,7 @@ class CRAY_OT_GenerateBoxColliderExp(Operator):
             {
                 "vertex_indices": stats.get("vertex_indices", []),
                 "face_indices": stats.get("face_indices", []),
+                "material_name": material_name,
                 "scope": str(getattr(settings, "collider_scope", "FROM_SELECTED")),
                 "parts": len(data_items),
             },
@@ -10994,11 +14548,33 @@ class CRAY_OT_GenerateConvexHullColliderExp(Operator):
                 self,
                 bounds_only=False,
             )
+            material_index, material_name = _ensure_collider_placeholder_material(
+                target_obj,
+                source_obj,
+                data_items=data_items,
+            )
             stats = _collider_exp_empty_stats_exp()
-            for data in data_items:
-                world_points = _transform_collider_exp_local_points_exp(data, self)
-                part_stats = _append_collider_exp_hull_to_object_exp(target_obj, world_points, self)
+            if target_obj == source_obj and _allow_collider_exp_in_place_target_exp(
+                target_obj,
+                str(getattr(self, "target_lod", getattr(settings, "target_lod", "6")) or "6"),
+            ):
+                part_stats = _build_collider_exp_hull_from_selected_loose_verts_in_place_exp(
+                    context,
+                    target_obj,
+                    self,
+                    material_index=material_index,
+                )
                 _merge_collider_exp_stats_exp(stats, part_stats)
+            else:
+                for data in data_items:
+                    world_points = _transform_collider_exp_local_points_exp(data, self)
+                    part_stats = _append_collider_exp_hull_to_object_exp(
+                        target_obj,
+                        world_points,
+                        self,
+                        material_index=material_index,
+                    )
+                    _merge_collider_exp_stats_exp(stats, part_stats)
         except Exception as e:
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
@@ -11020,6 +14596,7 @@ class CRAY_OT_GenerateConvexHullColliderExp(Operator):
             {
                 "vertex_indices": stats.get("vertex_indices", []),
                 "face_indices": stats.get("face_indices", []),
+                "material_name": material_name,
                 "scope": str(getattr(settings, "collider_scope", "FROM_SELECTED")),
                 "parts": len(data_items),
                 "convex_detail": int(self.convex_detail),
@@ -11138,6 +14715,7 @@ class CRAY_OT_RebuildConvexHullColliderExp(Operator):
             vertex_indices = params.get("vertex_indices", [])
             if replace_whole_object or not vertex_indices:
                 _delete_all_collider_exp_vertices_exp(target_obj)
+                _clear_collider_exp_history_exp(target_obj)
             else:
                 _delete_collider_exp_vertices_exp(target_obj, vertex_indices)
             stats = _append_collider_exp_hull_data_to_object_exp(
@@ -11187,8 +14765,7 @@ class CRAY_OT_RebuildConvexHullColliderExp(Operator):
         )
         try:
             _deselect_all_in_view_layer(context)
-            target_obj.select_set(True)
-            context.view_layer.objects.active = target_obj
+            _select_object_in_view_layer(context, target_obj, active=True)
         except Exception:
             pass
         report_level = {"WARNING"} if (
@@ -11206,11 +14783,204 @@ class CRAY_OT_RebuildConvexHullColliderExp(Operator):
         return {"FINISHED"}
 
 
+class CRAY_OT_ReconvexSelectedComponentsExp(Operator):
+    """Replace selected connected mesh components with one convex hull"""
+
+    bl_idname = "cray.reconvex_selected_components_exp"
+    bl_label = "Re-Convex Selected Components"
+    bl_description = "In Edit Mode, expand the current selection to touched connected face islands and replace them with one convex hull"
+    bl_options = {"REGISTER", "UNDO"}
+
+    merge_distance: FloatProperty(name="Merge Distance", default=0.0, min=0.0)
+    recalc_normals: BoolProperty(name="Recalculate Normals", default=True)
+    convex_detail: IntProperty(
+        name="Hull Detail",
+        description="Simplification/detail level for the merged convex hull",
+        default=16,
+        min=4,
+        max=128,
+    )
+    convex_max_triangles: IntProperty(
+        name="Max Hull Triangles",
+        description="Triangle budget used when simplifying the merged convex hull",
+        default=64,
+        min=4,
+        max=2048,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        obj = getattr(context, "edit_object", None)
+        return obj is not None and getattr(obj, "type", None) == "MESH" and getattr(obj, "mode", "") == "EDIT"
+
+    def invoke(self, context, event):
+        del event
+        props = ("merge_distance", "recalc_normals", "convex_detail", "convex_max_triangles")
+        _copy_collider_exp_settings_to_operator_exp(self, _collider_exp_settings_exp(context), prop_names=props)
+        return self.execute(context)
+
+    def draw(self, context):
+        del context
+        self.layout.prop(self, "convex_detail")
+        self.layout.prop(self, "convex_max_triangles")
+        self.layout.prop(self, "merge_distance")
+        self.layout.prop(self, "recalc_normals")
+
+    def execute(self, context):
+        target_obj = getattr(context, "edit_object", None) or getattr(context, "active_object", None)
+        if target_obj is None or getattr(target_obj, "type", None) != "MESH" or getattr(target_obj, "mode", "") != "EDIT":
+            self.report({"ERROR"}, "Select component faces/verts on a mesh in Edit Mode")
+            return {"CANCELLED"}
+
+        try:
+            mesh = target_obj.data
+            bm = bmesh.from_edit_mesh(mesh)
+            bm.verts.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            bm.faces.ensure_lookup_table()
+
+            islands = _selected_face_islands_for_reconvex(bm)
+            if not islands:
+                raise RuntimeError("Select at least one face/edge/vertex on the component(s) to re-convex")
+
+            island_faces = []
+            seen_faces = set()
+            for island in islands:
+                for face in island:
+                    if face in seen_faces or face is None or not face.is_valid:
+                        continue
+                    seen_faces.add(face)
+                    island_faces.append(face)
+
+            local_points = []
+            seen_points = set()
+            for face in island_faces:
+                for vert in face.verts:
+                    if vert is None or not vert.is_valid:
+                        continue
+                    key = _vector_quantized_key(vert.co)
+                    if key in seen_points:
+                        continue
+                    seen_points.add(key)
+                    local_points.append(vert.co.copy())
+            if len(local_points) < 4:
+                raise RuntimeError("Selected component vertices collapse below 4 unique points")
+
+            world_points = [target_obj.matrix_world @ point for point in local_points]
+            build = _build_collider_exp_hull_data_for_budget_exp(target_obj, world_points, self)
+            material_index = _most_common_material_index_from_faces(island_faces)
+            stats = _replace_face_islands_with_clean_hull_in_edit_object(
+                context,
+                target_obj,
+                build["hull_data"],
+                island_faces,
+                material_index=material_index,
+                recalc_normals=bool(self.recalc_normals),
+            )
+            _apply_collider_exp_hull_build_stats_exp(stats, build)
+            _force_edit_mesh_view_refresh_exp(context, target_obj)
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        report_level = {"WARNING"} if (
+            int(stats.get("max_triangles", 0)) > 0
+            and int(stats.get("triangles", 0)) > int(stats.get("max_triangles", 0))
+        ) else {"INFO"}
+        self.report(
+            report_level,
+            (
+                f"Re-convexed {len(islands)} component(s) in {target_obj.name}: "
+                f"-{stats.get('faces_removed', 0)} faces, +{stats.get('faces_added', 0)} faces, "
+                f"{stats.get('triangles', 0)} tris"
+            ),
+        )
+        return {"FINISHED"}
+
+
+class CRAY_OT_DeleteLastColliderExp(Operator):
+    """Delete the most recently generated experimental collider geometry"""
+
+    bl_idname = "cray.delete_last_collider_exp"
+    bl_label = "Delete Last Created Collider"
+    bl_description = "Deletes one collider geometry item from the last-created history, keeping up to 30 items"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = _collider_exp_settings_exp(context)
+        target_obj, params = _resolve_last_collider_exp_target_exp(context, settings)
+        if target_obj is None:
+            self.report({"ERROR"}, "No last created collider geometry found")
+            return {"CANCELLED"}
+
+        try:
+            stats = _delete_collider_exp_vertices_any_mode_exp(target_obj, params.get("vertex_indices", []))
+            remaining = _pop_last_collider_exp_history_entry_exp(target_obj)
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        self.report(
+            {"INFO"},
+            (
+                f"Deleted last created collider from {target_obj.name}: "
+                f"-{stats.get('verts_removed', 0)} verts, {remaining} stored item(s) left"
+            ),
+        )
+        return {"FINISHED"}
+
+
+class CRAY_OT_SelectConnectedShellFromSelectionExp(Operator):
+    """Select the full connected mesh shell from the current Edit Mode selection"""
+
+    bl_idname = "cray.select_connected_shell_from_selection_exp"
+    bl_label = "Select Connected Shell"
+    bl_description = "In Edit Mode, selects the full connected shell from the currently selected face, edge, or vertex"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = getattr(context, "edit_object", None)
+        return obj is not None and getattr(obj, "type", None) == "MESH" and getattr(obj, "mode", "") == "EDIT"
+
+    def execute(self, context):
+        obj = getattr(context, "edit_object", None)
+        if obj is None or getattr(obj, "type", None) != "MESH":
+            self.report({"ERROR"}, "Open a mesh in Edit Mode and select part of a shell")
+            return {"CANCELLED"}
+
+        try:
+            bm = bmesh.from_edit_mesh(obj.data)
+            if not any(
+                (vert.is_valid and vert.select)
+                for vert in bm.verts
+            ) and not any(
+                (edge.is_valid and edge.select)
+                for edge in bm.edges
+            ) and not any(
+                (face.is_valid and face.select)
+                for face in bm.faces
+            ):
+                raise RuntimeError("Select a face, edge, or vertex first")
+            result = bpy.ops.mesh.select_linked(delimit=set())
+        except TypeError:
+            result = bpy.ops.mesh.select_linked()
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        if "FINISHED" not in set(result or []):
+            self.report({"WARNING"}, "Could not select linked shell")
+            return {"CANCELLED"}
+        self.report({"INFO"}, "Selected connected shell")
+        return {"FINISHED"}
+
+
 class CRAY_OT_CreateCylinderGuideColliderExp(Operator):
-    """Create an editable cylinder guide that can be adjusted before box generation"""
+    """Create a cylinder collider directly in the target Geometry LOD"""
 
     bl_idname = "cray.create_cylinder_guide_collider_exp"
-    bl_label = "Create Cylinder Guide"
+    bl_label = "Create Cylinder"
     bl_options = {"REGISTER", "UNDO"}
 
     target_lod: EnumProperty(name="Target LOD", items=_COLLIDER_TARGET_LOD_ITEMS, default="6")
@@ -11239,26 +15009,43 @@ class CRAY_OT_CreateCylinderGuideColliderExp(Operator):
             self.layout,
             self,
             ("cylinder_segments",),
-            extra_label="Cylinder Guide",
+            extra_label="Cylinder",
         )
 
     def execute(self, context):
         settings = _require_collider_exp_enabled_exp(self, context)
         if settings is None:
             return {"CANCELLED"}
-        source_obj = _resolve_collider_exp_source_object_exp(context, getattr(settings, "source_object", None))
-        if source_obj is None:
-            self.report({"ERROR"}, "Source Object must be a mesh")
-            return {"CANCELLED"}
-
+        source_was_edit = False
         try:
-            data = _collect_collider_exp_input_data_exp(context, source_obj, bounds_only=True)
+            target_obj, source_obj, data_items = _prepare_collider_exp_scope_build_exp(
+                context,
+                settings,
+                self,
+                bounds_only=False,
+            )
+            source_was_edit = getattr(source_obj, "mode", "") == "EDIT"
+            material_index, material_name = _ensure_collider_placeholder_material(
+                target_obj,
+                source_obj,
+                data_items=data_items,
+            )
             if getattr(source_obj, "mode", "OBJECT") != "OBJECT":
                 bpy.ops.object.mode_set(mode="OBJECT")
-            guide_obj = _create_collider_exp_guide_object_exp(context, data, self, "CYLINDER")
-            _deselect_all_in_view_layer(context)
-            guide_obj.select_set(True)
-            context.view_layer.objects.active = guide_obj
+            stats = _collider_exp_empty_stats_exp()
+            for data in data_items:
+                vertices, faces = _cylinder_guide_mesh_from_data_exp(data, self)
+                vertices = _collider_exp_local_vertices_to_world_exp(data, vertices, self)
+                part_stats = _append_collider_exp_mesh_to_object_exp(
+                    target_obj,
+                    vertices,
+                    faces,
+                    merge_distance=self.merge_distance,
+                    recalc_normals=bool(self.recalc_normals),
+                    material_index=material_index,
+                )
+                _merge_collider_exp_stats_exp(stats, part_stats)
+            _restore_collider_exp_source_context_exp(context, source_obj, restore_edit_mode=source_was_edit)
         except Exception as e:
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
@@ -11269,15 +15056,28 @@ class CRAY_OT_CreateCylinderGuideColliderExp(Operator):
             settings.exp_mode = "CYLINDER_BOXES"
         except Exception:
             pass
-        self.report({"INFO"}, f"Created editable cylinder guide: {guide_obj.name}")
+        _set_collider_exp_custom_props_exp(
+            target_obj,
+            "CYLINDER",
+            source_obj,
+            {
+                "vertex_indices": stats.get("vertex_indices", []),
+                "face_indices": stats.get("face_indices", []),
+                "material_name": material_name,
+                "segments": int(self.cylinder_segments),
+                "scope": str(getattr(settings, "collider_scope", "FROM_SELECTED")),
+                "parts": len(data_items),
+            },
+        )
+        self.report({"INFO"}, f"Created {len(data_items)} cylinder collider part(s) in {target_obj.name}")
         return {"FINISHED"}
 
 
 class CRAY_OT_CreatePipeGuideColliderExp(Operator):
-    """Create an editable pipe guide that can be adjusted before box generation"""
+    """Create a pipe collider directly in the target Geometry LOD"""
 
     bl_idname = "cray.create_pipe_guide_collider_exp"
-    bl_label = "Create Pipe Guide"
+    bl_label = "Create Pipe"
     bl_options = {"REGISTER", "UNDO"}
 
     target_lod: EnumProperty(name="Target LOD", items=_COLLIDER_TARGET_LOD_ITEMS, default="6")
@@ -11293,10 +15093,10 @@ class CRAY_OT_CreatePipeGuideColliderExp(Operator):
     merge_distance: FloatProperty(name="Merge Distance", default=0.0, min=0.0)
     recalc_normals: BoolProperty(name="Recalculate Normals", default=True)
     pipe_segments: IntProperty(name="Pipe Segments", default=24, min=4, max=128)
-    pipe_inner_radius: FloatProperty(name="Pipe Inner Radius", default=0.5, min=0.0)
-    pipe_outer_radius: FloatProperty(name="Pipe Outer Radius", default=1.0, min=0.001)
-    pipe_depth: FloatProperty(name="Pipe Depth", default=0.25, min=0.001)
-    pipe_thickness: FloatProperty(name="Pipe Thickness", default=0.25, min=0.001)
+    pipe_inner_radius: FloatProperty(name="Pipe Inner Radius", default=0.5, min=0.0, precision=4, unit="LENGTH")
+    pipe_outer_radius: FloatProperty(name="Pipe Outer Radius", default=1.0, min=0.001, precision=4, unit="LENGTH")
+    pipe_depth: FloatProperty(name="Pipe Depth", default=0.25, min=0.001, precision=4, unit="LENGTH")
+    pipe_thickness: FloatProperty(name="Pipe Thickness", default=0.25, min=0.0, precision=4, unit="LENGTH")
 
     def invoke(self, context, event):
         del event
@@ -11322,26 +15122,43 @@ class CRAY_OT_CreatePipeGuideColliderExp(Operator):
                 "pipe_thickness",
                 "pipe_depth",
             ),
-            extra_label="Pipe Guide",
+            extra_label="Pipe",
         )
 
     def execute(self, context):
         settings = _require_collider_exp_enabled_exp(self, context)
         if settings is None:
             return {"CANCELLED"}
-        source_obj = _resolve_collider_exp_guide_creation_source_exp(context, settings)
-        if source_obj is None:
-            self.report({"ERROR"}, "Source Object must be a mesh")
-            return {"CANCELLED"}
-
+        source_was_edit = False
         try:
-            data = _collect_collider_exp_input_data_exp(context, source_obj, bounds_only=True)
+            target_obj, source_obj, data_items = _prepare_collider_exp_scope_build_exp(
+                context,
+                settings,
+                self,
+                bounds_only=True,
+            )
+            source_was_edit = getattr(source_obj, "mode", "") == "EDIT"
+            material_index, material_name = _ensure_collider_placeholder_material(
+                target_obj,
+                source_obj,
+                data_items=data_items,
+            )
             if getattr(source_obj, "mode", "OBJECT") != "OBJECT":
                 bpy.ops.object.mode_set(mode="OBJECT")
-            guide_obj = _create_collider_exp_guide_object_exp(context, data, self, "PIPE")
-            _deselect_all_in_view_layer(context)
-            guide_obj.select_set(True)
-            context.view_layer.objects.active = guide_obj
+            stats = _collider_exp_empty_stats_exp()
+            for data in data_items:
+                vertices, faces = _pipe_guide_mesh_from_data_exp(data, self)
+                vertices = _collider_exp_local_vertices_to_world_exp(data, vertices, self)
+                part_stats = _append_collider_exp_mesh_to_object_exp(
+                    target_obj,
+                    vertices,
+                    faces,
+                    merge_distance=self.merge_distance,
+                    recalc_normals=bool(self.recalc_normals),
+                    material_index=material_index,
+                )
+                _merge_collider_exp_stats_exp(stats, part_stats)
+            _restore_collider_exp_source_context_exp(context, source_obj, restore_edit_mode=source_was_edit)
         except Exception as e:
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
@@ -11358,7 +15175,24 @@ class CRAY_OT_CreatePipeGuideColliderExp(Operator):
             settings.exp_mode = "PIPE_BOXES"
         except Exception:
             pass
-        self.report({"INFO"}, f"Created editable pipe guide: {guide_obj.name}")
+        _set_collider_exp_custom_props_exp(
+            target_obj,
+            "PIPE",
+            source_obj,
+            {
+                "vertex_indices": stats.get("vertex_indices", []),
+                "face_indices": stats.get("face_indices", []),
+                "material_name": material_name,
+                "segments": int(self.pipe_segments),
+                "inner_radius": float(self.pipe_inner_radius),
+                "outer_radius": float(self.pipe_outer_radius),
+                "thickness": float(self.pipe_thickness),
+                "depth": float(self.pipe_depth),
+                "scope": str(getattr(settings, "collider_scope", "FROM_SELECTED")),
+                "parts": len(data_items),
+            },
+        )
+        self.report({"INFO"}, f"Created {len(data_items)} pipe collider part(s) in {target_obj.name}")
         return {"FINISHED"}
 
 
@@ -11366,7 +15200,7 @@ class CRAY_OT_GenerateCylinderBoxesColliderExp(Operator):
     """Generate experimental box segments around a cylindrical form"""
 
     bl_idname = "cray.generate_cylinder_boxes_collider_exp"
-    bl_label = "Generate Cylinder Boxes From Guide"
+    bl_label = "Generate Cylinder Boxes"
     bl_options = {"REGISTER", "UNDO"}
 
     target_lod: EnumProperty(name="Target LOD", items=_COLLIDER_TARGET_LOD_ITEMS, default="6")
@@ -11397,33 +15231,66 @@ class CRAY_OT_GenerateCylinderBoxesColliderExp(Operator):
         settings = _require_collider_exp_enabled_exp(self, context)
         if settings is None:
             return {"CANCELLED"}
-        source_obj, target_source_obj = _require_collider_exp_guide_source_exp(self, context, settings, "CYLINDER")
-        if source_obj is None:
-            return {"CANCELLED"}
+        guide_obj = _resolve_collider_exp_source_object_exp(
+            context,
+            getattr(settings, "source_object", None) if settings is not None else None,
+        )
+        source_obj = None
+        target_source_obj = None
+        guide_mode = _is_collider_exp_guide_object_exp(guide_obj, "CYLINDER")
+        restore_obj = None
+        restore_edit = False
         try:
-            if getattr(source_obj, "mode", "OBJECT") != "OBJECT":
-                bpy.ops.object.mode_set(mode="OBJECT")
-            target_obj = _ensure_collider_exp_target_object_exp(context, settings, target_source_obj, op=self)
-            if target_obj == source_obj:
-                raise RuntimeError("Target Geometry LOD must be separate from the Source Object")
-            data = _collect_collider_exp_input_data_exp(context, source_obj, bounds_only=False)
-            vertices, faces, inner_factor = _cylinder_box_mesh_from_data_exp(data, self)
-            stats = _append_collider_exp_mesh_to_object_exp(
+            if guide_mode:
+                source_obj = guide_obj
+                target_source_obj = _collider_exp_guide_source_object_exp(context, source_obj, settings) or source_obj
+                restore_obj = target_source_obj
+                if getattr(source_obj, "mode", "OBJECT") != "OBJECT":
+                    bpy.ops.object.mode_set(mode="OBJECT")
+                target_obj = _ensure_collider_exp_target_object_exp(context, settings, target_source_obj, op=self)
+                if target_obj == source_obj:
+                    raise RuntimeError("Target Geometry LOD must be separate from the Source Object")
+                data_items = [_collect_collider_exp_input_data_exp(context, source_obj, bounds_only=False)]
+            else:
+                target_obj, target_source_obj, data_items = _prepare_collider_exp_direct_boxes_build_exp(
+                    context,
+                    settings,
+                    self,
+                    bounds_only=False,
+                )
+                restore_obj = target_source_obj
+                restore_edit = getattr(target_source_obj, "mode", "") == "EDIT"
+                if getattr(target_source_obj, "mode", "OBJECT") != "OBJECT":
+                    bpy.ops.object.mode_set(mode="OBJECT")
+
+            material_index, material_name = _ensure_collider_placeholder_material(
                 target_obj,
-                vertices,
-                faces,
-                merge_distance=self.merge_distance,
-                recalc_normals=bool(self.recalc_normals),
+                target_source_obj,
+                data_items=[] if guide_mode else data_items,
             )
-            _remove_collider_exp_guide_after_conversion_exp(context, source_obj)
-            _deselect_all_in_view_layer(context)
-            target_obj.select_set(True)
-            context.view_layer.objects.active = target_obj
+            stats = _collider_exp_empty_stats_exp()
+            inner_factor = 0.0
+            actual_segments = 0
+            for data in data_items:
+                vertices, faces, part_inner_factor = _cylinder_box_mesh_from_data_exp(data, self)
+                part_stats = _append_collider_exp_mesh_to_object_exp(
+                    target_obj,
+                    vertices,
+                    faces,
+                    merge_distance=self.merge_distance,
+                    recalc_normals=bool(self.recalc_normals),
+                    material_index=material_index,
+                )
+                _merge_collider_exp_stats_exp(stats, part_stats)
+                inner_factor = float(part_inner_factor)
+                actual_segments += len(faces) // len(_COLLIDER_EXP_BOX_FACES)
+            if guide_mode:
+                _remove_collider_exp_guide_after_conversion_exp(context, source_obj)
+            _restore_collider_exp_source_context_exp(context, restore_obj, restore_edit_mode=restore_edit)
         except Exception as e:
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
 
-        actual_segments = len(faces) // len(_COLLIDER_EXP_BOX_FACES)
         props = ("target_lod", "minimum_size", "merge_distance", "recalc_normals")
         _write_collider_exp_operator_to_settings_exp(self, settings, prop_names=props)
         try:
@@ -11437,8 +15304,11 @@ class CRAY_OT_GenerateCylinderBoxesColliderExp(Operator):
             {
                 "vertex_indices": stats.get("vertex_indices", []),
                 "face_indices": stats.get("face_indices", []),
+                "material_name": material_name,
                 "inner_factor": float(inner_factor),
                 "segments": int(actual_segments),
+                "scope": str(getattr(settings, "collider_scope", "FROM_SELECTED")),
+                "parts": len(data_items),
             },
         )
         self.report({"INFO"}, f"Generated {actual_segments} cylinder box segments in {target_obj.name}")
@@ -11449,7 +15319,7 @@ class CRAY_OT_GeneratePipeBoxesColliderExp(Operator):
     """Generate experimental box segments around a ring or pipe"""
 
     bl_idname = "cray.generate_pipe_boxes_collider_exp"
-    bl_label = "Generate Pipe Boxes From Guide"
+    bl_label = "Generate Pipe Boxes"
     bl_options = {"REGISTER", "UNDO"}
 
     target_lod: EnumProperty(name="Target LOD", items=_COLLIDER_TARGET_LOD_ITEMS, default="6")
@@ -11465,10 +15335,10 @@ class CRAY_OT_GeneratePipeBoxesColliderExp(Operator):
     merge_distance: FloatProperty(name="Merge Distance", default=0.0, min=0.0)
     recalc_normals: BoolProperty(name="Recalculate Normals", default=True)
     pipe_segments: IntProperty(name="Pipe Segments", default=24, min=4, max=128)
-    pipe_inner_radius: FloatProperty(name="Pipe Inner Radius", default=0.5, min=0.0)
-    pipe_outer_radius: FloatProperty(name="Pipe Outer Radius", default=1.0, min=0.001)
-    pipe_depth: FloatProperty(name="Pipe Depth", default=0.25, min=0.001)
-    pipe_thickness: FloatProperty(name="Pipe Thickness", default=0.25, min=0.001)
+    pipe_inner_radius: FloatProperty(name="Pipe Inner Radius", default=0.5, min=0.0, precision=4, unit="LENGTH")
+    pipe_outer_radius: FloatProperty(name="Pipe Outer Radius", default=1.0, min=0.001, precision=4, unit="LENGTH")
+    pipe_depth: FloatProperty(name="Pipe Depth", default=0.25, min=0.001, precision=4, unit="LENGTH")
+    pipe_thickness: FloatProperty(name="Pipe Thickness", default=0.25, min=0.0, precision=4, unit="LENGTH")
 
     def invoke(self, context, event):
         del event
@@ -11484,33 +15354,64 @@ class CRAY_OT_GeneratePipeBoxesColliderExp(Operator):
         settings = _require_collider_exp_enabled_exp(self, context)
         if settings is None:
             return {"CANCELLED"}
-        source_obj, target_source_obj = _require_collider_exp_guide_source_exp(self, context, settings, "PIPE")
-        if source_obj is None:
-            return {"CANCELLED"}
+        guide_obj = _resolve_collider_exp_source_object_exp(
+            context,
+            getattr(settings, "source_object", None) if settings is not None else None,
+        )
+        source_obj = None
+        target_source_obj = None
+        guide_mode = _is_collider_exp_guide_object_exp(guide_obj, "PIPE")
+        restore_obj = None
+        restore_edit = False
         try:
-            if getattr(source_obj, "mode", "OBJECT") != "OBJECT":
-                bpy.ops.object.mode_set(mode="OBJECT")
-            target_obj = _ensure_collider_exp_target_object_exp(context, settings, target_source_obj, op=self)
-            if target_obj == source_obj:
-                raise RuntimeError("Target Geometry LOD must be separate from the Source Object")
-            data = _collect_collider_exp_input_data_exp(context, source_obj, bounds_only=False)
-            vertices, faces = _pipe_box_mesh_from_data_exp(data, self)
-            stats = _append_collider_exp_mesh_to_object_exp(
+            if guide_mode:
+                source_obj = guide_obj
+                target_source_obj = _collider_exp_guide_source_object_exp(context, source_obj, settings) or source_obj
+                restore_obj = target_source_obj
+                if getattr(source_obj, "mode", "OBJECT") != "OBJECT":
+                    bpy.ops.object.mode_set(mode="OBJECT")
+                target_obj = _ensure_collider_exp_target_object_exp(context, settings, target_source_obj, op=self)
+                if target_obj == source_obj:
+                    raise RuntimeError("Target Geometry LOD must be separate from the Source Object")
+                data_items = [_collect_collider_exp_input_data_exp(context, source_obj, bounds_only=False)]
+            else:
+                target_obj, target_source_obj, data_items = _prepare_collider_exp_direct_boxes_build_exp(
+                    context,
+                    settings,
+                    self,
+                    bounds_only=False,
+                )
+                restore_obj = target_source_obj
+                restore_edit = getattr(target_source_obj, "mode", "") == "EDIT"
+                if getattr(target_source_obj, "mode", "OBJECT") != "OBJECT":
+                    bpy.ops.object.mode_set(mode="OBJECT")
+
+            material_index, material_name = _ensure_collider_placeholder_material(
                 target_obj,
-                vertices,
-                faces,
-                merge_distance=self.merge_distance,
-                recalc_normals=bool(self.recalc_normals),
+                target_source_obj,
+                data_items=[] if guide_mode else data_items,
             )
-            _remove_collider_exp_guide_after_conversion_exp(context, source_obj)
-            _deselect_all_in_view_layer(context)
-            target_obj.select_set(True)
-            context.view_layer.objects.active = target_obj
+            stats = _collider_exp_empty_stats_exp()
+            actual_segments = 0
+            for data in data_items:
+                vertices, faces = _pipe_box_mesh_from_data_exp(data, self)
+                part_stats = _append_collider_exp_mesh_to_object_exp(
+                    target_obj,
+                    vertices,
+                    faces,
+                    merge_distance=self.merge_distance,
+                    recalc_normals=bool(self.recalc_normals),
+                    material_index=material_index,
+                )
+                _merge_collider_exp_stats_exp(stats, part_stats)
+                actual_segments += len(faces) // len(_COLLIDER_EXP_BOX_FACES)
+            if guide_mode:
+                _remove_collider_exp_guide_after_conversion_exp(context, source_obj)
+            _restore_collider_exp_source_context_exp(context, restore_obj, restore_edit_mode=restore_edit)
         except Exception as e:
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
 
-        actual_segments = len(faces) // len(_COLLIDER_EXP_BOX_FACES)
         props = ("target_lod", "minimum_size", "merge_distance", "recalc_normals")
         _write_collider_exp_operator_to_settings_exp(self, settings, prop_names=props)
         try:
@@ -11524,11 +15425,14 @@ class CRAY_OT_GeneratePipeBoxesColliderExp(Operator):
             {
                 "vertex_indices": stats.get("vertex_indices", []),
                 "face_indices": stats.get("face_indices", []),
+                "material_name": material_name,
                 "segments": int(actual_segments),
                 "inner_radius": float(self.pipe_inner_radius),
                 "outer_radius": float(self.pipe_outer_radius),
                 "thickness": float(self.pipe_thickness),
                 "depth": float(self.pipe_depth),
+                "scope": str(getattr(settings, "collider_scope", "FROM_SELECTED")),
+                "parts": len(data_items),
             },
         )
         self.report({"INFO"}, f"Generated {actual_segments} pipe box segments in {target_obj.name}")
@@ -11582,6 +15486,11 @@ class CRAY_OT_GenerateSphereColliderExp(Operator):
                 self,
                 bounds_only=True,
             )
+            material_index, material_name = _ensure_collider_placeholder_material(
+                target_obj,
+                source_obj,
+                data_items=data_items,
+            )
             stats = _collider_exp_empty_stats_exp()
             for data in data_items:
                 vertices, faces = _sphere_mesh_from_data_exp(data, self)
@@ -11591,6 +15500,7 @@ class CRAY_OT_GenerateSphereColliderExp(Operator):
                     faces,
                     merge_distance=self.merge_distance,
                     recalc_normals=bool(self.recalc_normals),
+                    material_index=material_index,
                 )
                 _merge_collider_exp_stats_exp(stats, part_stats)
         except Exception as e:
@@ -11610,6 +15520,7 @@ class CRAY_OT_GenerateSphereColliderExp(Operator):
             {
                 "vertex_indices": stats.get("vertex_indices", []),
                 "face_indices": stats.get("face_indices", []),
+                "material_name": material_name,
                 "scope": str(getattr(settings, "collider_scope", "FROM_SELECTED")),
                 "parts": len(data_items),
             },
@@ -11685,6 +15596,11 @@ class CRAY_OT_GenerateCapsuleColliderExp(Operator):
                 self,
                 bounds_only=True,
             )
+            material_index, material_name = _ensure_collider_placeholder_material(
+                target_obj,
+                source_obj,
+                data_items=data_items,
+            )
             stats = _collider_exp_empty_stats_exp()
             for data in data_items:
                 vertices, faces = _capsule_mesh_from_data_exp(data, self)
@@ -11694,6 +15610,7 @@ class CRAY_OT_GenerateCapsuleColliderExp(Operator):
                     faces,
                     merge_distance=self.merge_distance,
                     recalc_normals=bool(self.recalc_normals),
+                    material_index=material_index,
                 )
                 _merge_collider_exp_stats_exp(stats, part_stats)
         except Exception as e:
@@ -11719,6 +15636,7 @@ class CRAY_OT_GenerateCapsuleColliderExp(Operator):
             {
                 "vertex_indices": stats.get("vertex_indices", []),
                 "face_indices": stats.get("face_indices", []),
+                "material_name": material_name,
                 "scope": str(getattr(settings, "collider_scope", "FROM_SELECTED")),
                 "parts": len(data_items),
                 "capsule_follow_source_angle": bool(self.capsule_follow_source_angle),
@@ -11816,10 +15734,16 @@ class CRAY_OT_RunCollisionToolSelfTestExp(Operator):
     bl_label = "NH Debug / Run Collision Tool Self Test"
     bl_options = {"REGISTER", "UNDO"}
 
-    def _run_step(self, label, log, callback, *, expect_finished=True):
+    def _run_step(self, label, log, callback, *, expect_finished=True, expected_error=None):
         try:
             result = callback()
         except Exception as e:
+            message = _fmt_exc(e)
+            if not expect_finished:
+                if expected_error and expected_error not in message:
+                    raise RuntimeError(f"{label}: expected error containing {expected_error!r}, got {message}")
+                log.append(f"{label}: ['CANCELLED'] ({message})")
+                return {"CANCELLED"}
             raise RuntimeError(f"{label}: traceback: {_fmt_exc(e)}")
 
         if isinstance(result, set):
@@ -11832,6 +15756,8 @@ class CRAY_OT_RunCollisionToolSelfTestExp(Operator):
         log.append(f"{label}: {sorted(result_set)}")
         if expect_finished and "FINISHED" not in result_set:
             raise RuntimeError(f"{label}: expected FINISHED, got {sorted(result_set)}")
+        if not expect_finished and "FINISHED" in result_set:
+            raise RuntimeError(f"{label}: expected non-FINISHED, got {sorted(result_set)}")
         return result_set
 
     def execute(self, context):
@@ -11873,6 +15799,7 @@ class CRAY_OT_RunCollisionToolSelfTestExp(Operator):
             "convex_detail",
             "convex_max_triangles",
             "minimum_size",
+            "normal_minimum_size",
             "merge_distance",
             "recalc_normals",
         )
@@ -11912,6 +15839,7 @@ class CRAY_OT_RunCollisionToolSelfTestExp(Operator):
             settings.convex_detail = 8
             settings.convex_max_triangles = 32
             settings.minimum_size = 0.05
+            settings.normal_minimum_size = False
             settings.merge_distance = 0.0
             settings.recalc_normals = True
 
@@ -11926,6 +15854,7 @@ class CRAY_OT_RunCollisionToolSelfTestExp(Operator):
                     "EXEC_DEFAULT",
                     target_lod="6",
                     minimum_size=0.05,
+                    normal_minimum_size=False,
                     recalc_normals=True,
                 ),
             )
@@ -12004,6 +15933,7 @@ class CRAY_OT_RunCollisionToolSelfTestExp(Operator):
                     minimum_size=0.01,
                 ),
                 expect_finished=False,
+                expected_error="No collision objects found",
             )
 
             _deselect_all_in_view_layer(context)
@@ -12018,6 +15948,7 @@ class CRAY_OT_RunCollisionToolSelfTestExp(Operator):
                     minimum_size=0.01,
                 ),
                 expect_finished=False,
+                expected_error="No collision objects found",
             )
 
             settings.geometry_object = collision_obj
@@ -12952,6 +16883,7 @@ def _texture_tools_folder_from_settings(settings=None) -> str:
 
 def _texture_tool_candidates(filename: str, settings=None, include_bin=False):
     addon_dir = _get_addon_dir()
+    bundled_tools_dir = "_nh_blender_tools"
     candidates = []
     configured = _texture_tools_folder_from_settings(settings)
     if configured:
@@ -12961,14 +16893,17 @@ def _texture_tool_candidates(filename: str, settings=None, include_bin=False):
             candidates.append(os.path.join(configured, "bin", filename))
         candidates.append(os.path.join(configured, filename))
 
+    candidates.append(os.path.join(addon_dir, bundled_tools_dir, "xray_tex_converter", filename))
+    if include_bin:
+        candidates.append(os.path.join(addon_dir, bundled_tools_dir, "xray_tex_converter", "bin", filename))
     candidates.append(os.path.join(addon_dir, "tools", "xray_tex_converter", filename))
     if include_bin:
         candidates.append(os.path.join(addon_dir, "tools", "xray_tex_converter", "bin", filename))
 
     if _path_is_scripts_addons_dir(addon_dir):
-        candidates.append(os.path.join(addon_dir, "NH_Blender", "tools", "xray_tex_converter", filename))
+        candidates.append(os.path.join(addon_dir, bundled_tools_dir, "xray_tex_converter", filename))
         if include_bin:
-            candidates.append(os.path.join(addon_dir, "NH_Blender", "tools", "xray_tex_converter", "bin", filename))
+            candidates.append(os.path.join(addon_dir, bundled_tools_dir, "xray_tex_converter", "bin", filename))
         candidates.append(os.path.join(addon_dir, "tools", "xray_tex_converter", filename))
         if include_bin:
             candidates.append(os.path.join(addon_dir, "tools", "xray_tex_converter", "bin", filename))
@@ -12988,7 +16923,7 @@ def _expected_texture_tools_folder(settings=None) -> str:
 
     addon_dir = _get_addon_dir()
     if _path_is_scripts_addons_dir(addon_dir):
-        return _norm_path(os.path.join(addon_dir, "NH_Blender", "tools"))
+        return _norm_path(os.path.join(addon_dir, "_nh_blender_tools"))
     return _norm_path(os.path.join(addon_dir, "tools"))
 
 def _get_expected_python_dds_converter_paths(settings=None):
@@ -13480,53 +17415,6 @@ def _tex_export_source_tried_lines(source_root, rel_dir: str, names):
             out.append(_norm_path(os.path.join(root, base + ".dds")))
     return _unique_ci(out)
 
-_TEX_EXPORT_CONSOLE_INFO_CODES = {
-    "EXPORT_START",
-    "EXPORT_REQUESTS_COLLECTED",
-    "SOURCE_DDS_SCAN_DONE",
-    "REQUEST_BEGIN",
-    "SOURCE_SEARCH_RESULT",
-    "SOURCE_FOUND_DIFFUSE",
-    "SOURCE_FOUND_BUMP",
-    "CHANNEL_START",
-    "CHANNEL_EXISTING_FOUND",
-    "SKIP_EXISTING_PNG",
-    "SKIP_EXISTING_PAA",
-    "DDS_BACKEND_SELECT",
-    "DDS_BACKEND_ATTEMPT",
-    "DDS_BACKEND_OK",
-    "DDS_BACKEND_FAILED",
-    "DDS_CONVERT_START",
-    "DDS_LOAD_START",
-    "DDS_LOAD_OK",
-    "PNG_SAVE_START",
-    "PNG_SAVE_OK",
-    "DDS_CONVERT_OK",
-    "PAA_CONVERT_START",
-    "PAA_CONVERT_OK",
-    "PNG_DELETE_AFTER_PAA_OK",
-    "RVMAT_CREATE_START",
-    "RVMAT_CREATE_OK",
-    "LOG_FILE_WRITTEN",
-}
-
-_TEX_EXPORT_REASON_SUMMARY = (
-    ("DDS source found", ("SOURCE_FOUND_DIFFUSE", "SOURCE_FOUND_BUMP")),
-    ("Diffuse source missing", ("SOURCE_MISSING_DIFFUSE",)),
-    ("Bump source missing", ("SOURCE_MISSING_BUMP",)),
-    ("DDS convert OK", ("DDS_CONVERT_OK",)),
-    ("DDS convert failed", ("DDS_CONVERT_FAILED",)),
-    ("PNG missing after convert", ("OUTPUT_MISSING_AFTER_DDS_CONVERT",)),
-    ("PNG skipped existing", ("SKIP_EXISTING_PNG",)),
-    ("PAA tool missing", ("PAA_TOOL_MISSING",)),
-    ("PAA convert OK", ("PAA_CONVERT_OK",)),
-    ("PAA convert failed", ("PAA_CONVERT_FAILED",)),
-    ("RVMAT created", ("RVMAT_CREATE_OK",)),
-    ("RVMAT skipped existing", ("RVMAT_SKIP_EXISTING",)),
-    ("RVMAT fallback NOHQ", ("RVMAT_FALLBACK_NOHQ",)),
-    ("RVMAT fallback SMDI", ("RVMAT_FALLBACK_SMDI",)),
-)
-
 def _tex_export_file_size(path: str):
     try:
         return os.path.getsize(path) if path and os.path.isfile(path) else None
@@ -13812,29 +17700,6 @@ def _write_texture_export_last_report(
         json.dump(report_data, f, ensure_ascii=False, indent=2, sort_keys=True)
 
     return report_txt_path
-
-def _print_texture_export_diagnostics(events, verbose=True):
-    print("=== Texture Source Export Diagnostics ===")
-    printed = 0
-    for event in events:
-        level = event.get("level", "INFO")
-        code = event.get("code", "")
-        if level in {"ERROR", "WARNING"} or (level == "INFO" and (verbose or code in _TEX_EXPORT_CONSOLE_INFO_CODES)):
-            print(_tex_export_event_text(event))
-            printed += 1
-    if not printed:
-        print("No warnings/errors were recorded.")
-
-def _print_texture_export_reason_summary(events):
-    counts = {}
-    for event in events:
-        code = event.get("code")
-        counts[code] = counts.get(code, 0) + 1
-
-    print("=== Texture Source Export Reason Summary ===")
-    for label, codes in _TEX_EXPORT_REASON_SUMMARY:
-        total = sum(counts.get(code, 0) for code in codes)
-        print(f"{label}: {total}")
 
 def _print_texture_export_backend_summary(events):
     ok_by_backend = {}
@@ -14156,10 +18021,6 @@ def _move_object_to_collection(obj, target_collection, unlink_roots=None):
     if not _collection_directly_contains_object(target_collection, obj):
         _link_object_to_collection(obj, target_collection)
 
-def _is_export_helper_empty_name(name: str) -> bool:
-    n = (name or "").strip().lower()
-    return n == "visuals" or n.endswith("_a.p3d")
-
 def _scene_fix_collection_name(scene):
     scene_name = (getattr(scene, "name", "") or "").strip()
     if not scene_name:
@@ -14459,22 +18320,6 @@ def _collect_repair_a3ob_scope(context, target_obj):
 
     return _collect_fix_scope(context, target_obj)
 
-def _pick_primary_mesh(scope_objs, preferred_obj):
-    meshes = [o for o in scope_objs if o.type == "MESH" and o.data is not None]
-    if not meshes:
-        return None, "none"
-
-    if preferred_obj in meshes and not _is_helper_object_name(preferred_obj.name):
-        return preferred_obj, "preferred"
-
-    non_helper = [o for o in meshes if not _is_helper_object_name(o.name)]
-    if non_helper:
-        best = max(non_helper, key=lambda o: len(o.data.polygons) if o.data else 0)
-        return best, "largest-non-helper"
-
-    best = max(meshes, key=lambda o: len(o.data.polygons) if o.data else 0)
-    return best, "largest-mesh"
-
 def _largest_mesh(objs):
     meshes = [o for o in objs if o is not None and o.type == "MESH" and o.data is not None]
     if not meshes:
@@ -14536,32 +18381,6 @@ def _resolve_fix_target_object(context, picked_obj):
 
     return _resolve_tex_target_object(context, picked_obj)
 
-def _collect_collection_objects_deep(collection):
-    if collection is None:
-        return []
-
-    out = []
-    seen_cols = set()
-    seen_objs = set()
-    stack = [collection]
-    while stack:
-        col = stack.pop()
-        if col is None:
-            continue
-        col_key = col.as_pointer()
-        if col_key in seen_cols:
-            continue
-        seen_cols.add(col_key)
-
-        for obj in col.objects:
-            obj_key = obj.as_pointer()
-            if obj_key in seen_objs:
-                continue
-            seen_objs.add(obj_key)
-            out.append(obj)
-        stack.extend(col.children)
-    return out
-
 def _collect_collections_deep(collection):
     if collection is None:
         return []
@@ -14580,31 +18399,6 @@ def _collect_collections_deep(collection):
         out.append(col)
         stack.extend(col.children)
     return out
-
-def _pick_random_scene_fix_mesh(context):
-    root_col = context.scene.collection.children.get(_ROOT_COLLECTION_NAME)
-    if root_col is not None:
-        root_col_meshes = [
-            o for o in _collect_collection_objects_deep(root_col)
-            if o.type == "MESH" and o.data is not None and len(o.data.polygons) > 0
-        ]
-        if root_col_meshes:
-            non_helper = [o for o in root_col_meshes if not _is_helper_object_name(o.name)]
-            if non_helper:
-                return random.choice(non_helper), "collection-random-non-helper"
-            return random.choice(root_col_meshes), "collection-random"
-
-    scene_meshes = [
-        o for o in context.scene.objects
-        if o.type == "MESH" and o.data is not None and len(o.data.polygons) > 0
-    ]
-    if not scene_meshes:
-        return None, "none"
-
-    non_helper = [o for o in scene_meshes if not _is_helper_object_name(o.name)]
-    if non_helper:
-        return random.choice(non_helper), "scene-random-non-helper"
-    return random.choice(scene_meshes), "scene-random"
 
 def _resolve_tex_target_object(context, picked_obj):
     if picked_obj is not None and picked_obj.type == "MESH":
@@ -14705,24 +18499,6 @@ def _cleanup_target_collection_keep_mesh(target_collection, keep_obj):
             _ui_yield()
 
     return deleted_objects, deleted_collections
-
-def _unlink_collection_from_all_parents(col):
-    if col is None:
-        return
-    for scene in _iter_safe_scenes():
-        try:
-            if scene.collection.children.get(col.name) is not None:
-                scene.collection.children.unlink(col)
-        except Exception:
-            pass
-    for parent in list(bpy.data.collections):
-        if parent == col:
-            continue
-        try:
-            if parent.children.get(col.name) is not None:
-                parent.children.unlink(col)
-        except Exception:
-            pass
 
 def _unlink_collection_from_scene_parents(scene, col):
     if scene is None or col is None:
@@ -15121,11 +18897,70 @@ def _get_material_first_image_path(mat: bpy.types.Material):
 
     return None
 
+def _material_identity_value_usable(value) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    if _is_placeholder_material_name(raw):
+        return False
+    if _is_invalid_windows_filename_component(raw) or _is_blender_install_texture_path_invalid(raw):
+        return False
+    return True
+
+
+def _source_material_export_paths(src_mat: bpy.types.Material):
+    if src_mat is None:
+        return None, None
+
+    paa_path, rvmat_path = _get_a3ob_material_paths(src_mat)
+    paa_path = paa_path if _material_identity_value_usable(paa_path) else None
+    rvmat_path = rvmat_path if _material_identity_value_usable(rvmat_path) else None
+
+    if not paa_path:
+        image_path = _get_material_first_image_path(src_mat)
+        if _material_identity_value_usable(image_path):
+            paa_path = image_path
+
+    return paa_path, rvmat_path
+
+
+def _material_identity_quality(mat: bpy.types.Material) -> int:
+    if mat is None:
+        return -1
+    paa_path, rvmat_path = _get_a3ob_material_paths(mat)
+    if _material_identity_value_usable(paa_path):
+        return 40
+    if _material_identity_value_usable(rvmat_path):
+        return 30
+    if _material_identity_value_usable(_get_material_first_image_path(mat)):
+        return 20
+    if _material_identity_value_usable(getattr(mat, "name", "")):
+        return 10
+    return 0
+
+
+def _sync_collider_material_identity_from_source(target_mat: bpy.types.Material, src_mat: bpy.types.Material):
+    if target_mat is None:
+        return
+
+    paa_path, rvmat_path = _source_material_export_paths(src_mat)
+    try:
+        _set_a3ob_material_paths(
+            target_mat,
+            paa_path,
+            rvmat_path,
+            clear_paa=not bool(paa_path),
+            clear_rvmat=not bool(rvmat_path),
+        )
+    except Exception:
+        pass
+
+
 def _derive_roadway_material_name(src_mat: bpy.types.Material):
     if src_mat is None:
         return "RoadwayMaterial"
 
-    paa_path, rvmat_path = _get_a3ob_material_paths(src_mat)
+    paa_path, rvmat_path = _source_material_export_paths(src_mat)
     candidates = [
         paa_path,
         rvmat_path,
@@ -15157,6 +18992,7 @@ def _ensure_roadway_material(target_materials, src_mat: bpy.types.Material):
     existing_index = _find_material_slot_index_by_name_ci(target_materials, material_name)
     if existing_index is not None:
         existing_mat = target_materials[existing_index]
+        _sync_collider_material_identity_from_source(existing_mat, src_mat)
         return existing_index, existing_mat.name
 
     if src_mat is not None:
@@ -15166,17 +19002,253 @@ def _ensure_roadway_material(target_materials, src_mat: bpy.types.Material):
 
     roadway_mat.name = material_name
 
-    paa_path, rvmat_path = _get_a3ob_material_paths(src_mat)
-    try:
-        if paa_path or rvmat_path:
-            _set_a3ob_material_paths(roadway_mat, paa_path, rvmat_path)
-    except Exception:
-        pass
+    _sync_collider_material_identity_from_source(roadway_mat, src_mat)
 
     target_materials.append(roadway_mat)
     return len(target_materials) - 1, roadway_mat.name
 
-def _set_a3ob_material_paths(mat: bpy.types.Material, paa_abs: str | None, rvmat_abs: str | None):
+
+def _source_material_from_index(source_obj, material_index):
+    if source_obj is None or getattr(source_obj, "type", None) != "MESH":
+        return None
+    mesh = getattr(source_obj, "data", None)
+    if mesh is None:
+        return None
+    materials = list(getattr(mesh, "materials", []) or [])
+    if not materials:
+        return None
+    try:
+        idx = int(material_index)
+    except Exception:
+        return None
+    if 0 <= idx < len(materials):
+        return materials[idx]
+    return None
+
+
+def _source_object_material_counts(source_obj):
+    if source_obj is None or getattr(source_obj, "type", None) != "MESH":
+        return {}
+    mesh = getattr(source_obj, "data", None)
+    if mesh is None:
+        return {}
+
+    counts = {}
+    for poly in getattr(mesh, "polygons", []) or []:
+        idx = int(getattr(poly, "material_index", 0) or 0)
+        counts[idx] = counts.get(idx, 0) + 1
+
+    if counts:
+        return counts
+
+    try:
+        active_idx = int(getattr(source_obj, "active_material_index", 0) or 0)
+    except Exception:
+        active_idx = 0
+    if _source_material_from_index(source_obj, active_idx) is not None:
+        return {active_idx: 1}
+    return {}
+
+
+def _source_edit_selection_material_counts(source_obj):
+    if source_obj is None or getattr(source_obj, "type", None) != "MESH":
+        return {}
+    if getattr(source_obj, "mode", "") != "EDIT":
+        return {}
+
+    try:
+        bm = bmesh.from_edit_mesh(source_obj.data)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+    except Exception:
+        return {}
+
+    selected_verts = {vert for vert in bm.verts if vert.is_valid and vert.select}
+    selected_edges = {edge for edge in bm.edges if edge.is_valid and edge.select}
+    counts = {}
+
+    for face in bm.faces:
+        if face is None or not face.is_valid:
+            continue
+        touched = bool(face.select)
+        if not touched and selected_edges:
+            touched = any(edge in selected_edges for edge in face.edges if edge is not None and edge.is_valid)
+        if not touched and selected_verts:
+            touched = any(vert in selected_verts for vert in face.verts if vert is not None and vert.is_valid)
+        if not touched:
+            continue
+        idx = int(getattr(face, "material_index", 0) or 0)
+        counts[idx] = counts.get(idx, 0) + 1
+
+    return counts
+
+
+def _normalize_material_counts(material_counts):
+    counts = {}
+    if isinstance(material_counts, dict):
+        items = material_counts.items()
+    else:
+        items = material_counts or ()
+    for raw_idx, raw_count in items:
+        try:
+            idx = int(raw_idx)
+            count = int(raw_count)
+        except Exception:
+            continue
+        if count <= 0:
+            continue
+        counts[idx] = counts.get(idx, 0) + count
+    return counts
+
+
+def _add_source_material_candidates(candidates, source_obj, material_counts, *, order_base=0):
+    counts = _normalize_material_counts(material_counts)
+    for order, material_index in enumerate(sorted(counts.keys())):
+        mat = _source_material_from_index(source_obj, material_index)
+        if mat is None:
+            continue
+        candidates.append(
+            {
+                "material": mat,
+                "count": max(1, int(counts.get(material_index, 1) or 1)),
+                "order": int(order_base) + order,
+            }
+        )
+
+
+def _choose_best_source_material(candidates):
+    merged = {}
+    for item in candidates or []:
+        mat = item.get("material") if isinstance(item, dict) else None
+        if mat is None:
+            continue
+        try:
+            key = ("ptr", int(mat.as_pointer()))
+        except Exception:
+            key = ("name", str(getattr(mat, "name", "") or ""))
+        rec = merged.get(key)
+        if rec is None:
+            merged[key] = {
+                "material": mat,
+                "count": max(1, int(item.get("count", 1) or 1)),
+                "order": int(item.get("order", 0) or 0),
+            }
+        else:
+            rec["count"] += max(1, int(item.get("count", 1) or 1))
+            rec["order"] = min(int(rec.get("order", 0) or 0), int(item.get("order", 0) or 0))
+
+    best = None
+    best_score = None
+    for rec in merged.values():
+        mat = rec["material"]
+        score = (
+            _material_identity_quality(mat),
+            int(rec.get("count", 0) or 0),
+            -int(rec.get("order", 0) or 0),
+        )
+        if best_score is None or score > best_score:
+            best = mat
+            best_score = score
+    return best
+
+
+def _selected_source_material_for_placeholder(source_obj, material_counts=None):
+    if source_obj is None or getattr(source_obj, "type", None) != "MESH":
+        return None
+
+    candidates = []
+    if material_counts:
+        _add_source_material_candidates(candidates, source_obj, material_counts)
+    if not candidates:
+        _add_source_material_candidates(candidates, source_obj, _source_edit_selection_material_counts(source_obj))
+    if not candidates:
+        _add_source_material_candidates(candidates, source_obj, _source_object_material_counts(source_obj))
+    if not candidates:
+        try:
+            active_idx = int(getattr(source_obj, "active_material_index", 0) or 0)
+        except Exception:
+            active_idx = 0
+        _add_source_material_candidates(candidates, source_obj, {active_idx: 1})
+
+    chosen = _choose_best_source_material(candidates)
+    if chosen is not None:
+        return chosen
+
+    for mat in list(getattr(source_obj.data, "materials", []) or []):
+        if mat is not None:
+            return mat
+    return None
+
+
+def _selected_source_material_from_data_items(source_obj, *, source_objects=None, data_items=None):
+    candidates = []
+    order = 0
+    for item in data_items or []:
+        if not isinstance(item, dict):
+            continue
+        item_source = item.get("source_obj") or item.get("source_object") or source_obj
+        if item_source is None or getattr(item_source, "type", None) != "MESH":
+            continue
+        if "material_counts" in item:
+            _add_source_material_candidates(candidates, item_source, item.get("material_counts"), order_base=order)
+        elif "material_index" in item:
+            _add_source_material_candidates(candidates, item_source, {item.get("material_index"): 1}, order_base=order)
+        order += 1000
+
+    if candidates:
+        return _choose_best_source_material(candidates)
+
+    source_candidates = []
+    for idx, obj in enumerate(source_objects or []):
+        mat = _selected_source_material_for_placeholder(obj)
+        if mat is not None:
+            source_candidates.append({"material": mat, "count": 1, "order": idx})
+    if source_candidates:
+        return _choose_best_source_material(source_candidates)
+
+    return _selected_source_material_for_placeholder(source_obj)
+
+
+def _ensure_collider_placeholder_material(target_obj, source_obj, *, source_objects=None, data_items=None):
+    if target_obj is None or getattr(target_obj, "type", None) != "MESH" or target_obj.data is None:
+        return None, ""
+    src_mat = _selected_source_material_from_data_items(
+        source_obj,
+        source_objects=source_objects,
+        data_items=data_items,
+    )
+    material_name = _derive_roadway_material_name(src_mat)
+    existing_index = _find_material_slot_index_by_name_ci(target_obj.data.materials, material_name)
+    if existing_index is not None:
+        existing_mat = target_obj.data.materials[existing_index]
+        _sync_collider_material_identity_from_source(existing_mat, src_mat)
+        return existing_index, getattr(existing_mat, "name", material_name)
+    existing_global = bpy.data.materials.get(material_name)
+    if existing_global is not None:
+        _sync_collider_material_identity_from_source(existing_global, src_mat)
+        target_obj.data.materials.append(existing_global)
+        return len(target_obj.data.materials) - 1, existing_global.name
+    try:
+        return _ensure_roadway_material(target_obj.data.materials, src_mat)
+    except Exception:
+        if src_mat is not None:
+            for idx, mat in enumerate(target_obj.data.materials):
+                if mat == src_mat:
+                    return idx, getattr(mat, "name", "")
+            target_obj.data.materials.append(src_mat)
+            return len(target_obj.data.materials) - 1, getattr(src_mat, "name", "")
+    return None, ""
+
+
+def _set_a3ob_material_paths(
+    mat: bpy.types.Material,
+    paa_abs: str | None,
+    rvmat_abs: str | None,
+    *,
+    clear_paa: bool = False,
+    clear_rvmat: bool = False,
+):
     def clean_path(value, label):
         if value is None:
             return None
@@ -15227,6 +19299,11 @@ def _set_a3ob_material_paths(mat: bpy.types.Material, paa_abs: str | None, rvmat
     )
 
     # Hard requirement: if we want to set a value, field must exist
+    if clear_paa and paa_id and hasattr(pg, paa_id):
+        setattr(pg, paa_id, "")
+    if clear_rvmat and rvmat_id and hasattr(pg, rvmat_id):
+        setattr(pg, rvmat_id, "")
+
     if paa_abs is not None:
         if not paa_id or not hasattr(pg, paa_id):
             raise RuntimeError("PAA path field not found in A3OB Material Properties")
@@ -15621,6 +19698,14 @@ def _nh_texture_cache_root(create=False) -> str:
     if create:
         os.makedirs(path, exist_ok=True)
     return path
+
+
+def _nh_texture_export_output_root(create=False) -> str:
+    path = os.path.join(_nh_blender_shared_cache_base(create=create), "NH_ObjectTextures")
+    if create:
+        os.makedirs(path, exist_ok=True)
+    return path
+
 
 def _texture_cache_key_for_path(path_abs: str) -> str:
     try:
@@ -16297,7 +20382,7 @@ class CRAY_PG_TexSourceRootItem(PropertyGroup):
     path: StringProperty(name="Root", subtype="DIR_PATH")
 
 class CRAY_PG_TexReplaceSettings(PropertyGroup):
-    folder: StringProperty(name="Folder", default="P:\\NH_ObjectTextures", subtype="DIR_PATH")
+    folder: StringProperty(name="Folder", default=_nh_texture_export_output_root(create=False), subtype="DIR_PATH")
     picked_object: PointerProperty(name="Select Object", type=bpy.types.Object)
     write_expected_missing_paths: BoolProperty(
         name="Write Expected Missing Paths",
@@ -16321,12 +20406,12 @@ class CRAY_PG_TexReplaceSettings(PropertyGroup):
     target_textures_folder: StringProperty(
         name="Target Textures Folder",
         subtype="DIR_PATH",
-        default="P:\\NH_ObjectTextures\\",
+        default=_nh_texture_export_output_root(create=False),
     )
     texture_cache_source_folder: StringProperty(
         name="Texture Cache Source",
         subtype="DIR_PATH",
-        default=r"P:\NH_ObjectTextures",
+        default=_nh_texture_export_output_root(create=False),
         description="Корневая папка с .paa текстурами для общего PNG-кеша Blender",
     )
     texture_cache_workers: IntProperty(
@@ -17756,12 +21841,18 @@ class CRAY_OT_TextureCacheBuild(Operator):
         root_abs = os.path.abspath(bpy.path.abspath(root))
         force_rebuild = not bool(self.missing_only)
 
-        cache_stats = _run_texture_cache_workers(
-            paa_files,
-            force_rebuild=force_rebuild,
-            settings=ts,
-            context=context,
-        )
+        try:
+            cache_stats = _run_texture_cache_workers(
+                paa_files,
+                force_rebuild=force_rebuild,
+                settings=ts,
+                context=context,
+            )
+        except Exception as e:
+            print("=== NH Texture PNG Cache: failed to start/update cache ===")
+            print(_fmt_exc(e))
+            self.report({"ERROR"}, f"Texture PNG cache failed: {_fmt_exc(e)}")
+            return {"CANCELLED"}
         created = int(cache_stats.get("created", 0) or 0)
         rebuilt = int(cache_stats.get("rebuilt", 0) or 0)
         skipped = int(cache_stats.get("skipped", 0) or 0)
@@ -18074,7 +22165,7 @@ class CRAY_OT_OpenNHAssetCacheFolder(Operator):
 
 class CRAY_OT_AssetLibraryRebuildIconCache(Operator):
     bl_idname = "cray.asset_library_rebuild_icon_cache"
-    bl_label = "Rebuild Textured Library Icons"
+    bl_label = "Rebuild Library Icons"
     bl_description = "Пересобирает NH asset libraries и заново создает иконки ассетов с текущими настройками превью"
     bl_options = {"REGISTER", "UNDO"}
 
@@ -18084,8 +22175,38 @@ class CRAY_OT_AssetLibraryRebuildIconCache(Operator):
         old_render = bool(getattr(settings, "render_textured_previews", False))
         try:
             settings.rebuild_existing_libraries = True
-            settings.render_textured_previews = True
-            return _build_nh_objects_persistent_asset_libraries(self, context)
+            settings.render_textured_previews = False
+            return _build_nh_objects_persistent_asset_libraries(self, context, cache_missing_textures=False)
+        finally:
+            try:
+                settings.rebuild_existing_libraries = old_rebuild
+                settings.render_textured_previews = old_render
+            except Exception:
+                pass
+
+
+class CRAY_OT_AssetLibraryFullRebuildFromZero(Operator):
+    bl_idname = "cray.asset_library_full_rebuild_from_zero"
+    bl_label = "Full Rebuild From Zero"
+    bl_description = "Deletes NH Common/Environment asset-library cache and rebuilds libraries with materialless clay icons"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = context.scene.cray_asset_library_settings
+        old_rebuild = bool(getattr(settings, "rebuild_existing_libraries", False))
+        old_render = bool(getattr(settings, "render_textured_previews", False))
+        try:
+            removed, failed = _clear_nh_objects_asset_library_cache_roots(settings)
+            if failed:
+                print("=== NH Objects Full Rebuild: Cache cleanup warnings ===")
+                for item in failed:
+                    print(item)
+            settings.rebuild_existing_libraries = True
+            settings.render_textured_previews = False
+            result = _build_nh_objects_persistent_asset_libraries(self, context, cache_missing_textures=False)
+            if result == {"FINISHED"} and removed:
+                self.report({"INFO"}, f"Full NH rebuild complete: cleared {len(removed)} cache folder(s)")
+            return result
         finally:
             try:
                 settings.rebuild_existing_libraries = old_rebuild
@@ -19303,99 +23424,6 @@ def _ensure_split_part_root_collection(context, source_root, part_number: int):
     _set_ie_source_path_tag(target, split_source_path)
     return target
 
-def _format_named_split_model_collection_name(model_name: str) -> str:
-    base_name = _strip_blender_numeric_suffix((model_name or "").strip())
-    base_name = _INVALID_FILENAME_CHARS_RE.sub("_", base_name)
-    base_name = re.sub(r"\s+", " ", base_name).strip(" .")
-    if not base_name:
-        base_name = "new_model"
-
-    stem, ext = os.path.splitext(base_name)
-    if ext.lower() == ".p3d":
-        safe_stem = stem.strip(" .") or "new_model"
-        return f"{safe_stem}.p3d"
-    return f"{base_name}.p3d"
-
-def _derive_named_split_export_source_path(source_root, model_root_name: str, export_mode: str, export_directory: str = "") -> str:
-    filename = _format_named_split_model_collection_name(model_root_name)
-    if export_mode == "CUSTOM_DIR":
-        export_dir = bpy.path.abspath(export_directory) if export_directory else ""
-        export_dir = os.path.abspath(export_dir) if export_dir else ""
-        if not export_dir:
-            return ""
-        return _norm_path(os.path.join(export_dir, filename))
-    return _derive_split_export_source_path(source_root, filename)
-
-def _ensure_named_split_model_root_collection(context, source_root, model_name: str, export_mode: str, export_directory: str = ""):
-    scene_root = getattr(getattr(context, "scene", None), "collection", None)
-    parent = _find_parent_collection(scene_root, source_root) if scene_root is not None else None
-    if parent is None:
-        parent = scene_root if scene_root is not None else source_root
-    if parent is None:
-        return None
-
-    target_name = _format_named_split_model_collection_name(model_name)
-    target = parent.children.get(target_name)
-    if target is None:
-        existing = bpy.data.collections.get(target_name)
-        if existing is not None:
-            target = existing
-            try:
-                if all(ch != target for ch in parent.children):
-                    parent.children.link(target)
-            except Exception:
-                pass
-        else:
-            target = bpy.data.collections.new(target_name)
-            parent.children.link(target)
-
-    try:
-        source_color = getattr(source_root, "color_tag", None)
-        if source_color:
-            target.color_tag = source_color
-    except Exception:
-        pass
-
-    split_source_path = _derive_named_split_export_source_path(
-        source_root,
-        target_name,
-        export_mode,
-        export_directory,
-    )
-    _set_ie_source_path_tag(target, split_source_path)
-    return target
-
-def _model_split_context_objects(context):
-    selected = [obj for obj in getattr(context, "selected_objects", []) if obj is not None]
-    if selected:
-        return selected
-    active = getattr(getattr(context, "view_layer", None), "objects", None)
-    active_obj = getattr(active, "active", None) if active is not None else None
-    return [active_obj] if active_obj is not None else []
-
-def _model_split_single_source_root_from_context(context):
-    objects = _model_split_context_objects(context)
-    roots = {}
-    missing = []
-    for obj in objects:
-        root = _find_p3d_root_collection_for_object(context, obj)
-        if root is None:
-            missing.append(getattr(obj, "name", "<unnamed>"))
-            continue
-        roots[root.as_pointer()] = root
-
-    if missing:
-        preview = ", ".join(missing[:5])
-        if len(missing) > 5:
-            preview += ", ..."
-        return None, f"Selected/active objects are not inside a .p3d root collection: {preview}"
-    if not roots:
-        return None, "Select or activate an object inside the source .p3d root collection first"
-    if len(roots) != 1:
-        root_names = ", ".join(sorted({root.name for root in roots.values()}, key=lambda x: x.lower()))
-        return None, f"Use objects from exactly one source .p3d root collection (found: {root_names})"
-    return next(iter(roots.values())), ""
-
 def _find_p3d_root_collection_for_collection(context, collection, *, require_p3d: bool = False):
     if collection is None:
         return None
@@ -20407,38 +24435,6 @@ def _add_model_split_part_to_planner(context, target_root):
         added = False
     return added, planner_path
 
-def _flatten_named_split_legacy_visuals_collection(dest_root):
-    if dest_root is None:
-        return
-
-    visuals = None
-    for child in list(getattr(dest_root, "children", [])):
-        if _logical_collection_name(getattr(child, "name", "")) == _logical_collection_name("visuals"):
-            visuals = child
-            break
-    if visuals is None:
-        return
-
-    legacy_resolution = None
-    for child in list(getattr(visuals, "children", [])):
-        if _logical_collection_name(getattr(child, "name", "")) == _logical_collection_name("resolution 0"):
-            legacy_resolution = child
-            break
-
-    if legacy_resolution is None:
-        return
-
-    for obj in list(getattr(legacy_resolution, "objects", [])):
-        try:
-            _move_object_to_collection(obj, visuals)
-        except Exception:
-            pass
-    if len(legacy_resolution.objects) == 0 and len(legacy_resolution.children) == 0:
-        try:
-            bpy.data.collections.remove(legacy_resolution)
-        except Exception:
-            pass
-
 def _focus_created_split_objects(context, dest_root, created):
     _ensure_collection_visible_in_view_layer(context, dest_root)
     if not created:
@@ -20495,18 +24491,6 @@ def _prepare_moved_objects_for_named_split(objects):
                     pass
 
         _clear_ie_source_path_tag(obj)
-
-def _ensure_split_collection_path(dest_root, source_path):
-    current = dest_root
-    for source_col in list(source_path or [])[1:]:
-        color_tag = None
-        try:
-            color_tag = getattr(source_col, "color_tag", None)
-        except Exception:
-            color_tag = None
-        current = _ensure_named_child_collection(current, source_col.name, color_tag=color_tag)
-        _clear_ie_source_path_tag(current)
-    return current
 
 def _duplicate_object_for_split(obj):
     if obj is None:
@@ -20598,51 +24582,6 @@ def _rewire_split_copy_object_refs(copies_by_source):
                 except Exception:
                     pass
 
-
-def _resolve_object_source_p3d(obj):
-    if obj is None:
-        return ""
-
-    def _source_from_item(item):
-        if item is None:
-            return ""
-        if isinstance(item, bpy.types.Collection):
-            return _resolve_collection_source_path(item)
-        try:
-            src = item.get(_IE_SOURCE_PATH_KEY)
-        except Exception:
-            src = None
-        if isinstance(src, str) and src.strip():
-            return _norm_path(bpy.path.abspath(src))
-        return ""
-
-    candidates = [obj]
-    if getattr(obj, "instance_collection", None) is not None:
-        candidates.append(obj.instance_collection)
-
-    parent = obj.parent
-    while parent is not None:
-        candidates.append(parent)
-        if getattr(parent, "instance_collection", None) is not None:
-            candidates.append(parent.instance_collection)
-        parent = parent.parent
-
-    for item in candidates:
-        src = _source_from_item(item)
-        if src:
-            return src
-
-    for col in getattr(obj, "users_collection", []):
-        src = _resolve_collection_source_path(col)
-        if src:
-            return src
-
-    for name in _iter_object_asset_source_name_candidates(obj):
-        src = _find_nh_objects_p3d_path_by_name(name)
-        if src:
-            return src
-
-    return ""
 
 
 def _iter_object_asset_source_name_candidates(obj):
@@ -20810,12 +24749,50 @@ def _build_proxy_from_object_instance(proxy_obj, source_obj, parent_obj, proxy_i
         pass
 
 
-def _proxy_selected_asset_source_map(context):
+def _proxy_selected_collection_ids(context):
+    collections = []
+    seen = set()
+    for item in getattr(context, "selected_ids", []) or []:
+        if not isinstance(item, bpy.types.Collection):
+            continue
+        key = _model_split_id_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        collections.append(item)
+    return collections
+
+
+def _proxy_add_source_object(sources, obj, context=None, excluded_root=None):
+    if obj is None or obj in sources:
+        return
+    if excluded_root is not None and _object_is_directly_or_indirectly_in_collection(excluded_root, obj):
+        return
+    if _model_split_is_a3ob_lod_object(obj) or _is_a3ob_proxy_object(obj):
+        return
+    src = _resolve_proxy_asset_source_p3d(obj, context=context)
+    if src:
+        sources[obj] = src
+
+
+def _proxy_selected_asset_source_map(context, excluded_root=None):
     sources = {}
     for obj in getattr(context, "selected_objects", []) or []:
-        src = _resolve_proxy_asset_source_p3d(obj, context=context)
-        if src:
-            sources[obj] = src
+        _proxy_add_source_object(sources, obj, context=context, excluded_root=excluded_root)
+
+    selected_collections = _proxy_selected_collection_ids(context)
+    if selected_collections:
+        for obj in bpy.data.objects:
+            inst = getattr(obj, "instance_collection", None)
+            if inst in selected_collections:
+                _proxy_add_source_object(sources, obj, context=context, excluded_root=excluded_root)
+
+        for collection in selected_collections:
+            root = _find_p3d_root_collection_for_collection(context, collection, require_p3d=True)
+            if excluded_root is not None and (collection == excluded_root or root == excluded_root):
+                continue
+            for obj in _collect_collection_objects_recursive(collection):
+                _proxy_add_source_object(sources, obj, context=context, excluded_root=excluded_root)
     return sources
 
 
@@ -20942,6 +24919,40 @@ def _pick_proxy_target_object(context, explicit_obj=None, source_objs=None):
     return _proxy_target_from_source_context(context, source_objs)
 
 
+def _pick_proxy_target_root_collection(context, explicit_collection=None, target_obj=None, source_objs=None):
+    if explicit_collection is not None:
+        root = _find_p3d_root_collection_for_collection(context, explicit_collection, require_p3d=True)
+        if root is not None:
+            return root
+
+    if target_obj is not None:
+        root = _find_p3d_root_collection_for_object(context, target_obj)
+        if root is not None:
+            return root
+
+    source_objs = set(source_objs or ())
+    for collection in _proxy_selected_collection_ids(context):
+        root = _find_p3d_root_collection_for_collection(context, collection, require_p3d=True)
+        if root is not None:
+            return root
+
+    active = getattr(getattr(context, "view_layer", None), "objects", None)
+    active_obj = getattr(active, "active", None) if active is not None else None
+    ordered = []
+    if active_obj is not None:
+        ordered.append(active_obj)
+    for obj in getattr(context, "selected_objects", []) or []:
+        if obj not in ordered:
+            ordered.append(obj)
+    for obj in ordered:
+        if obj in source_objs:
+            continue
+        root = _find_p3d_root_collection_for_object(context, obj)
+        if root is not None:
+            return root
+    return None
+
+
 def _proxy_is_resolution_lod_object(obj) -> bool:
     if not _model_split_is_a3ob_lod_object(obj):
         return False
@@ -20959,6 +24970,106 @@ def _proxy_resolution_lod_sort_key(obj):
     except Exception:
         pass
     return (resolution, (getattr(obj, "name", "") or "").lower())
+
+
+def _proxy_selected_target_category_tokens(settings, target_obj=None):
+    items = (
+        ("RESOLUTION", "proxy_duplicate_resolution"),
+        ("GEOMETRIES", "proxy_duplicate_geometries"),
+        ("ROADWAY", "proxy_duplicate_roadway"),
+        ("POINT_CLOUDS", "proxy_duplicate_point_clouds"),
+    )
+    tokens = [
+        token for token, prop_name in items
+        if bool(getattr(settings, prop_name, False))
+    ]
+    if tokens:
+        return tokens
+    if target_obj is not None:
+        return [_model_split_lod_merge_category(target_obj)]
+    return ["RESOLUTION"]
+
+
+def _proxy_category_lod_sort_key(obj, category_token: str):
+    if category_token == "RESOLUTION":
+        return _proxy_resolution_lod_sort_key(obj)
+    return _proxy_target_lod_sort_key(obj, category_token)
+
+
+def _ensure_proxy_category_lod_object(context, target_root, category_token: str):
+    if target_root is None:
+        return None
+
+    dest_collection = _ensure_model_split_target_category_collection(target_root, category_token)
+    if dest_collection is None:
+        return None
+
+    spec = _model_split_target_category_spec(category_token)
+    lod_token = str(spec.get("lod", "0") or "0")
+    lod_name = _collider_lod_name(lod_token) if lod_token != "0" else "Resolution 0"
+    mesh = bpy.data.meshes.new(lod_name)
+    obj = bpy.data.objects.new(lod_name, mesh)
+    dest_collection.objects.link(obj)
+
+    if category_token == "RESOLUTION":
+        try:
+            _set_resolution0_a3ob_lod_props(obj)
+        except Exception:
+            _set_model_split_target_lod_a3ob_props(obj, category_token)
+    else:
+        _set_model_split_target_lod_a3ob_props(obj, category_token)
+
+    try:
+        context.view_layer.update()
+    except Exception:
+        pass
+    return obj
+
+
+def _proxy_lod_objects_for_category(context, target_root, category_token: str, preferred_obj=None):
+    if target_root is None:
+        return []
+
+    candidates = [
+        obj for obj in _collect_collection_objects_recursive(target_root)
+        if _model_split_is_a3ob_lod_object(obj)
+        and _model_split_lod_merge_category(obj) == category_token
+    ]
+    if preferred_obj is not None and _model_split_lod_merge_category(preferred_obj) == category_token:
+        if preferred_obj not in candidates:
+            candidates.append(preferred_obj)
+
+    if not candidates:
+        created = _ensure_proxy_category_lod_object(context, target_root, category_token)
+        if created is not None:
+            candidates.append(created)
+
+    seen = set()
+    ordered = []
+    for obj in sorted(candidates, key=lambda item: _proxy_category_lod_sort_key(item, category_token)):
+        ptr = _model_split_object_ptr(obj)
+        if ptr in seen:
+            continue
+        seen.add(ptr)
+        ordered.append(obj)
+
+    if preferred_obj in ordered:
+        ordered.remove(preferred_obj)
+        ordered.insert(0, preferred_obj)
+    return ordered
+
+
+def _proxy_conversion_target_lods_for_categories(context, target_root, target_obj, category_tokens):
+    target_lods = []
+    seen = set()
+    for category_token in category_tokens or ():
+        for lod_obj in _proxy_lod_objects_for_category(context, target_root, category_token, preferred_obj=target_obj):
+            ptr = _model_split_object_ptr(lod_obj)
+            if ptr in seen:
+                continue
+            seen.add(ptr)
+            target_lods.append(lod_obj)
+    return target_lods
 
 
 def _proxy_conversion_target_lods(context, target_obj, duplicate_to_all_resolution_lods: bool):
@@ -21913,8 +26024,21 @@ def _model_split_grid_is_cutter(obj) -> bool:
         return False
 
 
+def _model_split_grid_is_guide(obj) -> bool:
+    if obj is None:
+        return False
+    try:
+        return bool(obj.get("nh_grid_guide", False))
+    except Exception:
+        return False
+
+
+def _model_split_grid_is_split_helper(obj) -> bool:
+    return _model_split_grid_is_cutter(obj) or _model_split_grid_is_guide(obj)
+
+
 def _model_split_grid_is_enabled_cutter(obj) -> bool:
-    if not _model_split_grid_is_cutter(obj):
+    if not (_model_split_grid_is_cutter(obj) or _model_split_grid_is_guide(obj)):
         return False
     try:
         return bool(obj.get("nh_grid_enabled", True))
@@ -21947,32 +26071,6 @@ def _model_split_grid_object_visible(context, obj) -> bool:
     return True
 
 
-def _model_split_grid_cutter_sort_key(obj):
-    def _int_prop(name):
-        try:
-            return int(obj.get(name, 0))
-        except Exception:
-            return 0
-
-    return (
-        _int_prop("nh_grid_x"),
-        _int_prop("nh_grid_y"),
-        _int_prop("nh_grid_z"),
-        getattr(obj, "name", ""),
-    )
-
-
-def _model_split_grid_cutter_id_from_object(obj) -> str:
-    try:
-        grid_id = str(obj.get("nh_grid_id", "") or "").strip()
-        if grid_id:
-            return grid_id
-    except Exception:
-        pass
-    name = _strip_blender_numeric_suffix(getattr(obj, "name", "") or "")
-    if name.upper().startswith("CUT_"):
-        return name[4:]
-    return name or "X00_Y00"
 
 
 def _model_split_grid_source_display_name(context, settings) -> str:
@@ -21983,7 +26081,7 @@ def _model_split_grid_source_display_name(context, settings) -> str:
     if source_root is not None:
         return _strip_blender_numeric_suffix(getattr(source_root, "name", "") or "Source")
     active_obj = _model_split_grid_active_mesh_object(context)
-    if active_obj is not None and not _model_split_grid_is_cutter(active_obj):
+    if active_obj is not None and not _model_split_grid_is_split_helper(active_obj):
         return _strip_blender_numeric_suffix(getattr(active_obj, "name", "") or "Source")
     roots = _model_split_selected_p3d_root_collections(context)
     if roots:
@@ -22001,8 +26099,12 @@ def _model_split_grid_safe_name(value: str, fallback: str = "split") -> str:
 
 
 def _model_split_grid_output_prefix(settings, source_name: str = "") -> str:
+    raw = (getattr(settings, "grid_output_prefix", "") or "").strip()
+    source_prefix = _model_split_grid_safe_name(source_name or "split", fallback="split")
+    if not raw or raw.lower() == "split":
+        raw = source_prefix
     return _model_split_grid_safe_name(
-        getattr(settings, "grid_output_prefix", "") or source_name or "split",
+        raw,
         fallback="split",
     )
 
@@ -22026,7 +26128,7 @@ def _model_split_grid_cutter_collection(context, settings, *, create: bool = Fal
         return None
 
     source_name = _model_split_grid_source_display_name(context, settings)
-    collection_name = f"NH Grid Cutters - {source_name}"
+    collection_name = f"NH Grid Cut Lines - {source_name}"
     collection = bpy.data.collections.get(collection_name)
     if collection is None:
         collection = bpy.data.collections.new(collection_name)
@@ -22046,37 +26148,19 @@ def _model_split_grid_cutter_collection(context, settings, *, create: bool = Fal
     return collection
 
 
-def _model_split_grid_collect_cutters(context, settings):
-    cutter_collection = _model_split_grid_cutter_collection(context, settings, create=False)
-    if cutter_collection is None:
-        return []
-
-    cutters = []
-    for obj in _collect_collection_objects_recursive(cutter_collection):
-        if getattr(obj, "type", None) != "MESH":
-            continue
-        if not _model_split_grid_is_enabled_cutter(obj):
-            continue
-        if bool(getattr(settings, "grid_use_visible_cutters_only", True)) and not _model_split_grid_object_visible(context, obj):
-            continue
-        cutters.append(obj)
-
-    cutters.sort(key=_model_split_grid_cutter_sort_key)
-    return cutters
-
 
 def _model_split_grid_delete_tagged_cutters(collection):
     if collection is None:
         return 0
     removed = 0
     for obj in list(_collect_collection_objects_recursive(collection)):
-        if not _model_split_grid_is_cutter(obj):
+        if not _model_split_grid_is_split_helper(obj):
             continue
         try:
             bpy.data.objects.remove(obj, do_unlink=True)
             removed += 1
         except Exception as e:
-            print(f"[NH Plugin] Grid Cutter Split: failed to remove cutter {getattr(obj, 'name', '<object>')}: {_fmt_exc(e)}")
+            print(f"[NH Plugin] Line Grid Split: failed to remove helper {getattr(obj, 'name', '<object>')}: {_fmt_exc(e)}")
     return removed
 
 
@@ -22117,64 +26201,8 @@ def _model_split_grid_world_bounds_for_objects(objects):
     return min_v, max_v
 
 
-def _model_split_grid_bounds_center(bounds):
-    if not bounds:
-        return Vector((0.0, 0.0, 0.0))
-    return (bounds[0] + bounds[1]) * 0.5
 
 
-def _model_split_grid_origin(context, settings):
-    mode = str(getattr(settings, "grid_origin_mode", "ACTIVE_OBJECT_BOUNDS") or "ACTIVE_OBJECT_BOUNDS")
-    if mode == "MANUAL":
-        return Vector((
-            float(getattr(settings, "grid_manual_origin_x", 0.0) or 0.0),
-            float(getattr(settings, "grid_manual_origin_y", 0.0) or 0.0),
-            float(getattr(settings, "grid_manual_origin_z", 0.0) or 0.0),
-        ))
-    if mode == "CURSOR":
-        try:
-            return context.scene.cursor.location.copy()
-        except Exception:
-            return Vector((0.0, 0.0, 0.0))
-
-    objects = []
-    if mode == "SOURCE_ROOT_BOUNDS":
-        root = getattr(settings, "grid_source_root_collection", None)
-        if root is None:
-            source_obj = getattr(settings, "grid_source_object", None)
-            root = _find_p3d_root_collection_for_object(context, source_obj) if source_obj is not None else None
-        if root is not None:
-            objects = [obj for obj in _collect_collection_objects_recursive(root) if getattr(obj, "type", None) == "MESH" and not _model_split_grid_is_cutter(obj)]
-    elif mode == "SELECTION_BOUNDS":
-        objects = [
-            obj for obj in getattr(context, "selected_objects", []) or []
-            if getattr(obj, "type", None) == "MESH" and not _model_split_grid_is_cutter(obj)
-        ]
-    else:
-        active_obj = _model_split_grid_active_mesh_object(context)
-        source_obj = getattr(settings, "grid_source_object", None)
-        if active_obj is not None and not _model_split_grid_is_cutter(active_obj):
-            objects = [active_obj]
-        elif source_obj is not None:
-            objects = [source_obj]
-
-    bounds = _model_split_grid_world_bounds_for_objects(objects)
-    return _model_split_grid_bounds_center(bounds)
-
-
-def _model_split_grid_axis_token(axis: str, index: int, count: int) -> str:
-    width = max(2, len(str(max(0, int(count) - 1))))
-    return f"{axis}{int(index):0{width}d}"
-
-
-def _model_split_grid_id(ix: int, iy: int, iz: int, count_z: int, count_x: int, count_y: int) -> str:
-    parts = (
-        _model_split_grid_axis_token("X", ix, count_x),
-        _model_split_grid_axis_token("Y", iy, count_y),
-    )
-    if int(count_z) > 1:
-        parts = parts + (_model_split_grid_axis_token("Z", iz, count_z),)
-    return "_".join(parts)
 
 
 def _model_split_grid_create_cube_mesh(name: str):
@@ -22210,6 +26238,199 @@ def _model_split_grid_config_values(settings):
     count_y = max(1, int(getattr(settings, "grid_count_y", 1) or 1))
     count_z = max(1, int(getattr(settings, "grid_count_z", 1) or 1))
     return size_x, size_y, size_z, count_x, count_y, count_z
+
+
+def _model_split_grid_expanded_bounds(bounds, min_span: float = 0.01):
+    if not bounds:
+        return None
+    min_v = bounds[0].copy()
+    max_v = bounds[1].copy()
+    for axis in range(3):
+        span = float(max_v[axis] - min_v[axis])
+        if abs(span) >= min_span:
+            continue
+        center = (float(min_v[axis]) + float(max_v[axis])) * 0.5
+        half = min_span * 0.5
+        min_v[axis] = center - half
+        max_v[axis] = center + half
+    return min_v, max_v
+
+
+def _model_split_grid_auto_cut_positions(min_value: float, max_value: float, count: int):
+    count = max(1, int(count or 1))
+    if count <= 1:
+        return []
+    span = float(max_value) - float(min_value)
+    if abs(span) <= 1.0e-9:
+        return []
+    step = span / float(count)
+    return [float(min_value) + step * i for i in range(1, count)]
+
+
+def _model_split_grid_unique_cut_positions(values, min_value: float, max_value: float):
+    span = abs(float(max_value) - float(min_value))
+    epsilon = max(span * 1.0e-5, 1.0e-5)
+    result = []
+    for value in sorted(float(v) for v in values):
+        if value <= min_value + epsilon or value >= max_value - epsilon:
+            continue
+        if result and abs(value - result[-1]) <= epsilon:
+            continue
+        result.append(value)
+    return result
+
+
+def _model_split_grid_collect_guides(context, settings):
+    collection = _model_split_grid_cutter_collection(context, settings, create=False)
+    if collection is None:
+        return []
+
+    guides = []
+    for obj in _collect_collection_objects_recursive(collection):
+        if not _model_split_grid_is_guide(obj):
+            continue
+        if not _model_split_grid_is_enabled_cutter(obj):
+            continue
+        if bool(getattr(settings, "grid_use_visible_cutters_only", True)) and not _model_split_grid_object_visible(context, obj):
+            continue
+        guides.append(obj)
+    guides.sort(key=lambda obj: (str(obj.get("nh_grid_axis", "") or ""), getattr(obj, "name", "")))
+    return guides
+
+
+def _model_split_grid_guide_cut_positions(context, settings, bounds):
+    positions = {"X": [], "Y": []}
+    for guide in _model_split_grid_collect_guides(context, settings):
+        try:
+            axis = str(guide.get("nh_grid_axis", "") or "").strip().upper()
+        except Exception:
+            axis = ""
+        if axis not in positions:
+            continue
+        try:
+            loc = guide.matrix_world.translation
+        except Exception:
+            continue
+        positions[axis].append(float(loc.x if axis == "X" else loc.y))
+
+    min_v, max_v = bounds
+    positions["X"] = _model_split_grid_unique_cut_positions(positions["X"], min_v.x, max_v.x)
+    positions["Y"] = _model_split_grid_unique_cut_positions(positions["Y"], min_v.y, max_v.y)
+    return positions
+
+
+def _model_split_grid_cut_edges(context, settings, source_objects):
+    bounds = _model_split_grid_expanded_bounds(_model_split_grid_world_bounds_for_objects(source_objects))
+    if bounds is None:
+        raise RuntimeError("Could not calculate source bounds for line grid split")
+    min_v, max_v = bounds
+    count_x = max(1, int(getattr(settings, "grid_count_x", 1) or 1))
+    count_y = max(1, int(getattr(settings, "grid_count_y", 1) or 1))
+
+    guide_positions = _model_split_grid_guide_cut_positions(context, settings, bounds)
+    x_cuts = guide_positions["X"] or _model_split_grid_auto_cut_positions(min_v.x, max_v.x, count_x)
+    y_cuts = guide_positions["Y"] or _model_split_grid_auto_cut_positions(min_v.y, max_v.y, count_y)
+    x_cuts = _model_split_grid_unique_cut_positions(x_cuts, min_v.x, max_v.x)
+    y_cuts = _model_split_grid_unique_cut_positions(y_cuts, min_v.y, max_v.y)
+
+    x_edges = [float(min_v.x), *x_cuts, float(max_v.x)]
+    y_edges = [float(min_v.y), *y_cuts, float(max_v.y)]
+    used_guides = bool(guide_positions["X"] or guide_positions["Y"])
+    return bounds, x_edges, y_edges, used_guides
+
+
+def _model_split_grid_iter_cells(x_edges, y_edges):
+    part_number = 1
+    # Number top-to-bottom in top view, then left-to-right in each row.
+    for iy in range(len(y_edges) - 2, -1, -1):
+        for ix in range(len(x_edges) - 1):
+            yield (
+                part_number,
+                ix,
+                iy,
+                float(x_edges[ix]),
+                float(x_edges[ix + 1]),
+                float(y_edges[iy]),
+                float(y_edges[iy + 1]),
+            )
+            part_number += 1
+
+
+def _model_split_grid_create_temp_collection(context, name: str):
+    collection = bpy.data.collections.new(name)
+    scene_root = getattr(getattr(context, "scene", None), "collection", None)
+    if scene_root is not None:
+        scene_root.children.link(collection)
+    return collection
+
+
+def _model_split_grid_remove_temp_collection(collection):
+    if collection is None:
+        return
+    for obj in list(_collect_collection_objects_recursive(collection)):
+        _model_split_grid_remove_object(obj)
+    _model_split_grid_remove_collection_tree(collection)
+
+
+def _model_split_grid_create_cell_cutter(context, temp_collection, name: str, bounds, x0: float, x1: float, y0: float, y1: float):
+    min_v, max_v = bounds
+    span_z = max(float(max_v.z - min_v.z), 0.01)
+    pad_z = max(span_z * 0.05, 0.01)
+    size_x = max(float(x1 - x0), 0.001)
+    size_y = max(float(y1 - y0), 0.001)
+    size_z = span_z + pad_z * 2.0
+
+    mesh = _model_split_grid_create_cube_mesh(name)
+    obj = bpy.data.objects.new(name, mesh)
+    obj.location = (
+        (float(x0) + float(x1)) * 0.5,
+        (float(y0) + float(y1)) * 0.5,
+        (float(min_v.z) + float(max_v.z)) * 0.5,
+    )
+    obj.scale = (size_x, size_y, size_z)
+    obj["nh_grid_temp_cell_cutter"] = True
+    try:
+        obj.display_type = "WIRE"
+    except Exception:
+        pass
+    _link_object_to_collection(obj, temp_collection)
+    _ensure_collection_visible_in_view_layer(context, temp_collection)
+    return obj
+
+
+def _model_split_grid_create_guide_object(context, collection, axis: str, index: int, position: float, bounds):
+    axis = (axis or "X").upper()
+    min_v, max_v = bounds
+    span_x = max(float(max_v.x - min_v.x), 0.01)
+    span_y = max(float(max_v.y - min_v.y), 0.01)
+    span_z = max(float(max_v.z - min_v.z), 0.01)
+    thickness = max(min(span_x, span_y) * 0.006, 0.02)
+    pad_xy = max(max(span_x, span_y) * 0.02, 0.05)
+    pad_z = max(span_z * 0.05, 0.05)
+
+    name = f"CUT_{axis}{index:02d}"
+    mesh = _model_split_grid_create_cube_mesh(name)
+    obj = bpy.data.objects.new(name, mesh)
+    if axis == "X":
+        obj.location = (float(position), (min_v.y + max_v.y) * 0.5, (min_v.z + max_v.z) * 0.5)
+        obj.scale = (thickness, span_y + pad_xy * 2.0, span_z + pad_z * 2.0)
+    else:
+        obj.location = ((min_v.x + max_v.x) * 0.5, float(position), (min_v.z + max_v.z) * 0.5)
+        obj.scale = (span_x + pad_xy * 2.0, thickness, span_z + pad_z * 2.0)
+
+    obj["nh_grid_guide"] = True
+    obj["nh_grid_axis"] = axis
+    obj["nh_grid_index"] = int(index)
+    obj["nh_grid_enabled"] = True
+    try:
+        obj.display_type = "WIRE"
+        obj.show_name = True
+        obj.color = (0.0, 0.85, 1.0, 0.45) if axis == "X" else (1.0, 0.65, 0.0, 0.45)
+    except Exception:
+        pass
+    _link_object_to_collection(obj, collection)
+    _ensure_collection_visible_in_view_layer(context, collection)
+    return obj
 
 
 def _model_split_grid_category_for_object(obj) -> str:
@@ -22492,10 +26713,17 @@ def _model_split_grid_piece_is_empty(obj, settings, *, point_piece: bool = False
 def _model_split_grid_remove_object(obj):
     if obj is None:
         return
+    data = getattr(obj, "data", None)
     try:
         bpy.data.objects.remove(obj, do_unlink=True)
     except Exception:
         pass
+    if data is not None:
+        try:
+            if getattr(data, "users", 0) == 0:
+                bpy.data.meshes.remove(data)
+        except Exception:
+            pass
 
 
 def _model_split_grid_make_face_piece(context, src_obj, cutter, dest_collection, settings, piece_name, category_token):
@@ -22646,7 +26874,7 @@ def _model_split_grid_resolve_source(context, settings):
         resolved_root = _find_p3d_root_collection_for_collection(context, source_root, require_p3d=False) or source_root
         source_objects = [
             obj for obj in _collect_collection_objects_recursive(resolved_root)
-            if getattr(obj, "type", None) == "MESH" and not _model_split_grid_is_cutter(obj)
+            if getattr(obj, "type", None) == "MESH" and not _model_split_grid_is_split_helper(obj)
         ]
         if not source_objects:
             raise RuntimeError(f"Source Root Collection '{resolved_root.name}' contains no mesh objects")
@@ -22657,18 +26885,18 @@ def _model_split_grid_resolve_source(context, settings):
         root = selected_roots[0]
         source_objects = [
             obj for obj in _collect_collection_objects_recursive(root)
-            if getattr(obj, "type", None) == "MESH" and not _model_split_grid_is_cutter(obj)
+            if getattr(obj, "type", None) == "MESH" and not _model_split_grid_is_split_helper(obj)
         ]
         if source_objects:
             return root, source_objects
 
     active_obj = _model_split_grid_active_mesh_object(context)
-    if active_obj is not None and not _model_split_grid_is_cutter(active_obj):
+    if active_obj is not None and not _model_split_grid_is_split_helper(active_obj):
         return _find_p3d_root_collection_for_object(context, active_obj), [active_obj]
 
     selected_meshes = [
         obj for obj in getattr(context, "selected_objects", []) or []
-        if getattr(obj, "type", None) == "MESH" and not _model_split_grid_is_cutter(obj)
+        if getattr(obj, "type", None) == "MESH" and not _model_split_grid_is_split_helper(obj)
     ]
     if selected_meshes:
         return _find_p3d_root_collection_for_object(context, selected_meshes[0]), selected_meshes
@@ -22711,58 +26939,31 @@ def _model_split_grid_hide_cutters(cutter_collection, cutters):
 
 class CRAY_OT_ModelSplitGridCreateCutters(Operator):
     bl_idname = "cray.model_split_grid_create_cutters"
-    bl_label = "Create Cutter Grid"
+    bl_label = "Create/Edit Cut Lines"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         settings = context.scene.cray_model_split_settings
         try:
-            size_x, size_y, size_z, count_x, count_y, count_z = _model_split_grid_config_values(settings)
-            origin = _model_split_grid_origin(context, settings)
-            cutter_collection = _model_split_grid_cutter_collection(context, settings, create=True)
-            if cutter_collection is None:
-                raise RuntimeError("Could not create cutter collection")
+            source_root, source_objects = _model_split_grid_resolve_source(context, settings)
+            bounds = _model_split_grid_expanded_bounds(_model_split_grid_world_bounds_for_objects(source_objects))
+            if bounds is None:
+                raise RuntimeError("Could not calculate source bounds for cut lines")
 
-            removed = _model_split_grid_delete_tagged_cutters(cutter_collection)
-            half_x = (count_x - 1) * 0.5
-            half_y = (count_y - 1) * 0.5
-            half_z = (count_z - 1) * 0.5
+            _size_x, _size_y, _size_z, count_x, count_y, _count_z = _model_split_grid_config_values(settings)
+            guide_collection = _model_split_grid_cutter_collection(context, settings, create=True)
+            if guide_collection is None:
+                raise RuntimeError("Could not create cut lines collection")
+
+            removed = _model_split_grid_delete_tagged_cutters(guide_collection)
             created = []
-            for ix in range(count_x):
-                for iy in range(count_y):
-                    for iz in range(count_z):
-                        grid_id = _model_split_grid_id(ix, iy, iz, count_z, count_x, count_y)
-                        obj_name = f"CUT_{grid_id}"
-                        mesh = _model_split_grid_create_cube_mesh(obj_name)
-                        obj = bpy.data.objects.new(obj_name, mesh)
-                        obj.location = (
-                            origin.x + (ix - half_x) * size_x,
-                            origin.y + (iy - half_y) * size_y,
-                            origin.z + (iz - half_z) * size_z,
-                        )
-                        obj.scale = (size_x, size_y, size_z)
-                        obj["nh_grid_cutter"] = True
-                        obj["nh_grid_id"] = grid_id
-                        obj["nh_grid_x"] = int(ix)
-                        obj["nh_grid_y"] = int(iy)
-                        obj["nh_grid_z"] = int(iz)
-                        obj["nh_grid_enabled"] = True
-                        try:
-                            obj.display_type = "WIRE"
-                        except Exception:
-                            pass
-                        try:
-                            obj.show_name = True
-                        except Exception:
-                            pass
-                        try:
-                            obj.color = (0.0, 0.85, 1.0, 0.35)
-                        except Exception:
-                            pass
-                        _link_object_to_collection(obj, cutter_collection)
-                        created.append(obj)
+            min_v, max_v = bounds
+            for idx, position in enumerate(_model_split_grid_auto_cut_positions(min_v.x, max_v.x, count_x), start=1):
+                created.append(_model_split_grid_create_guide_object(context, guide_collection, "X", idx, position, bounds))
+            for idx, position in enumerate(_model_split_grid_auto_cut_positions(min_v.y, max_v.y, count_y), start=1):
+                created.append(_model_split_grid_create_guide_object(context, guide_collection, "Y", idx, position, bounds))
 
-            _ensure_collection_visible_in_view_layer(context, cutter_collection)
+            _ensure_collection_visible_in_view_layer(context, guide_collection)
             _deselect_all_in_view_layer(context)
             for obj in created:
                 try:
@@ -22775,7 +26976,8 @@ class CRAY_OT_ModelSplitGridCreateCutters(Operator):
                 except Exception:
                     pass
 
-            self.report({"INFO"}, f"Created {len(created)} cutter cube(s), removed {removed} old tagged cutter(s)")
+            root_name = getattr(source_root, "name", "") if source_root is not None else _model_split_grid_source_display_name(context, settings)
+            self.report({"INFO"}, f"Created {len(created)} cut line(s) for {count_x}x{count_y} split on {root_name}, removed {removed} old helper(s)")
             return {"FINISHED"}
         except Exception as e:
             self.report({"ERROR"}, _fmt_exc(e))
@@ -22784,23 +26986,23 @@ class CRAY_OT_ModelSplitGridCreateCutters(Operator):
 
 class CRAY_OT_ModelSplitGridSelectCutters(Operator):
     bl_idname = "cray.model_split_grid_select_cutters"
-    bl_label = "Select Cutter Grid"
+    bl_label = "Select Cut Lines"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         settings = context.scene.cray_model_split_settings
-        cutter_collection = _model_split_grid_cutter_collection(context, settings, create=False)
-        if cutter_collection is None:
-            self.report({"ERROR"}, "Choose or create a Cutter Collection first")
+        guide_collection = _model_split_grid_cutter_collection(context, settings, create=False)
+        if guide_collection is None:
+            self.report({"ERROR"}, "Create cut lines first")
             return {"CANCELLED"}
 
-        cutters = [
-            obj for obj in _collect_collection_objects_recursive(cutter_collection)
-            if getattr(obj, "type", None) == "MESH" and _model_split_grid_is_cutter(obj)
+        guides = [
+            obj for obj in _collect_collection_objects_recursive(guide_collection)
+            if getattr(obj, "type", None) == "MESH" and _model_split_grid_is_guide(obj)
         ]
-        _ensure_collection_visible_in_view_layer(context, cutter_collection)
+        _ensure_collection_visible_in_view_layer(context, guide_collection)
         _deselect_all_in_view_layer(context)
-        for obj in cutters:
+        for obj in guides:
             try:
                 obj.hide_set(False)
             except Exception:
@@ -22813,34 +27015,34 @@ class CRAY_OT_ModelSplitGridSelectCutters(Operator):
                 obj.select_set(True)
             except Exception:
                 pass
-        if cutters:
+        if guides:
             try:
-                context.view_layer.objects.active = cutters[0]
+                context.view_layer.objects.active = guides[0]
             except Exception:
                 pass
-        self.report({"INFO"}, f"Selected {len(cutters)} cutter cube(s)")
+        self.report({"INFO"}, f"Selected {len(guides)} cut line(s)")
         return {"FINISHED"}
 
 
 class CRAY_OT_ModelSplitGridClearCutters(Operator):
     bl_idname = "cray.model_split_grid_clear_cutters"
-    bl_label = "Clear Cutter Grid"
+    bl_label = "Clear Cut Lines"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         settings = context.scene.cray_model_split_settings
-        cutter_collection = _model_split_grid_cutter_collection(context, settings, create=False)
-        if cutter_collection is None:
-            self.report({"ERROR"}, "Choose or create a Cutter Collection first")
+        guide_collection = _model_split_grid_cutter_collection(context, settings, create=False)
+        if guide_collection is None:
+            self.report({"ERROR"}, "Create cut lines first")
             return {"CANCELLED"}
-        removed = _model_split_grid_delete_tagged_cutters(cutter_collection)
-        self.report({"INFO"}, f"Removed {removed} tagged cutter cube(s)")
+        removed = _model_split_grid_delete_tagged_cutters(guide_collection)
+        self.report({"INFO"}, f"Removed {removed} cut line helper(s)")
         return {"FINISHED"}
 
 
 class CRAY_OT_ModelSplitGridSplitSource(Operator):
     bl_idname = "cray.model_split_grid_split_source"
-    bl_label = "Split Source By Cutter Grid"
+    bl_label = "Split Source To _p Parts"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -22853,9 +27055,9 @@ class CRAY_OT_ModelSplitGridSplitSource(Operator):
 
         try:
             source_root, source_objects = _model_split_grid_resolve_source(context, settings)
-            cutters = _model_split_grid_collect_cutters(context, settings)
-            if not cutters:
-                raise RuntimeError("No tagged cutter cubes found in Cutter Collection")
+            bounds, x_edges, y_edges, used_guides = _model_split_grid_cut_edges(context, settings, source_objects)
+            cell_count_x = max(1, len(x_edges) - 1)
+            cell_count_y = max(1, len(y_edges) - 1)
             prefix = _model_split_grid_output_prefix(
                 settings,
                 _model_split_grid_source_display_name(context, settings),
@@ -22863,90 +27065,115 @@ class CRAY_OT_ModelSplitGridSplitSource(Operator):
             output_container = _model_split_grid_output_container(context, source_root, prefix)
             if output_container is None:
                 raise RuntimeError("Could not create output collection")
+            temp_collection = _model_split_grid_create_temp_collection(context, f"NH Grid Split Cells - {prefix}")
         except Exception as e:
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
 
-        for cutter in cutters:
-            grid_id = _model_split_grid_cutter_id_from_object(cutter)
-            root_name = _model_split_grid_output_root_name(prefix, grid_id)
-            target_root = _model_split_grid_create_output_root(context, output_container, source_root, root_name)
-            if target_root is None:
-                error_count += 1
-                failures.append(f"{getattr(cutter, 'name', '<cutter>')} -> failed to create output root")
-                continue
-
-            cutter_created = []
-            for src_obj in source_objects:
-                if src_obj is None or getattr(src_obj, "type", None) != "MESH":
-                    continue
-                if _model_split_grid_is_cutter(src_obj):
-                    continue
-
+        try:
+            cells = list(_model_split_grid_iter_cells(x_edges, y_edges))
+            for part_number, _ix, _iy, x0, x1, y0, y1 in cells:
+                grid_id = f"p{part_number:02d}"
+                cell_cutter = None
                 try:
-                    if _model_split_grid_is_proxy_object(src_obj):
-                        category_token = "RESOLUTION"
+                    cell_cutter = _model_split_grid_create_cell_cutter(
+                        context,
+                        temp_collection,
+                        f"CELL_{grid_id}",
+                        bounds,
+                        x0,
+                        x1,
+                        y0,
+                        y1,
+                    )
+                except Exception as e:
+                    error_count += 1
+                    failures.append(f"{grid_id} -> failed to create temporary split cell: {_fmt_exc(e)}")
+                    continue
+
+                root_name = _model_split_grid_output_root_name(prefix, grid_id)
+                target_root = _model_split_grid_create_output_root(context, output_container, source_root, root_name)
+                if target_root is None:
+                    error_count += 1
+                    failures.append(f"{grid_id} -> failed to create output root")
+                    _model_split_grid_remove_object(cell_cutter)
+                    continue
+
+                cell_created = []
+                for src_obj in source_objects:
+                    if src_obj is None or getattr(src_obj, "type", None) != "MESH":
+                        continue
+                    if _model_split_grid_is_split_helper(src_obj):
+                        continue
+
+                    try:
+                        if _model_split_grid_is_proxy_object(src_obj):
+                            category_token = "RESOLUTION"
+                            dest_leaf = _ensure_model_split_target_category_collection(target_root, category_token)
+                            if dest_leaf is None:
+                                raise RuntimeError("Could not create A3OB category collection")
+                            piece_name = f"{getattr(src_obj, 'name', 'Object')}__{grid_id}"
+                            piece = _model_split_grid_make_proxy_piece(
+                                src_obj,
+                                cell_cutter,
+                                dest_leaf,
+                                settings,
+                                piece_name,
+                                category_token,
+                            )
+                            if piece is None:
+                                skipped_empty += 1
+                                continue
+                            cell_created.append(piece)
+                            created_objects.append(piece)
+                            continue
+
+                        category_token = _model_split_grid_category_for_object(src_obj)
+                        if _model_split_grid_should_clip_as_points(src_obj, category_token):
+                            category_token = "POINT_CLOUDS"
                         dest_leaf = _ensure_model_split_target_category_collection(target_root, category_token)
                         if dest_leaf is None:
                             raise RuntimeError("Could not create A3OB category collection")
                         piece_name = f"{getattr(src_obj, 'name', 'Object')}__{grid_id}"
-                        piece = _model_split_grid_make_proxy_piece(
-                            src_obj,
-                            cutter,
-                            dest_leaf,
-                            settings,
-                            piece_name,
-                            category_token,
-                        )
+                        if _model_split_grid_should_clip_as_points(src_obj, category_token):
+                            piece = _model_split_grid_make_point_piece(
+                                src_obj,
+                                cell_cutter,
+                                dest_leaf,
+                                settings,
+                                piece_name,
+                                category_token,
+                            )
+                        else:
+                            piece = _model_split_grid_make_face_piece(
+                                context,
+                                src_obj,
+                                cell_cutter,
+                                dest_leaf,
+                                settings,
+                                piece_name,
+                                category_token,
+                            )
+
                         if piece is None:
                             skipped_empty += 1
                             continue
-                        cutter_created.append(piece)
+                        cell_created.append(piece)
                         created_objects.append(piece)
-                        continue
-
-                    category_token = _model_split_grid_category_for_object(src_obj)
-                    if _model_split_grid_should_clip_as_points(src_obj, category_token):
-                        category_token = "POINT_CLOUDS"
-                    dest_leaf = _ensure_model_split_target_category_collection(target_root, category_token)
-                    if dest_leaf is None:
-                        raise RuntimeError("Could not create A3OB category collection")
-                    piece_name = f"{getattr(src_obj, 'name', 'Object')}__{grid_id}"
-                    if _model_split_grid_should_clip_as_points(src_obj, category_token):
-                        piece = _model_split_grid_make_point_piece(
-                            src_obj,
-                            cutter,
-                            dest_leaf,
-                            settings,
-                            piece_name,
-                            category_token,
-                        )
-                    else:
-                        piece = _model_split_grid_make_face_piece(
-                            context,
-                            src_obj,
-                            cutter,
-                            dest_leaf,
-                            settings,
-                            piece_name,
-                            category_token,
+                    except Exception as e:
+                        error_count += 1
+                        failures.append(
+                            f"{getattr(src_obj, 'name', '<source>')} / {grid_id} -> {_fmt_exc(e)}"
                         )
 
-                    if piece is None:
-                        skipped_empty += 1
-                        continue
-                    cutter_created.append(piece)
-                    created_objects.append(piece)
-                except Exception as e:
-                    error_count += 1
-                    failures.append(
-                        f"{getattr(src_obj, 'name', '<source>')} / {getattr(cutter, 'name', '<cutter>')} -> {_fmt_exc(e)}"
-                    )
+                _model_split_grid_remove_object(cell_cutter)
 
-            if cutter_created:
-                created_roots.append(target_root)
-            else:
-                _model_split_grid_remove_collection_tree(target_root)
+                if cell_created:
+                    created_roots.append(target_root)
+                else:
+                    _model_split_grid_remove_collection_tree(target_root)
+        finally:
+            _model_split_grid_remove_temp_collection(temp_collection)
 
         if not created_roots:
             _model_split_grid_remove_collection_tree(output_container)
@@ -22957,9 +27184,10 @@ class CRAY_OT_ModelSplitGridSplitSource(Operator):
         if created_roots and not bool(getattr(settings, "grid_keep_original", True)):
             _model_split_grid_hide_sources(source_objects)
 
-        cutter_collection = _model_split_grid_cutter_collection(context, settings, create=False)
+        guide_collection = _model_split_grid_cutter_collection(context, settings, create=False)
+        guides = _model_split_grid_collect_guides(context, settings)
         if bool(getattr(settings, "grid_hide_cutters_after_split", False)):
-            _model_split_grid_hide_cutters(cutter_collection, cutters)
+            _model_split_grid_hide_cutters(guide_collection, guides)
 
         planner_added = 0
         if created_roots and bool(getattr(settings, "grid_add_result_to_export_planner", True)):
@@ -22973,12 +27201,14 @@ class CRAY_OT_ModelSplitGridSplitSource(Operator):
                     failures.append(f"{getattr(root, 'name', '<root>')} -> planner add failed: {_fmt_exc(e)}")
 
         if failures:
-            print("=== Model Split Grid Cutter Split: Failures ===")
+            print("=== Model Split Line Grid Split: Failures ===")
             for failure in failures:
                 print(failure)
 
+        expected_parts = cell_count_x * cell_count_y
+        guide_text = "manual guides" if used_guides else "equal grid"
         msg = (
-            f"Grid split: cutters {len(cutters)}, .p3d parts {len(created_roots)}, "
+            f"Line grid split: {cell_count_x}x{cell_count_y} cells ({expected_parts}) from {guide_text}, .p3d parts {len(created_roots)}, "
             f"mesh pieces {len(created_objects)}, skipped empty {skipped_empty}, errors {error_count}"
         )
         if planner_added:
@@ -23206,10 +27436,35 @@ class CRAY_PG_AssetProxySettings(PropertyGroup):
         description="A3OB LOD mesh, for example Resolution 0, that will own the created proxy",
         type=bpy.types.Object,
     )
+    target_collection: PointerProperty(
+        name="Target P3D Collection",
+        description="Target .p3d root collection that will receive generated proxies; leave empty to infer from selection",
+        type=bpy.types.Collection,
+    )
     duplicate_to_all_resolution_lods: BoolProperty(
         name="Duplicate to all Resolution LODs",
         default=False,
         description="After conversion, also create the same A3OB proxy in every Resolution LOD under the same .p3d root",
+    )
+    proxy_duplicate_resolution: BoolProperty(
+        name="Resolution",
+        description="Create proxies under Resolution LODs",
+        default=True,
+    )
+    proxy_duplicate_geometries: BoolProperty(
+        name="Geometries",
+        description="Create proxies under Geometry LOD",
+        default=False,
+    )
+    proxy_duplicate_roadway: BoolProperty(
+        name="Roadway",
+        description="Create proxies under Roadway LOD",
+        default=False,
+    )
+    proxy_duplicate_point_clouds: BoolProperty(
+        name="Point clouds",
+        description="Create proxies under Point clouds / Memory LOD",
+        default=False,
     )
 
 
@@ -23224,6 +27479,7 @@ _NH_OBJECTS_ASSET_BLEND_NAME = "_NH_AssetLibrary.blend"
 _NH_OBJECTS_ASSET_MANIFEST_NAME = "_NH_AssetLibrary.manifest.json"
 _NH_OBJECTS_CACHE_FOLDER_NAME = "NH_Objects_AssetLibraries"
 _NH_OBJECTS_ASSET_PREVIEWS_FOLDER_NAME = "_NH_previews"
+_NH_OBJECTS_INCREMENTAL_CACHE_FOLDER_NAME = "_NH_incremental"
 _NH_TEXTURE_CACHE_FOLDER_NAME = "NH_TexturePreviewCache"
 _NH_OBJECTS_ASSET_CATALOG_FILE_NAME = "blender_assets.cats.txt"
 _NH_OBJECTS_LEGACY_SOURCE_CACHE_FILENAMES = {
@@ -23886,57 +28142,16 @@ def _asset_rendered_preview_path_for_collection(collection, preview_dir: str, si
 
 
 def _asset_preview_path_for_collection(collection, preview_dir: str, render_textured_previews: bool = False):
-    if render_textured_previews:
-        rendered_preview = _asset_rendered_preview_path_for_collection(collection, preview_dir)
-        if rendered_preview:
-            return rendered_preview
-
+    del render_textured_previews
     geometry_preview = _asset_geometry_preview_path_for_collection(collection, preview_dir)
     if geometry_preview:
         return geometry_preview
-
-    image = _first_image_from_collection_materials(collection)
-    if image is None:
-        return ""
-    existing = _image_filepath_if_loadable(image)
-    if existing:
-        return existing
-    if not preview_dir:
-        return ""
-    try:
-        os.makedirs(preview_dir, exist_ok=True)
-        preview_path = os.path.join(preview_dir, _asset_preview_filename(getattr(collection, "name", "") or getattr(image, "name", "")))
-        _save_image_as_png(image, preview_path)
-        return preview_path if os.path.isfile(preview_path) else ""
-    except Exception:
-        return ""
+    return ""
 
 
-def _stable_preview_color(name: str):
-    seed = sum((idx + 1) * ord(ch) for idx, ch in enumerate(str(name or "")))
-    palette = (
-        (0.62, 0.67, 0.63),
-        (0.65, 0.62, 0.56),
-        (0.56, 0.63, 0.69),
-        (0.67, 0.58, 0.57),
-        (0.58, 0.64, 0.58),
-    )
-    return palette[seed % len(palette)]
-
-
-def _preview_material_color(obj, material_index: int):
-    mat = None
-    slots = getattr(obj, "material_slots", []) or []
-    if 0 <= material_index < len(slots):
-        mat = getattr(slots[material_index], "material", None)
-    if mat is not None:
-        try:
-            color = tuple(float(v) for v in getattr(mat, "diffuse_color", ()))
-            if len(color) >= 3 and max(color[:3]) > 0.02:
-                return color[:3]
-        except Exception:
-            pass
-    return _stable_preview_color(getattr(obj, "name", ""))
+def _preview_materialless_color(obj=None, material_index: int = 0):
+    del obj, material_index
+    return (0.66, 0.68, 0.64)
 
 
 def _collect_collection_preview_geometry(collection, max_faces=900, max_edges=2600):
@@ -23969,7 +28184,7 @@ def _collect_collection_preview_geometry(collection, max_faces=900, max_edges=26
             indices = list(getattr(poly, "vertices", []) or [])
             if len(indices) < 3:
                 continue
-            color = _preview_material_color(obj, int(getattr(poly, "material_index", 0) or 0))
+            color = _preview_materialless_color(obj, int(getattr(poly, "material_index", 0) or 0))
             for idx in range(1, len(indices) - 1):
                 try:
                     p0 = world_vertices[indices[0]]
@@ -24131,25 +28346,6 @@ def _asset_geometry_preview_path_for_collection(collection, preview_dir: str, si
         return ""
 
 
-def _mark_collection_as_asset_safe(collection, catalog_id=None, preview_path=None):
-    if collection is None:
-        return
-    try:
-        collection.asset_mark()
-    except Exception:
-        pass
-    if catalog_id:
-        try:
-            asset_data = getattr(collection, "asset_data", None)
-            if asset_data is not None:
-                asset_data.catalog_id = str(catalog_id)
-            else:
-                collection["catalog_id"] = str(catalog_id)
-        except Exception:
-            pass
-    if not _load_custom_asset_preview_safe(collection, preview_path or ""):
-        _generate_asset_preview_safe(collection)
-
 
 def _clear_asset_mark_safe(id_data):
     if id_data is None:
@@ -24170,7 +28366,7 @@ def _asset_instancer_name_for_collection(collection, filepath: str):
     return base
 
 
-def _create_asset_instancer_for_collection(asset_root, collection, filepath: str, catalog_id=None, preview_dir=None, render_textured_previews=False):
+def _create_asset_instancer_for_collection(asset_root, collection, filepath: str, catalog_id=None, preview_dir=None, render_textured_previews=False, preview_paths_out=None):
     if asset_root is None or collection is None:
         return None
     name = _asset_instancer_name_for_collection(collection, filepath)
@@ -24194,27 +28390,17 @@ def _create_asset_instancer_for_collection(asset_root, collection, filepath: str
     except Exception:
         pass
     preview_path = _asset_preview_path_for_collection(collection, preview_dir or "", render_textured_previews=render_textured_previews)
+    if preview_path and preview_paths_out is not None:
+        try:
+            preview_paths_out.append(preview_path)
+        except Exception:
+            pass
     _clear_asset_mark_safe(collection)
     _mark_object_as_asset_safe(instancer, catalog_id=catalog_id, preview_path=preview_path)
     return instancer
 
 
-def _mark_objects_in_collection_as_assets_safe(collection):
-    if collection is None:
-        return
-    seen = set()
-    for obj in _collect_collection_objects_recursive(collection):
-        if obj is None:
-            continue
-        ptr = obj.as_pointer()
-        if ptr in seen:
-            continue
-        seen.add(ptr)
-        if obj.type not in {"MESH", "EMPTY", "CURVE", "ARMATURE"}:
-            continue
-        _mark_object_as_asset_safe(obj)
-
-def _move_import_result_into_asset_library(context, filepath, pre_obj_ptrs, pre_col_ptrs, asset_root, catalog_id=None, preview_dir=None, render_textured_previews=False):
+def _move_import_result_into_asset_library(context, filepath, pre_obj_ptrs, pre_col_ptrs, asset_root, catalog_id=None, preview_dir=None, render_textured_previews=False, preview_paths_out=None):
     imported_objs = [o for o in bpy.data.objects if o.as_pointer() not in pre_obj_ptrs]
     _tag_import_source_on_imported_data(
         context=context,
@@ -24260,7 +28446,7 @@ def _move_import_result_into_asset_library(context, filepath, pre_obj_ptrs, pre_
                 col[_IE_SOURCE_PATH_KEY] = _norm_path(bpy.path.abspath(filepath))
             except Exception:
                 pass
-            _create_asset_instancer_for_collection(asset_root, col, filepath, catalog_id=catalog_id, preview_dir=preview_dir, render_textured_previews=render_textured_previews)
+            _create_asset_instancer_for_collection(asset_root, col, filepath, catalog_id=catalog_id, preview_dir=preview_dir, render_textured_previews=render_textured_previews, preview_paths_out=preview_paths_out)
             moved += 1
     else:
         name = os.path.splitext(os.path.basename(filepath))[0]
@@ -24280,7 +28466,7 @@ def _move_import_result_into_asset_library(context, filepath, pre_obj_ptrs, pre_
             col[_IE_SOURCE_PATH_KEY] = _norm_path(bpy.path.abspath(filepath))
         except Exception:
             pass
-        _create_asset_instancer_for_collection(asset_root, col, filepath, catalog_id=catalog_id, preview_dir=preview_dir, render_textured_previews=render_textured_previews)
+        _create_asset_instancer_for_collection(asset_root, col, filepath, catalog_id=catalog_id, preview_dir=preview_dir, render_textured_previews=render_textured_previews, preview_paths_out=preview_paths_out)
         moved = 1
 
     return moved, len(imported_objs)
@@ -24538,7 +28724,7 @@ def _p3d_file_manifest_entry(folder_abs: str, filepath: str):
     }
 
 
-def _p3d_folder_manifest(source_folder_abs: str, p3d_files, settings=None):
+def _p3d_folder_manifest(source_folder_abs: str, p3d_files, settings=None, preview_mode_override: str = ""):
     entries = []
     for fp in sorted((p3d_files or []), key=lambda item: item.lower()):
         if not fp or not os.path.isfile(fp):
@@ -24547,7 +28733,11 @@ def _p3d_folder_manifest(source_folder_abs: str, p3d_files, settings=None):
             entries.append(_p3d_file_manifest_entry(source_folder_abs, fp))
         except Exception:
             continue
-    preview_mode = "rendered_textured_cached_only" if bool(getattr(settings, "render_textured_previews", False)) else "geometry"
+    preview_mode = (
+        str(preview_mode_override)
+        if preview_mode_override
+        else "geometry"
+    )
     return {
         "version": _NH_OBJECTS_ASSET_MANIFEST_VERSION,
         "asset_blend": _NH_OBJECTS_ASSET_BLEND_NAME,
@@ -24555,6 +28745,72 @@ def _p3d_folder_manifest(source_folder_abs: str, p3d_files, settings=None):
         "preview_mode": preview_mode,
         "files": entries,
     }
+
+
+def _cache_relative_file_manifest_entries(cache_folder_abs: str, filepaths):
+    entries = []
+    seen = set()
+    cache_folder_abs = os.path.abspath(bpy.path.abspath(cache_folder_abs or ""))
+    for filepath in filepaths or []:
+        if not filepath:
+            continue
+        try:
+            path_abs = os.path.abspath(bpy.path.abspath(filepath))
+        except Exception:
+            path_abs = os.path.abspath(filepath)
+        key = os.path.normcase(path_abs)
+        if key in seen or not os.path.isfile(path_abs):
+            continue
+        seen.add(key)
+        try:
+            rel_path = os.path.relpath(path_abs, cache_folder_abs)
+        except Exception:
+            rel_path = os.path.basename(path_abs)
+        try:
+            stat = os.stat(path_abs)
+        except Exception:
+            continue
+        entries.append({
+            "path": rel_path.replace(os.sep, "/"),
+            "size": int(getattr(stat, "st_size", 0) or 0),
+            "mtime_ns": int(getattr(stat, "st_mtime_ns", int(getattr(stat, "st_mtime", 0.0) * 1000000000))),
+        })
+    return entries
+
+
+def _manifest_preview_files_are_ready(manifest_path: str, manifest: dict) -> bool:
+    preview_files = manifest.get("preview_files", []) if isinstance(manifest, dict) else []
+    if not preview_files:
+        return False
+
+    cache_folder = os.path.dirname(manifest_path or "")
+    for item in preview_files:
+        if not isinstance(item, dict):
+            return False
+        rel_or_abs = str(item.get("path", "") or "")
+        if not rel_or_abs:
+            return False
+        path_abs = rel_or_abs if os.path.isabs(rel_or_abs) else os.path.join(cache_folder, rel_or_abs)
+        try:
+            path_abs = os.path.abspath(bpy.path.abspath(path_abs))
+        except Exception:
+            path_abs = os.path.abspath(path_abs)
+        if not os.path.isfile(path_abs):
+            return False
+        try:
+            if os.path.getsize(path_abs) <= 0:
+                return False
+        except Exception:
+            return False
+
+    stats = manifest.get("texture_preview_stats", {}) if isinstance(manifest, dict) else {}
+    if not isinstance(stats, dict):
+        return False
+    textured_candidates = int(stats.get("textured_candidates", 0) or 0)
+    previewed = int(stats.get("previewed", 0) or 0)
+    if textured_candidates > 0 and previewed < textured_candidates:
+        return False
+    return True
 
 
 def _read_json_file(filepath: str):
@@ -24598,7 +28854,7 @@ def _custom_asset_manifest(p3d_files, settings=None):
             entries.append(_custom_p3d_file_manifest_entry(fp))
         except Exception:
             continue
-    preview_mode = "rendered_textured_cached_only" if bool(getattr(settings, "render_textured_previews", False)) else "geometry"
+    preview_mode = "geometry"
     return {
         "version": _NH_OBJECTS_ASSET_MANIFEST_VERSION,
         "asset_blend": _NH_OBJECTS_ASSET_BLEND_NAME,
@@ -24661,11 +28917,24 @@ def _custom_asset_library_is_current(p3d_files, settings=None):
     return list(saved_manifest.get("files", []) or []) == list(current_manifest.get("files", []) or [])
 
 
-def _write_persistent_asset_library_manifest(cache_folder_abs: str, source_folder_abs: str, p3d_files, blend_path: str, asset_entries: int, settings=None):
+def _write_persistent_asset_library_manifest(
+    cache_folder_abs: str,
+    source_folder_abs: str,
+    p3d_files,
+    blend_path: str,
+    asset_entries: int,
+    settings=None,
+    preview_mode_override: str = "",
+    preview_files=None,
+    texture_preview_stats=None,
+):
     os.makedirs(cache_folder_abs, exist_ok=True)
-    manifest = _p3d_folder_manifest(source_folder_abs, p3d_files, settings=settings)
+    manifest = _p3d_folder_manifest(source_folder_abs, p3d_files, settings=settings, preview_mode_override=preview_mode_override)
     manifest["asset_blend"] = os.path.basename(blend_path or _NH_OBJECTS_ASSET_BLEND_NAME)
     manifest["asset_entries"] = int(asset_entries or 0)
+    manifest["preview_files"] = _cache_relative_file_manifest_entries(cache_folder_abs, preview_files or [])
+    if texture_preview_stats is not None:
+        manifest["texture_preview_stats"] = dict(texture_preview_stats)
     manifest_path = _nh_asset_manifest_path_for_folder(cache_folder_abs)
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2, sort_keys=True)
@@ -24687,6 +28956,153 @@ def _persistent_asset_library_is_current(source_folder_abs: str, p3d_files, sett
     if str(saved_manifest.get("preview_mode", "") or "") != str(current_manifest.get("preview_mode", "") or ""):
         return False
     return list(saved_manifest.get("files", []) or []) == list(current_manifest.get("files", []) or [])
+
+
+def _iter_nh_asset_manifest_paths(cache_root: str):
+    if not cache_root or not os.path.isdir(cache_root):
+        return
+    for current, dirs, files in os.walk(cache_root):
+        dirs[:] = [name for name in dirs if name not in {"__pycache__"}]
+        if _NH_OBJECTS_ASSET_MANIFEST_NAME in files:
+            yield os.path.join(current, _NH_OBJECTS_ASSET_MANIFEST_NAME)
+
+
+def _manifest_asset_blend_exists(manifest_path: str, manifest: dict) -> bool:
+    blend_name = str(manifest.get("asset_blend", "") or _NH_OBJECTS_ASSET_BLEND_NAME)
+    blend_path = blend_name if os.path.isabs(blend_name) else os.path.join(os.path.dirname(manifest_path), blend_name)
+    return os.path.isfile(blend_path)
+
+
+def _cached_p3d_keys_from_asset_manifest(manifest_path: str):
+    manifest = _read_json_file(manifest_path)
+    if not isinstance(manifest, dict) or not _manifest_asset_blend_exists(manifest_path, manifest):
+        return set()
+
+    source_folder = str(manifest.get("source_folder", "") or "")
+    out = set()
+    for item in manifest.get("files", []) or []:
+        if not isinstance(item, dict):
+            continue
+        rel_or_abs = str(item.get("path", "") or "")
+        if not rel_or_abs:
+            continue
+        if os.path.isabs(rel_or_abs):
+            path_abs = rel_or_abs
+        elif source_folder:
+            path_abs = os.path.join(source_folder, rel_or_abs)
+        else:
+            continue
+        try:
+            path_abs = os.path.abspath(bpy.path.abspath(path_abs))
+        except Exception:
+            path_abs = os.path.abspath(path_abs)
+        if os.path.isfile(path_abs) and path_abs.lower().endswith(".p3d"):
+            out.add(os.path.normcase(path_abs))
+    return out
+
+
+def _cached_nh_objects_p3d_keys(settings=None):
+    keys = set()
+    for label, _source_root in _iter_nh_objects_source_roots(settings):
+        cache_root = _nh_objects_asset_cache_root(label, create=False)
+        for manifest_path in _iter_nh_asset_manifest_paths(cache_root) or ():
+            keys.update(_cached_p3d_keys_from_asset_manifest(manifest_path))
+    return keys
+
+
+def _p3d_paths_from_asset_manifest(manifest_path: str):
+    manifest = _read_json_file(manifest_path)
+    if not isinstance(manifest, dict) or not _manifest_asset_blend_exists(manifest_path, manifest):
+        return []
+
+    source_folder = str(manifest.get("source_folder", "") or "")
+    out = []
+    seen = set()
+    for item in manifest.get("files", []) or []:
+        if not isinstance(item, dict):
+            continue
+        rel_or_abs = str(item.get("path", "") or "")
+        if not rel_or_abs:
+            continue
+        if os.path.isabs(rel_or_abs):
+            path_abs = rel_or_abs
+        elif source_folder:
+            path_abs = os.path.join(source_folder, rel_or_abs)
+        else:
+            continue
+        try:
+            path_abs = os.path.abspath(bpy.path.abspath(path_abs))
+        except Exception:
+            path_abs = os.path.abspath(path_abs)
+        key = os.path.normcase(path_abs)
+        if key in seen:
+            continue
+        if os.path.isfile(path_abs) and path_abs.lower().endswith(".p3d"):
+            seen.add(key)
+            out.append(path_abs)
+    return out
+
+
+def _incremental_assets_needing_textured_previews(settings=None):
+    out = []
+    seen = set()
+    wanted_mode = "geometry"
+    for label, source_root in _iter_nh_objects_source_roots(settings):
+        cache_root = _nh_objects_asset_cache_root(label, create=False)
+        incremental_root = os.path.join(cache_root, _NH_OBJECTS_INCREMENTAL_CACHE_FOLDER_NAME)
+        for manifest_path in _iter_nh_asset_manifest_paths(incremental_root) or ():
+            manifest = _read_json_file(manifest_path)
+            if not isinstance(manifest, dict):
+                continue
+            if (
+                str(manifest.get("preview_mode", "") or "") == wanted_mode
+                and _manifest_preview_files_are_ready(manifest_path, manifest)
+            ):
+                continue
+            p3d_paths = _p3d_paths_from_asset_manifest(manifest_path)
+            if len(p3d_paths) != 1:
+                continue
+            fp = p3d_paths[0]
+            key = os.path.normcase(fp)
+            if key in seen:
+                continue
+            seen.add(key)
+            source_folder = str(manifest.get("source_folder", "") or "") or os.path.dirname(fp)
+            try:
+                source_folder = os.path.abspath(bpy.path.abspath(source_folder))
+            except Exception:
+                source_folder = os.path.abspath(source_folder)
+            if not _path_is_under_or_equal(source_folder, source_root):
+                source_folder = os.path.dirname(fp)
+            out.append((source_folder, fp, os.path.dirname(manifest_path)))
+    return out
+
+
+def _nh_incremental_asset_cache_folder_for_p3d(source_folder_abs: str, p3d_path: str, settings=None, create=False) -> str:
+    base_cache = _nh_asset_cache_folder_for_source_folder(source_folder_abs, settings, create=create)
+    stem = os.path.splitext(os.path.basename(p3d_path or ""))[0] or "asset"
+    safe_stem = re.sub(r'[<>:"/\\|?*]+', "_", stem).strip(" .") or "asset"
+    digest = hashlib.sha1(_norm_path(os.path.abspath(bpy.path.abspath(p3d_path))).encode("utf-8", "ignore")).hexdigest()[:12]
+    cache_folder = os.path.join(base_cache, _NH_OBJECTS_INCREMENTAL_CACHE_FOLDER_NAME, f"{safe_stem}_{digest}")
+    if create:
+        os.makedirs(cache_folder, exist_ok=True)
+    return cache_folder
+
+
+def _find_new_nh_objects_p3d_files(settings=None):
+    cached_keys = _cached_nh_objects_p3d_keys(settings)
+    new_items = []
+    scanned = 0
+    cached = 0
+    for folder_abs in _iter_nh_objects_asset_source_folders(settings):
+        for fp in _iter_p3d_files_direct(folder_abs, settings):
+            scanned += 1
+            key = os.path.normcase(os.path.abspath(bpy.path.abspath(fp)))
+            if key in cached_keys:
+                cached += 1
+                continue
+            new_items.append((folder_abs, fp))
+    return new_items, scanned, cached, len(cached_keys)
 
 
 def _write_persistent_asset_library_blend(folder_abs: str, asset_root):
@@ -24717,6 +29133,7 @@ def _build_persistent_asset_library_for_folder(
     catalog_path: str = "",
     library_label: str = "",
     cache_missing_textures: bool = False,
+    render_textured_previews=None,
     manifest_writer=None,
 ):
     _clear_temp_asset_library(context)
@@ -24732,14 +29149,21 @@ def _build_persistent_asset_library_for_folder(
                 library_label = name
                 break
     catalog_id = _nh_asset_catalog_id(library_label, catalog_path)
+    render_textured_previews = (
+        bool(getattr(settings, "render_textured_previews", False))
+        if render_textured_previews is None
+        else bool(render_textured_previews)
+    )
 
     imported = 0
     moved_collections = 0
     previewed = 0
     textured_candidates = 0
+    missing_texture_previews = 0
     packed_preview_images = 0
     failed = []
     preview_errors = []
+    preview_paths = []
     try:
         for fp in p3d_files:
             pre_obj_ptrs = {o.as_pointer() for o in bpy.data.objects}
@@ -24765,22 +29189,24 @@ def _build_persistent_asset_library_for_folder(
                 continue
             imported += 1
             imported_objs = [o for o in bpy.data.objects if o.as_pointer() not in pre_obj_ptrs]
-            try:
-                preview_stats = _postprocess_imported_material_previews(
-                    context,
-                    imported_objs,
-                    show_materials=True,
-                    keep_converted_textures=True,
-                    pack_runtime_images=False,
-                    cache_missing_textures=bool(cache_missing_textures),
-                )
-                previewed += int(preview_stats.get("previewed", 0) or 0)
-                textured_candidates += int(preview_stats.get("textured_candidates", 0) or 0)
-                packed_preview_images += int(preview_stats.get("packed", 0) or 0)
-                for item in preview_stats.get("errors", []) or []:
-                    preview_errors.append(f"{os.path.basename(fp)}: {item}")
-            except Exception as e:
-                preview_errors.append(f"{os.path.basename(fp)}: {_fmt_exc(e)}")
+            if render_textured_previews:
+                try:
+                    preview_stats = _postprocess_imported_material_previews(
+                        context,
+                        imported_objs,
+                        show_materials=True,
+                        keep_converted_textures=True,
+                        pack_runtime_images=False,
+                        cache_missing_textures=bool(cache_missing_textures),
+                    )
+                    previewed += int(preview_stats.get("previewed", 0) or 0)
+                    textured_candidates += int(preview_stats.get("textured_candidates", 0) or 0)
+                    missing_texture_previews += int(preview_stats.get("missing", 0) or 0)
+                    packed_preview_images += int(preview_stats.get("packed", 0) or 0)
+                    for item in preview_stats.get("errors", []) or []:
+                        preview_errors.append(f"{os.path.basename(fp)}: {item}")
+                except Exception as e:
+                    preview_errors.append(f"{os.path.basename(fp)}: {_fmt_exc(e)}")
             moved, _obj_count = _move_import_result_into_asset_library(
                 context,
                 fp,
@@ -24789,7 +29215,8 @@ def _build_persistent_asset_library_for_folder(
                 asset_root,
                 catalog_id=catalog_id,
                 preview_dir=preview_dir,
-                render_textured_previews=bool(getattr(settings, "render_textured_previews", False)),
+                render_textured_previews=render_textured_previews,
+                preview_paths_out=preview_paths,
             )
             moved_collections += moved
 
@@ -24800,7 +29227,24 @@ def _build_persistent_asset_library_for_folder(
         if callable(manifest_writer):
             manifest_path = manifest_writer(cache_folder_abs, p3d_files, blend_path, asset_entries, settings=settings)
         else:
-            manifest_path = _write_persistent_asset_library_manifest(cache_folder_abs, folder_abs, p3d_files, blend_path, asset_entries, settings=settings)
+            preview_mode = "geometry"
+            manifest_path = _write_persistent_asset_library_manifest(
+                cache_folder_abs,
+                folder_abs,
+                p3d_files,
+                blend_path,
+                asset_entries,
+                settings=settings,
+                preview_mode_override=preview_mode,
+                preview_files=preview_paths,
+                texture_preview_stats={
+                    "textured_candidates": int(textured_candidates),
+                    "previewed": int(previewed),
+                    "missing": int(missing_texture_previews),
+                    "packed": int(packed_preview_images),
+                    "errors": int(len(preview_errors)),
+                },
+            )
         return {
             "folder": folder_abs,
             "cache_folder": cache_folder_abs,
@@ -24811,6 +29255,7 @@ def _build_persistent_asset_library_for_folder(
             "moved_collections": moved_collections,
             "previewed": previewed,
             "textured_candidates": textured_candidates,
+            "missing_texture_previews": missing_texture_previews,
             "packed_preview_images": packed_preview_images,
             "failed": failed,
             "preview_errors": preview_errors,
@@ -24921,7 +29366,8 @@ def _build_custom_persistent_asset_library(op, context, p3d_files, *, open_brows
             cache_folder_abs=_nh_objects_custom_asset_cache_root(create=True),
             catalog_path=_NH_OBJECTS_CUSTOM_LABEL,
             library_label=_NH_OBJECTS_CUSTOM_LIBRARY_NAME,
-            cache_missing_textures=True,
+            cache_missing_textures=False,
+            render_textured_previews=False,
             manifest_writer=_write_custom_asset_manifest,
         )
     except Exception as e:
@@ -24982,7 +29428,26 @@ def _find_custom_asset_source_by_name(settings, model_name: str):
     return (all_matches[0], all_matches) if all_matches else ("", [])
 
 
-def _build_nh_objects_persistent_asset_libraries(op, context):
+def _clear_nh_objects_asset_library_cache_roots(settings=None):
+    cache_base = os.path.abspath(_nh_objects_asset_cache_base(create=True))
+    removed = []
+    failed = []
+    for label, _source_root in _iter_nh_objects_source_roots(settings):
+        cache_root = os.path.abspath(_nh_objects_asset_cache_root(label, create=False))
+        if not os.path.isdir(cache_root):
+            continue
+        if not _path_is_under_or_equal(cache_root, cache_base):
+            failed.append(f"{label}: refused to delete outside NH cache: {cache_root}")
+            continue
+        try:
+            shutil.rmtree(cache_root)
+            removed.append(cache_root)
+        except Exception as e:
+            failed.append(f"{label}: {cache_root}: {_fmt_exc(e)}")
+    return removed, failed
+
+
+def _build_nh_objects_persistent_asset_libraries(op, context, cache_missing_textures: bool = False):
     settings = context.scene.cray_asset_library_settings
     if not _has_any_a3ob_import_ops():
         op.report({"ERROR"}, "Arma 3 Object Builder import operators not found")
@@ -25034,7 +29499,13 @@ def _build_nh_objects_persistent_asset_libraries(op, context):
             skipped_current += 1
             continue
         try:
-            stats = _build_persistent_asset_library_for_folder(context, folder_abs, p3d_files, settings)
+            stats = _build_persistent_asset_library_for_folder(
+                context,
+                folder_abs,
+                p3d_files,
+                settings,
+                cache_missing_textures=cache_missing_textures,
+            )
         except Exception as e:
             failed.append(f"{folder_abs}: {_fmt_exc(e)}")
             continue
@@ -25067,7 +29538,8 @@ def _build_nh_objects_persistent_asset_libraries(op, context):
                     cache_folder_abs=_nh_objects_custom_asset_cache_root(create=True),
                     catalog_path=_NH_OBJECTS_CUSTOM_LABEL,
                     library_label=_NH_OBJECTS_CUSTOM_LIBRARY_NAME,
-                    cache_missing_textures=True,
+                    cache_missing_textures=False,
+                    render_textured_previews=False,
                     manifest_writer=_write_custom_asset_manifest,
                 )
             except Exception as e:
@@ -25120,6 +29592,135 @@ def _build_nh_objects_persistent_asset_libraries(op, context):
     return {"FINISHED"}
 
 
+def _add_new_nh_objects_assets_to_cache(op, context):
+    settings = context.scene.cray_asset_library_settings
+    if not _has_any_a3ob_import_ops():
+        op.report({"ERROR"}, "Arma 3 Object Builder import operators not found")
+        return {"CANCELLED"}
+
+    registered, missing_roots = _register_nh_objects_blender_asset_libraries()
+    configured_roots = [
+        ("Common", _nh_objects_common_root(settings)),
+        ("Environment", _nh_objects_environment_root(settings)),
+    ]
+    missing_configured = [f"{label}: {path}" for label, path in configured_roots if not os.path.isdir(path)]
+    if missing_configured:
+        op.report({"ERROR"}, "Set valid Common and Environment folders")
+        print("=== NH Objects Add New Assets: Missing configured roots ===")
+        for item in missing_configured:
+            print(item)
+        return {"CANCELLED"}
+
+    folders = list(_iter_nh_objects_asset_source_folders(settings))
+    if not folders:
+        op.report({"ERROR"}, "No .p3d folders found in NH_Objects Common/Environment")
+        return {"CANCELLED"}
+    for cache_root, catalog_paths in _nh_asset_catalog_paths_by_cache_root(folders, settings).items():
+        try:
+            _write_nh_asset_catalog_file(cache_root, catalog_paths)
+        except Exception as e:
+            print(f"NH Objects Asset Catalogs: {cache_root}: {_fmt_exc(e)}")
+
+    new_items, scanned, cached_existing, cached_total = _find_new_nh_objects_p3d_files(settings)
+    icon_update_items = _incremental_assets_needing_textured_previews(settings)
+    if scanned > 0 and cached_total <= 0:
+        op.report({"ERROR"}, "No existing NH asset cache manifests found. Run Build NH Libraries once, then use Add New.")
+        return {"CANCELLED"}
+    if not new_items and not icon_update_items:
+        _open_nh_objects_asset_browser(context, settings)
+        op.report({"INFO"}, f"No new or outdated NH .p3d assets found: scanned {scanned}, cached {cached_existing}")
+        return {"FINISHED"}
+
+    try:
+        settings.import_first_lod_only = True
+    except Exception:
+        pass
+
+    built = 0
+    imported_total = 0
+    asset_entries_total = 0
+    previewed_total = 0
+    textured_candidates_total = 0
+    packed_preview_images_total = 0
+    failed = []
+    preview_errors = []
+    build_items = [
+        (folder_abs, fp, _nh_incremental_asset_cache_folder_for_p3d(folder_abs, fp, settings, create=True), "new")
+        for folder_abs, fp in new_items
+    ]
+    build_items.extend(
+        (folder_abs, fp, cache_folder_abs, "icon")
+        for folder_abs, fp, cache_folder_abs in icon_update_items
+    )
+
+    icon_updates = 0
+    for folder_abs, fp, cache_folder_abs, item_kind in build_items:
+        try:
+            os.makedirs(cache_folder_abs, exist_ok=True)
+            stats = _build_persistent_asset_library_for_folder(
+                context,
+                folder_abs,
+                [fp],
+                settings,
+                cache_folder_abs=cache_folder_abs,
+                cache_missing_textures=False,
+                render_textured_previews=False,
+            )
+        except Exception as e:
+            failed.append(f"{fp}: {_fmt_exc(e)}")
+            continue
+        built += 1
+        if item_kind == "icon":
+            icon_updates += 1
+        imported_total += int(stats.get("imported", 0))
+        asset_entries_total += int(stats.get("asset_entries", 0))
+        previewed_total += int(stats.get("previewed", 0))
+        textured_candidates_total += int(stats.get("textured_candidates", 0))
+        packed_preview_images_total += int(stats.get("packed_preview_images", 0))
+        for item in stats.get("failed", []) or []:
+            failed.append(f"{fp}: {item}")
+        for item in stats.get("preview_errors", []) or []:
+            preview_errors.append(f"{fp}: {item}")
+
+    if failed:
+        print("=== NH Objects Add New Assets: Failures ===")
+        for item in failed:
+            print(item)
+    if preview_errors:
+        print("=== NH Objects Add New Assets: Material preview warnings ===")
+        for item in preview_errors:
+            print(item)
+    if missing_roots:
+        print("=== NH Objects Asset Libraries: Missing roots ===")
+        for item in missing_roots:
+            print(item)
+
+    if built <= 0:
+        op.report({"ERROR"}, f"No NH assets updated; found {len(new_items)} new and {len(icon_update_items)} icon candidate(s), failed {len(failed)}")
+        return {"CANCELLED"}
+
+    _open_nh_objects_asset_browser(context, settings)
+    msg = (
+        f"Added new NH assets: scanned {scanned}, already cached {cached_existing}, "
+        f"new {len(new_items)}, updated {built}, imported {imported_total}, assets {asset_entries_total}"
+    )
+    if icon_updates:
+        msg += f", icon updates {icon_updates}"
+    if registered:
+        msg += f", registered {registered}"
+    if textured_candidates_total > 0:
+        msg += f", texture previews {previewed_total}/{textured_candidates_total}"
+    if packed_preview_images_total > 0:
+        msg += f", packed {packed_preview_images_total}"
+    if failed:
+        op.report({"WARNING"}, msg + f", failed {len(failed)} (see System Console)")
+    elif preview_errors:
+        op.report({"WARNING"}, msg + f", preview warnings {len(preview_errors)} (see System Console)")
+    else:
+        op.report({"INFO"}, msg)
+    return {"FINISHED"}
+
+
 class CRAY_OT_AssetLibraryBuildNHObjects(Operator):
     bl_idname = "cray.asset_library_build_nh_objects"
     bl_label = "Build NH Libraries"
@@ -25131,6 +29732,16 @@ class CRAY_OT_AssetLibraryBuildNHObjects(Operator):
 
     def execute(self, context):
         return _build_nh_objects_persistent_asset_libraries(self, context)
+
+
+class CRAY_OT_AssetLibraryAddNewNHObjects(Operator):
+    bl_idname = "cray.asset_library_add_new_nh_objects"
+    bl_label = "Add New NH Assets"
+    bl_description = "Scan Common/Environment and cache only .p3d files that are not already present in NH asset library manifests"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        return _add_new_nh_objects_assets_to_cache(self, context)
 
 
 class CRAY_OT_AssetLibraryOpenNHBrowser(Operator):
@@ -25534,42 +30145,81 @@ class CRAY_OT_ConvertSelectedToProxies(Operator):
     def execute(self, context):
         st = context.scene.cray_asset_proxy_settings
         explicit_source = getattr(st, "source_object", None)
+        explicit_target_collection = getattr(st, "target_collection", None)
+        provisional_target_root = _pick_proxy_target_root_collection(
+            context,
+            explicit_collection=explicit_target_collection,
+            target_obj=getattr(st, "target_object", None),
+        )
         if explicit_source is not None:
             source_map, source_error = _proxy_explicit_source_map(context, explicit_source)
             if source_error:
                 self.report({"ERROR"}, source_error)
                 return {"CANCELLED"}
         else:
-            source_map = _proxy_selected_asset_source_map(context)
+            source_map = _proxy_selected_asset_source_map(context, excluded_root=provisional_target_root)
 
         target_obj = _pick_proxy_target_object(context, st.target_object, source_map.keys())
+        target_root = _pick_proxy_target_root_collection(
+            context,
+            explicit_collection=explicit_target_collection,
+            target_obj=target_obj,
+            source_objs=source_map.keys(),
+        )
+        if target_root is not None and explicit_source is None:
+            source_map = _proxy_selected_asset_source_map(context, excluded_root=target_root)
+            target_obj = _pick_proxy_target_object(context, st.target_object, source_map.keys())
+            target_root = _pick_proxy_target_root_collection(
+                context,
+                explicit_collection=explicit_target_collection,
+                target_obj=target_obj,
+                source_objs=source_map.keys(),
+            ) or target_root
         if target_obj is not None:
             try:
                 st.target_object = target_obj
             except Exception:
                 pass
-        if target_obj is None:
-            self.report({"ERROR"}, "Pick Target Resolution / LOD or select an asset object parented under a LOD")
+        if target_root is not None:
+            try:
+                st.target_collection = target_root
+            except Exception:
+                pass
+        if target_obj is None and target_root is None:
+            self.report({"ERROR"}, "Pick Target P3D Collection, Target LOD mesh, or select an asset object parented under a LOD")
             return {"CANCELLED"}
-        if not _model_split_is_a3ob_lod_object(target_obj):
+        if target_obj is not None and not _model_split_is_a3ob_lod_object(target_obj):
             self.report({"ERROR"}, "Target must be an A3OB LOD mesh, for example Resolution 0")
             return {"CANCELLED"}
 
-        duplicate_to_all_resolution_lods = bool(getattr(st, "duplicate_to_all_resolution_lods", False))
-        target_lods = _proxy_conversion_target_lods(context, target_obj, duplicate_to_all_resolution_lods)
-        if duplicate_to_all_resolution_lods and not target_lods:
-            self.report({"ERROR"}, "Duplicate to all Resolution LODs requires a Resolution LOD target")
-            return {"CANCELLED"}
+        category_tokens = _proxy_selected_target_category_tokens(st, target_obj=target_obj)
+        target_lods = _proxy_conversion_target_lods_for_categories(context, target_root, target_obj, category_tokens)
+        if not target_lods and target_obj is not None:
+            target_lods = _proxy_conversion_target_lods(
+                context,
+                target_obj,
+                bool(getattr(st, "duplicate_to_all_resolution_lods", False)),
+            )
         if not target_lods:
-            target_lods = [target_obj]
+            self.report({"ERROR"}, "Could not find or create target LOD object(s) in the selected target collection")
+            return {"CANCELLED"}
+        if target_obj is None:
+            target_obj = target_lods[0]
+            try:
+                st.target_object = target_obj
+            except Exception:
+                pass
 
         if explicit_source is not None:
             selected = [explicit_source] if explicit_source != target_obj else []
         else:
-            selected = [
-                o for o in context.selected_objects
-                if o not in target_lods and o in source_map
-            ]
+            selected = []
+            for obj in getattr(context, "selected_objects", []) or []:
+                if obj not in target_lods and obj in source_map and obj not in selected:
+                    selected.append(obj)
+            for obj in source_map.keys():
+                if obj not in target_lods and obj not in selected:
+                    selected.append(obj)
         if not selected:
             self.report({"ERROR"}, "Pick Proxy Source Object or select placed asset object(s)")
             return {"CANCELLED"}
@@ -25657,7 +30307,13 @@ class CRAY_OT_ConvertSelectedToProxies(Operator):
 
         msg = f"Created {created} proxy(s)"
         if target_count > 1:
-            msg += f" across {target_count} Resolution LOD(s)"
+            category_labels = ", ".join(
+                _model_split_target_category_label(token)
+                for token in category_tokens
+            )
+            msg += f" across {target_count} target LOD(s)"
+            if category_labels:
+                msg += f" ({category_labels})"
         else:
             msg += f" under '{target_obj.name}'"
         msg += f", removed {removed} original(s)"
@@ -26973,7 +31629,8 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
             if ngon_issues:
                 _report_export_ngon_issues_in_console(col.name, filepath, ngon_issues)
                 if not bool(st.export_force_all_lods):
-                    failed.append(f"{col.name} -> n-gon detected in exportable LOD mesh (see System Console)")
+                    first_path = ngon_issues[0].get("display_path") or ngon_issues[0].get("mesh_object_name", "<unknown>")
+                    failed.append(f"{first_path} has n-gons (see System Console)")
                     continue
                 print("WARNING: Force export all LODs is ON, continuing despite n-gon issue(s).")
 
@@ -27028,12 +31685,6 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
             except Exception:
                 pass
 
-            prepared_mass = _prepare_geometry_lod_mass_for_export(selectable)
-            if prepared_mass:
-                print("=== Batch Export Collections: Geometry LOD mass prepared ===")
-                for lod_name, vert_count, total_mass in prepared_mass:
-                    print(f"{col.name} / {lod_name}: {vert_count} vertex masses, total {total_mass:.3f}")
-
             if warn_loose_vertices:
                 loose_warnings = _collect_export_loose_vertex_warnings(col, selectable)
                 if loose_warnings:
@@ -27049,23 +31700,31 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
                     failed.append(f"{col.name} -> backup stage failed: {backup_stage_err}")
                     continue
 
-            _, op_id, err = _call_export_with_optional_relaxed_validation(
-                force_all_lods=bool(st.export_force_all_lods),
-                filepath=filepath,
-                use_selection=True,
-                visible_only=False,
-                relative_paths=True,
-                preserve_normals=True,
-                validate_meshes=False,
-                apply_transforms=True,
-                apply_modifiers=True,
-                sort_sections=True,
-                lod_collisions="IGNORE" if bool(st.export_force_all_lods) else "SKIP",
-                validate_lods=False,
-                validate_lods_warning_errors=False,
-                generate_components=True,
-                force_lowercase=True,
-            )
+            material_restore = _strip_collision_lod_materials_for_export(selectable)
+            named_property_restore = _strip_a3ob_named_properties_for_export(selectable)
+            try:
+                _, op_id, err = _call_export_with_optional_relaxed_validation(
+                    force_all_lods=bool(st.export_force_all_lods),
+                    filepath=filepath,
+                    use_selection=True,
+                    visible_only=False,
+                    relative_paths=True,
+                    preserve_normals=True,
+                    validate_meshes=False,
+                    apply_transforms=True,
+                    apply_modifiers=True,
+                    sort_sections=True,
+                    lod_collisions="IGNORE" if bool(st.export_force_all_lods) else "SKIP",
+                    validate_lods=False,
+                    validate_lods_warning_errors=False,
+                    generate_components=True,
+                    renumber_components=True,
+                    translate_selections=False,
+                    force_lowercase=True,
+                )
+            finally:
+                _restore_a3ob_named_properties_after_export(named_property_restore)
+                _restore_collision_lod_materials_after_export(material_restore)
             export_missing_keys = []
             lod_post_check_failed = False
             if op_id:
@@ -27204,7 +31863,7 @@ class CRAY_PT_ClutterProxiesPanel(Panel):
     bl_category = "NH Plugin"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_order = 22
+    bl_order = _UI_PANEL_DEFAULT_ORDER["object_builder"]
     bl_options = {"DEFAULT_CLOSED"}
 
     @classmethod
@@ -27250,6 +31909,7 @@ class CRAY_PT_SnapPointsPanel(Panel):
     bl_category = "NH Plugin"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
+    bl_order = _UI_PANEL_DEFAULT_ORDER["snap_points"]
     bl_options = {"DEFAULT_CLOSED"}
 
     @classmethod
@@ -27319,7 +31979,7 @@ class CRAY_PT_ColliderPanel(Panel):
     bl_category = "NH Plugin"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_order = 20
+    bl_order = _UI_PANEL_DEFAULT_ORDER["geometry_lods"]
     bl_options = {"DEFAULT_CLOSED"}
 
     @classmethod
@@ -27348,6 +32008,34 @@ class CRAY_PT_ColliderPanel(Panel):
             row = fire.row(align=True)
             row.prop(cs, "fire_geometry_material", text="Material")
             row.operator("cray.open_fire_geometry_rvmat_folder", text="", icon="FILE_FOLDER")
+            op = row.operator("cray.select_collider_material_faces", text="", icon="FACESEL")
+            op.target_attr = "FIRE"
+
+        layout.separator()
+
+        fake = layout.box()
+        row = fake.row(align=True)
+        row.label(text="Fake Terrain Geometry", icon="MESH_GRID")
+        row.prop(
+            cs,
+            "show_fake_terrain_tools",
+            text="",
+            emboss=False,
+            icon="TRIA_DOWN" if cs.show_fake_terrain_tools else "TRIA_RIGHT",
+        )
+        if cs.show_fake_terrain_tools:
+            fake.prop(cs, "fake_terrain_source_object")
+            row = fake.row(align=True)
+            row.prop(cs, "fake_terrain_target_choice", text="Target")
+            row.operator("cray.set_fake_terrain_target_from_active", text="", icon="EYEDROPPER")
+            row = fake.row(align=True)
+            row.prop(cs, "fake_terrain_patch_size")
+            row.prop(cs, "fake_terrain_min_patch_size")
+            row = fake.row(align=True)
+            row.prop(cs, "fake_terrain_depression_error")
+            row.prop(cs, "fake_terrain_hill_error")
+            fake.prop(cs, "fake_terrain_thickness")
+            fake.operator("cray.generate_fake_terrain_geometry", icon="MOD_BUILD")
 
         layout.separator()
 
@@ -27370,8 +32058,10 @@ class CRAY_PT_ColliderPanel(Panel):
             row.operator("cray.ensure_roadway_lod", icon="OUTLINER_OB_MESH")
             row.operator("cray.copy_selected_faces_to_roadway", icon="FACESEL")
             row = roadway.row(align=True)
-            row.prop(cs, "roadway_material", text="Material")
+            row.prop(cs, "roadway_material", text="Texture")
             row.operator("cray.open_roadway_material_folder", text="", icon="FILE_FOLDER")
+            op = row.operator("cray.select_collider_material_faces", text="", icon="FACESEL")
+            op.target_attr = "ROADWAY"
             roadway.prop(cs, "roadway_weld_distance")
             roadway.operator("cray.weld_roadway_vertices", icon="AUTOMERGE_ON")
 
@@ -27382,7 +32072,7 @@ class CRAY_PT_ColliderExpPanel(Panel):
     bl_category = "NH Plugin"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_order = 21
+    bl_order = _UI_PANEL_DEFAULT_ORDER["collider"]
     bl_options = {"DEFAULT_CLOSED"}
 
     @classmethod
@@ -27420,6 +32110,7 @@ class CRAY_PT_ColliderExpPanel(Panel):
         row.prop_enum(es, "collider_scope", "PER_OBJECT_COMPONENTS", text="per obj comp")
         row.prop_enum(es, "collider_scope", "PER_OBJECTS", text="per objects")
         create.prop(es, "minimum_size")
+        create.prop(es, "normal_minimum_size")
         create.label(text="Create Collider", icon="MOD_REMESH")
 
         op = create.operator("cray.generate_box_collider_exp", text="Box", icon="MESH_CUBE")
@@ -27438,6 +32129,15 @@ class CRAY_PT_ColliderExpPanel(Panel):
             es,
             prop_names=_collider_exp_operator_props_exp(("convex_detail", "convex_max_triangles")),
         )
+        op = create.operator("cray.reconvex_selected_components_exp", text="Re-Convex Selected Components", icon="MESH_ICOSPHERE")
+        _assign_collider_exp_operator_props_exp(
+            op,
+            es,
+            prop_names=("merge_distance", "recalc_normals", "convex_detail", "convex_max_triangles"),
+        )
+        row = create.row(align=True)
+        row.operator("cray.select_connected_shell_from_selection_exp", text="Select Shell", icon="GROUP_VERTEX")
+        row.operator("cray.delete_last_collider_exp", text="Delete Last", icon="TRASH")
 
         row = create.row(align=True)
         op = row.operator("cray.generate_sphere_collider_exp", text="Sphere", icon="MESH_UVSPHERE")
@@ -27470,7 +32170,7 @@ class CRAY_PT_ColliderExpPanel(Panel):
             es,
             prop_names=_collider_exp_operator_props_exp(("cylinder_segments",)),
         )
-        op = row.operator("cray.generate_cylinder_boxes_collider_exp", text="Boxes From Cylinder", icon="MESH_CUBE")
+        op = row.operator("cray.generate_cylinder_boxes_collider_exp", text="Cylinder Boxes", icon="MESH_CUBE")
         _assign_collider_exp_operator_props_exp(
             op,
             es,
@@ -27489,7 +32189,7 @@ class CRAY_PT_ColliderExpPanel(Panel):
                 "pipe_thickness",
             )),
         )
-        op = row.operator("cray.generate_pipe_boxes_collider_exp", text="Boxes From Pipe", icon="MESH_CUBE")
+        op = row.operator("cray.generate_pipe_boxes_collider_exp", text="Pipe Boxes", icon="MESH_CUBE")
         _assign_collider_exp_operator_props_exp(
             op,
             es,
@@ -27517,6 +32217,7 @@ class CRAY_PT_AssetProxyPanel(Panel):
     bl_category = "NH Plugin"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
+    bl_order = _UI_PANEL_DEFAULT_ORDER["asset_library"]
     bl_options = {"DEFAULT_CLOSED"}
 
     @classmethod
@@ -27532,12 +32233,10 @@ class CRAY_PT_AssetProxyPanel(Panel):
         box.label(text="NH Objects Libraries", icon="ASSET_MANAGER")
         box.prop(lib, "common_root")
         box.prop(lib, "environment_root")
-        box.prop(lib, "rebuild_existing_libraries")
         row = box.row(align=True)
-        row.operator("cray.asset_library_build_nh_objects", icon="ASSET_MANAGER")
+        row.operator("cray.asset_library_full_rebuild_from_zero", text="Full Rebuild", icon="FILE_REFRESH")
+        row.operator("cray.asset_library_add_new_nh_objects", text="Add New", icon="ADD")
         row.operator("cray.asset_library_open_nh_browser", text="", icon="FILEBROWSER")
-        box.operator("cray.asset_library_clean_source_artifacts", text="Clean Source Cache Files", icon="TRASH")
-        box.operator("cray.texture_cache_build_nh_library_used", text="Cache Used Library Textures", icon="TEXTURE")
         box.separator()
         box.label(text="Custom", icon="BOOKMARKS")
         box.prop(lib, "custom_search_root")
@@ -27551,7 +32250,13 @@ class CRAY_PT_AssetProxyPanel(Panel):
         box.label(text="Placed Assets -> A3OB Proxies", icon="CONSTRAINT")
         box.prop(st, "source_object", text="Proxy Source Object")
         box.prop(st, "target_object", text="Target Resolution / LOD")
-        box.prop(st, "duplicate_to_all_resolution_lods")
+        box.prop(st, "target_collection", text="Target P3D Collection")
+        row = box.row(align=True)
+        row.label(text="Duplicate proxy to:")
+        row.prop(st, "proxy_duplicate_resolution", text="", icon="OUTLINER_OB_MESH", toggle=True)
+        row.prop(st, "proxy_duplicate_geometries", text="", icon="MESH_ICOSPHERE", toggle=True)
+        row.prop(st, "proxy_duplicate_roadway", text="", icon="MESH_PLANE", toggle=True)
+        row.prop(st, "proxy_duplicate_point_clouds", text="", icon="EMPTY_AXIS", toggle=True)
         box.operator("cray.convert_selected_to_proxies", icon="CONSTRAINT")
 
 
@@ -27561,6 +32266,7 @@ class CRAY_PT_FixesPanel(Panel):
     bl_category = "NH Plugin"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
+    bl_order = _UI_PANEL_DEFAULT_ORDER["fixes"]
     bl_options = {"DEFAULT_CLOSED"}
 
     @classmethod
@@ -27575,6 +32281,7 @@ class CRAY_PT_FixesPanel(Panel):
         check_box.label(text="Export checks", icon="ERROR")
         check_box.prop(ts, "export_warn_loose_vertices", text="Loose vertices outside Memory")
         check_box.operator("cray.select_loose_vertices_outside_memory", icon="VERTEXSEL")
+        check_box.operator("cray.report_ngon_meshes", text="Report Meshes With N-gons", icon="FACESEL")
 
         box = layout.box()
         box.label(text="Shading/Geometry fixes", icon="MOD_SMOOTH")
@@ -27621,6 +32328,9 @@ class CRAY_PT_FixesPanel(Panel):
         row = edit_col.row(align=True)
         row.operator("cray.select_split_planar_ngons", text="Find Trash", icon="TRASH")
         row.operator("cray.select_coplanar_plate_islands", text="Find Flat Plates", icon="MESH_GRID")
+        row = edit_col.row(align=True)
+        row.operator("cray.select_ngon_faces", text="Find N-gons", icon="FACESEL")
+        row.operator("cray.triangulate_ngon_faces", text="Triangulate Found", icon="MOD_TRIANGULATE")
         tol_row = edit_col.row(align=True)
         tol_row.prop(ts, "split_planar_ngon_angle_tolerance", text="Angle")
         tol_row.prop(ts, "split_planar_ngon_plane_tolerance", text="Plane")
@@ -27631,6 +32341,7 @@ class CRAY_PT_ImportExportPlannerPanel(Panel):
     bl_category = "NH Plugin"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
+    bl_order = _UI_PANEL_DEFAULT_ORDER["import_export"]
     bl_options = {"DEFAULT_CLOSED"}
 
     @classmethod
@@ -27688,6 +32399,7 @@ class CRAY_PT_ModelSplitPanel(Panel):
     bl_category = "NH Plugin"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
+    bl_order = _UI_PANEL_DEFAULT_ORDER["model_split"]
     bl_options = {"DEFAULT_CLOSED"}
 
     @classmethod
@@ -27711,39 +32423,28 @@ class CRAY_PT_ModelSplitPanel(Panel):
         layout.separator()
 
         grid_box = layout.box()
-        grid_box.label(text="Grid Cutter Split", icon="MOD_BOOLEAN")
-        grid_box.prop(st, "grid_source_object")
-        grid_box.prop(st, "grid_source_root_collection")
-        grid_box.prop(st, "grid_cutter_collection")
+        grid_box.label(text="Line Grid Split", icon="MOD_BOOLEAN")
+        grid_box.prop(st, "grid_source_object", text="Source Object")
+        grid_box.prop(st, "grid_source_root_collection", text="Source Collection")
         row = grid_box.row(align=True)
-        row.prop(st, "grid_cell_size_x")
-        row.prop(st, "grid_cell_size_y")
-        row.prop(st, "grid_cell_size_z")
-        row = grid_box.row(align=True)
-        row.prop(st, "grid_count_x")
-        row.prop(st, "grid_count_y")
-        row.prop(st, "grid_count_z")
-        grid_box.prop(st, "grid_origin_mode")
-        if st.grid_origin_mode == "MANUAL":
-            row = grid_box.row(align=True)
-            row.prop(st, "grid_manual_origin_x")
-            row.prop(st, "grid_manual_origin_y")
-            row.prop(st, "grid_manual_origin_z")
-        grid_box.prop(st, "grid_output_prefix")
-        grid_box.prop(st, "grid_use_visible_cutters_only")
+        row.prop(st, "grid_count_x", text="Parts X")
+        row.prop(st, "grid_count_y", text="Parts Y")
+        grid_box.prop(st, "grid_cutter_collection", text="Cut Lines")
+        grid_box.prop(st, "grid_output_prefix", text="Name Prefix")
         grid_box.prop(st, "grid_keep_original")
-        grid_box.prop(st, "grid_hide_cutters_after_split")
         grid_box.prop(st, "grid_skip_empty_pieces")
         row = grid_box.row(align=True)
-        row.prop(st, "grid_min_vertices")
-        row.prop(st, "grid_min_faces")
+        row.prop(st, "grid_min_vertices", text="Min Verts")
+        row.prop(st, "grid_min_faces", text="Min Faces")
+        grid_box.prop(st, "grid_use_visible_cutters_only")
+        grid_box.prop(st, "grid_hide_cutters_after_split")
         grid_box.prop(st, "grid_add_result_to_export_planner")
         row = grid_box.row(align=True)
-        row.operator("cray.model_split_grid_create_cutters", text="Create Cutter Grid", icon="MESH_CUBE")
-        row.operator("cray.model_split_grid_select_cutters", text="Select Cutter Grid", icon="RESTRICT_SELECT_OFF")
+        row.operator("cray.model_split_grid_create_cutters", text="Create/Edit Cut Lines", icon="MESH_GRID")
+        row.operator("cray.model_split_grid_select_cutters", text="Select Lines", icon="RESTRICT_SELECT_OFF")
         row = grid_box.row(align=True)
-        row.operator("cray.model_split_grid_clear_cutters", text="Clear Cutter Grid", icon="TRASH")
-        row.operator("cray.model_split_grid_split_source", text="Split Source By Cutter Grid", icon="MOD_BOOLEAN")
+        row.operator("cray.model_split_grid_clear_cutters", text="Clear Lines", icon="TRASH")
+        row.operator("cray.model_split_grid_split_source", text="Split To _p Parts", icon="MOD_BOOLEAN")
 
         layout.separator()
 
@@ -27774,7 +32475,7 @@ class CRAY_PT_CacheManagerPanel(Panel):
     bl_category = "NH Plugin"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
-    bl_order = 9999
+    bl_order = _UI_PANEL_DEFAULT_ORDER["cache_manager"]
     bl_options = {"DEFAULT_CLOSED"}
 
     @classmethod
@@ -27784,41 +32485,15 @@ class CRAY_PT_CacheManagerPanel(Panel):
     def draw(self, context):
         layout = self.layout
         ts = context.scene.cray_texreplace_settings
-        lib = context.scene.cray_asset_library_settings
-
-        tbox = layout.box()
-        tbox.label(text="Texture PNG Cache (.paa -> .png)", icon="TEXTURE")
-        row = tbox.row(align=True)
-        op = row.operator("cray.texture_cache_build_nh_library_used", text="Cache NH Used", icon="TEXTURE")
-        op.force_rebuild = False
-        row.operator("cray.texture_cache_rebuild_nh_library_used", text="Rebuild NH Used", icon="FILE_REFRESH")
-        tbox.prop(ts, "texture_cache_source_folder")
-        tbox.prop(ts, "texture_cache_workers")
-        row = tbox.row(align=True)
-        op = row.operator("cray.texture_cache_build", text="Update All Folder", icon="ADD")
-        op.missing_only = True
-        op = row.operator("cray.texture_cache_build", text="Rebuild All (slow)", icon="ERROR")
-        op.missing_only = False
-        row = tbox.row(align=True)
-        row.operator("cray.open_texture_preview_cache_folder", text="Open Texture PNG Cache", icon="FILE_FOLDER")
-        if ts.texture_cache_last_report_path:
-            row.operator("cray.open_texture_cache_last_report", text="Report", icon="TEXT")
-        try:
-            cache_root = _nh_texture_cache_root(create=False)
-            tbox.label(text=f"Cache: {cache_root}")
-        except Exception:
-            pass
-        if ts.texture_cache_last_summary:
-            tbox.label(text=f"Last: {ts.texture_cache_last_summary}")
 
         lbox = layout.box()
-        lbox.label(text="NH Library / Icon Cache", icon="ASSET_MANAGER")
-        lbox.prop(lib, "render_textured_previews", text="Use textured icons")
+        lbox.label(text="NH Asset Library Cache", icon="ASSET_MANAGER")
+        lbox.operator("cray.asset_library_full_rebuild_from_zero", text="Full Rebuild From Zero", icon="FILE_REFRESH")
+        lbox.operator("cray.asset_library_add_new_nh_objects", text="Add New P3Ds + Icons", icon="ADD")
+        lbox.prop(ts, "texture_cache_workers", text="Cache Workers")
         row = lbox.row(align=True)
-        row.operator("cray.asset_library_build_nh_objects", text="Build / Update Libraries", icon="ASSET_MANAGER")
-        row.operator("cray.asset_library_rebuild_icon_cache", text="Rebuild Icons", icon="IMAGE_DATA")
-        lbox.operator("cray.asset_library_clean_source_artifacts", text="Clean Source Cache Files", icon="TRASH")
-        lbox.operator("cray.open_nh_asset_cache_folder", text="Open NH Library Cache", icon="FILE_FOLDER")
+        row.operator("cray.asset_library_open_nh_browser", text="Open Asset Browser", icon="FILEBROWSER")
+        row.operator("cray.open_nh_asset_cache_folder", text="Open Cache", icon="FILE_FOLDER")
         try:
             asset_cache = _nh_objects_asset_cache_base(create=False)
             lbox.label(text=f"Cache: {asset_cache}")
@@ -27832,6 +32507,7 @@ class CRAY_PT_TextureReplacePanel(Panel):
     bl_category = "NH Plugin"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
+    bl_order = _UI_PANEL_DEFAULT_ORDER["texture_replace"]
     bl_options = {"DEFAULT_CLOSED"}
 
     @classmethod
@@ -27924,12 +32600,21 @@ class CRAY_PT_MenuSettingsPanel(Panel):
 
         box = layout.box()
         box.label(text="Panel Visibility", icon="PREFERENCES")
-        box.label(text="Drag panel handles to reorder", icon="INFO")
+        box.label(text="Use arrows to reorder; order is saved on exit", icon="INFO")
 
-        for key, label, _class_name in _UI_PANEL_LAYOUT_DEFINITIONS:
+        ordered_definitions = _sorted_ui_panel_layout_definitions(settings)
+        for _idx, (key, label, _class_name) in enumerate(ordered_definitions):
             row = box.row(align=True)
+            up = row.operator("cray.move_ui_panel_layout_item", text="", icon="TRIA_UP")
+            up.panel_key = key
+            up.direction = -1
+            down = row.operator("cray.move_ui_panel_layout_item", text="", icon="TRIA_DOWN")
+            down.panel_key = key
+            down.direction = 1
             row.prop(settings, f"show_{key}", text="")
             row.label(text=label)
+
+        box.operator("cray.reset_ui_panel_layout_order", text="Reset Order", icon="FILE_REFRESH")
 
         layout.separator()
         keybind_box = layout.box()
@@ -27943,11 +32628,20 @@ class CRAY_PT_MenuSettingsPanel(Panel):
         )
 
         if settings.show_custom_keybinds:
-            for shortcut, action, status_key in _CUSTOM_KEYBIND_DEFINITIONS:
+            row = keybind_box.row(align=True)
+            row.operator("cray.open_nh_keymap_preferences", text="Open Keymap", icon="PREFERENCES")
+            row.operator("cray.restore_nh_default_keymaps", text="Restore Defaults", icon="FILE_REFRESH")
+
+            for operator_idname, action, default_shortcut, status_key in _CUSTOM_KEYBIND_DEFINITIONS:
+                kmi = _find_nh_keymap_item(operator_idname)
+                shortcut = _keymap_item_shortcut_label(kmi, default_shortcut)
                 action_text = action
                 enabled = True
-                if status_key == "plain_axis" and not _PLAIN_AXIS_HOTKEY_REGISTERED:
-                    action_text = f"{action} (shortcut busy)"
+                if kmi is not None and not bool(getattr(kmi, "active", True)):
+                    action_text = f"{action} (disabled)"
+                    enabled = False
+                elif status_key == "plain_axis" and not _PLAIN_AXIS_HOTKEY_REGISTERED and kmi is None:
+                    action_text = f"{action} (default busy)"
                     enabled = False
 
                 row = keybind_box.row(align=True)
@@ -27967,6 +32661,8 @@ classes = (
     CRAY_PG_ColliderSettings,
     CRAY_PG_ColliderExpSettings,
     CRAY_PG_UIPanelSettings,
+    CRAY_OT_MoveUIPanelLayoutItem,
+    CRAY_OT_ResetUIPanelLayoutOrder,
     CRAY_OT_LoadConfig,
     CRAY_OT_ScatterProxies,
     CRAY_OT_EnsureMemoryLOD,
@@ -27977,12 +32673,17 @@ classes = (
     CRAY_OT_CopySelectedVertsToGeometry,
     CRAY_OT_HullLooseGeometryVerts,
     CRAY_OT_ColliderHotkeysInfo,
+    CRAY_OT_OpenNHKeymapPreferences,
+    CRAY_OT_RestoreNHDefaultKeymaps,
     CRAY_OT_SetColliderTargetFromActive,
+    CRAY_OT_SetFakeTerrainTargetFromActive,
     CRAY_OT_EnsureRoadwayLOD,
     CRAY_OT_CopySelectedFacesToRoadway,
     CRAY_OT_WeldRoadwayVertices,
     CRAY_OT_OpenRoadwayMaterialFolder,
     CRAY_OT_OpenFireGeometryRvmatFolder,
+    CRAY_OT_SelectColliderMaterialFaces,
+    CRAY_OT_GenerateFakeTerrainGeometry,
     CRAY_OT_OpenFixListFile,
     CRAY_OT_SelectFixListComponentsOnActiveLOD,
     CRAY_OT_DeleteSelectedComponentsKeepVertices,
@@ -27990,14 +32691,20 @@ classes = (
     CRAY_OT_FixProxyTriangleMeshes,
     CRAY_OT_SelectIsolatedVertices,
     CRAY_OT_SelectLooseVerticesOutsideMemory,
+    CRAY_OT_ReportNgonMeshes,
     CRAY_OT_SelectSplitPlanarNgons,
     CRAY_OT_SelectCoplanarPlateIslands,
+    CRAY_OT_SelectNgonFaces,
+    CRAY_OT_TriangulateNgonFaces,
     CRAY_OT_EnsureColliderLOD,
     CRAY_OT_BuildCollider,
     CRAY_OT_EnsureColliderLODExp,
     CRAY_OT_GenerateBoxColliderExp,
     CRAY_OT_GenerateConvexHullColliderExp,
     CRAY_OT_RebuildConvexHullColliderExp,
+    CRAY_OT_ReconvexSelectedComponentsExp,
+    CRAY_OT_DeleteLastColliderExp,
+    CRAY_OT_SelectConnectedShellFromSelectionExp,
     CRAY_OT_CreateCylinderGuideColliderExp,
     CRAY_OT_CreatePipeGuideColliderExp,
     CRAY_OT_GenerateCylinderBoxesColliderExp,
@@ -28032,6 +32739,7 @@ classes = (
     CRAY_OT_OpenTextureCacheLastReport,
     CRAY_OT_OpenNHAssetCacheFolder,
     CRAY_OT_AssetLibraryRebuildIconCache,
+    CRAY_OT_AssetLibraryFullRebuildFromZero,
     CRAY_OT_TextureCacheRebuildNHLibraryUsed,
 
     CRAY_PG_IEFileItem,
@@ -28047,6 +32755,7 @@ classes = (
     CRAY_OT_AssetLibraryClear,
     CRAY_OT_AssetLibraryCleanSourceArtifacts,
     CRAY_OT_AssetLibraryBuildNHObjects,
+    CRAY_OT_AssetLibraryAddNewNHObjects,
     CRAY_OT_AssetLibraryOpenNHBrowser,
     CRAY_OT_AssetLibraryAddCustomByName,
     CRAY_OT_AssetLibraryRemoveCustomByName,
@@ -28109,6 +32818,7 @@ def register():
     bpy.types.Scene.cray_ui_panel_settings = PointerProperty(type=CRAY_PG_UIPanelSettings)
     _PERSISTED_UI_STATE_CACHE = _read_persisted_ui_state()
     _apply_persisted_ui_state_to_all_scenes(only_if_default=True)
+    _apply_ui_panel_class_order(_ui_panel_settings_from_context(bpy.context))
     _PERSISTED_UI_STATE_CACHE = _collect_persisted_ui_state(getattr(bpy.context, "scene", None))
     if not bpy.app.timers.is_registered(_deferred_restore_persisted_ui_state):
         bpy.app.timers.register(_deferred_restore_persisted_ui_state, first_interval=0.2)
@@ -28139,18 +32849,25 @@ def unregister():
         bpy.app.timers.unregister(_ensure_a3ob_p3d_file_handler_patch_timer)
     _unpatch_a3ob_p3d_file_handler()
     _unpatch_a3ob_import_read_file()
-    del bpy.types.Scene.cray_ui_panel_settings
-    del bpy.types.Scene.cray_asset_proxy_settings
-    del bpy.types.Scene.cray_asset_library_settings
-    del bpy.types.Scene.cray_model_split_settings
-    del bpy.types.Scene.cray_ie_settings
-    del bpy.types.Scene.cray_texreplace_settings
-    del bpy.types.Scene.cray_collider_exp_settings
-    del bpy.types.Scene.cray_collider_settings
-    del bpy.types.Scene.cray_snap_settings
-    del bpy.types.Scene.cray_settings
+    for attr_name in (
+        "cray_ui_panel_settings",
+        "cray_asset_proxy_settings",
+        "cray_asset_library_settings",
+        "cray_model_split_settings",
+        "cray_ie_settings",
+        "cray_texreplace_settings",
+        "cray_collider_exp_settings",
+        "cray_collider_settings",
+        "cray_snap_settings",
+        "cray_settings",
+    ):
+        if hasattr(bpy.types.Scene, attr_name):
+            delattr(bpy.types.Scene, attr_name)
     for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+        try:
+            bpy.utils.unregister_class(cls)
+        except RuntimeError:
+            pass
 
 if __name__ == "__main__":
     register()
