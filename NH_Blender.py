@@ -1,7 +1,7 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Daryl and Enisam",
-    "version": (0, 5, 4, 5),
+    "version": (0, 5, 4, 7),
     "blender": (5, 1, 1),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "All-in-one Blender toolkit for porting and preparing DayZ/Arma assets: fixes, textures, colliders, proxies, snap points, and P3D workflow helpers.",    
@@ -43,6 +43,7 @@ _PROXY_MESH_NAME = "DayZ_ClutterProxyMesh"
 _SCATTER_PROXY_TAG_PROP = "cray_scatter_proxy"
 _ASSET_CATALOG_NAME = "Asset"
 _ASSET_CATALOG_FALLBACK_ID = "7d6f3b1d-4d5f-4b1e-9f77-5d1e8dd5c001"
+_TEXTURE_PREVIEW_CACHE_SCHEMA_VERSION = 2
 _ADDON_KEYMAP_ITEMS = []
 _PLAIN_AXIS_HELPER_PROP = "cray_plain_axis_helper"
 _PLAIN_AXIS_ROOT_PROP = "cray_plain_axis_root"
@@ -81,7 +82,6 @@ _PERSISTED_UI_SKIP_EMPTY_DEFAULT_PROPS = {
 _PERSISTED_UI_LEGACY_DEFAULTS_TO_IGNORE = {
     "cray_texreplace_settings": {
         "convert_png_to_paa": {False},
-        "output_diffuse_suffix": {"_co"},
         "dds_backend": {"AUTO", "BUNDLED_EXE", "BUNDLED_NODE", "BLENDER", "EXTERNAL"},
         "folder": {r"P:\NH_ObjectTextures", "P:\\NH_ObjectTextures\\"},
         "target_textures_folder": {r"P:\NH_ObjectTextures", "P:\\NH_ObjectTextures\\"},
@@ -209,7 +209,6 @@ _PERSISTED_UI_SETTINGS = {
         "export_only_missing",
         "export_overwrite_existing",
         "delete_png_after_paa",
-        "output_diffuse_suffix",
         "fix_mesh_join_batch",
         "fix_mesh_center_to_origin",
         "material_safe_merge_distance",
@@ -16013,10 +16012,6 @@ _TEX_EXPORT_TEXTURE_SUFFIX_RE = re.compile(
     r"([_-])(co|ca|nohq|smdi|bump|dt|as|mc|mask|rough|metal|ao|spec|det|detail|em|no|n)$",
     re.IGNORECASE,
 )
-_TEX_EXPORT_DIFFUSE_SUFFIX_ITEMS = (
-    ("_co", "_co", "Write diffuse as basename_co"),
-    ("NONE", "none", "Write diffuse as basename"),
-)
 _TEX_EXPORT_DDS_BACKEND_ITEMS = (
     ("BUILTIN_PYTHON", "Built-in Python", "Use dependency-free Python DDS converter"),
 )
@@ -16347,6 +16342,78 @@ def _split_texture_candidate_base(base: str):
     material_base = _TEXTURE_SUFFIX_RE.sub("", texture_base) or texture_base
     return texture_base, material_base
 
+def _base_color_suffix(base: str) -> str:
+    cleaned = _sanitize_tex_export_base(base)
+    match = re.search(r"(?:_|-)(ca|co)$", cleaned, re.IGNORECASE)
+    return f"_{match.group(1).lower()}" if match else ""
+
+def _base_color_stem(base: str) -> str:
+    cleaned = _sanitize_tex_export_base(base)
+    if not cleaned:
+        return ""
+    return re.sub(r"(?:_|-)(?:ca|co)$", "", cleaned, flags=re.IGNORECASE) or cleaned
+
+def _base_color_variant_bases(base: str, *, include_legacy: bool = True):
+    """Return Base Color names in selection order: alpha, opaque, legacy."""
+    cleaned = _sanitize_tex_export_base(base)
+    if not cleaned:
+        return []
+
+    suffix_match = _TEX_EXPORT_TEXTURE_SUFFIX_RE.search(cleaned)
+    if suffix_match and suffix_match.group(2).lower() not in {"ca", "co"}:
+        return [cleaned]
+
+    stem = _base_color_stem(cleaned)
+    variants = [stem + "_ca", stem + "_co"]
+    if include_legacy:
+        variants.append(stem)
+    return _unique_ci(variants)
+
+def _expected_base_color_base(base: str, has_alpha=None) -> str:
+    cleaned = _sanitize_tex_export_base(base)
+    if not cleaned:
+        return ""
+
+    suffix_match = _TEX_EXPORT_TEXTURE_SUFFIX_RE.search(cleaned)
+    if suffix_match and suffix_match.group(2).lower() not in {"ca", "co"}:
+        return cleaned
+
+    explicit_suffix = _base_color_suffix(cleaned)
+    if has_alpha is None and explicit_suffix:
+        return _base_color_stem(cleaned) + explicit_suffix
+
+    suffix = "_ca" if bool(has_alpha) else "_co"
+    return _base_color_stem(cleaned) + suffix
+
+def _base_color_suffix_priority(base: str) -> int:
+    suffix = _base_color_suffix(base)
+    if suffix == "_ca":
+        return 2
+    if suffix == "_co":
+        return 1
+    return 0
+
+def _base_color_path_variants(path_value: str):
+    """Return sibling Base Color paths with _ca before _co."""
+    raw = _normalize_drive_relative_path(path_value)
+    if not raw:
+        return []
+
+    folder, leaf = os.path.split(raw)
+    base, ext = os.path.splitext(leaf)
+    cleaned = _sanitize_tex_export_base(base)
+    if not cleaned or ext.lower() == ".rvmat":
+        return [raw]
+
+    suffix_match = _TEX_EXPORT_TEXTURE_SUFFIX_RE.search(cleaned)
+    if suffix_match and suffix_match.group(2).lower() not in {"ca", "co"}:
+        return [raw]
+
+    variants = []
+    for variant_base in _base_color_variant_bases(cleaned, include_legacy=True):
+        variants.append(os.path.join(folder, variant_base + ext) if folder else variant_base + ext)
+    return _unique_ci(variants)
+
 def _texture_category_folder_from_base(base: str) -> str:
     cleaned = os.path.basename(str(base or "")).strip()
     cleaned = os.path.splitext(cleaned)[0]
@@ -16394,7 +16461,7 @@ def _first_valid_texture_candidate(candidates) -> str:
 
 def _pick_best_db_match(candidates, db_map):
     best = None
-    for base in candidates:
+    for candidate_index, base in enumerate(candidates):
         if not _is_valid_texture_candidate(base):
             _log_rejected_texture_candidate(base)
             continue
@@ -16402,22 +16469,39 @@ def _pick_best_db_match(candidates, db_map):
         if not texture_base and not material_base:
             continue
 
-        paa_path = db_map.get(f"{texture_base.lower()}.paa") if texture_base else None
+        paa_path = None
+        matched_texture_base = ""
+        for variant_base in _base_color_variant_bases(texture_base, include_legacy=True):
+            variant_path = db_map.get(f"{variant_base.lower()}.paa")
+            if variant_path:
+                paa_path = variant_path
+                matched_texture_base = variant_base
+                break
+
         rvmat_path = db_map.get(f"{material_base.lower()}.rvmat") if material_base else None
         if not rvmat_path and texture_base and texture_base.lower() != material_base.lower():
             rvmat_path = db_map.get(f"{texture_base.lower()}.rvmat")
+
+        selected_texture_base = matched_texture_base or _expected_base_color_base(texture_base)
         score = int(bool(paa_path)) + int(bool(rvmat_path))
         if score == 0:
             continue
-        if best is None or score > best["score"]:
+
+        rank = (
+            score,
+            int(bool(paa_path)),
+            _base_color_suffix_priority(selected_texture_base),
+            -candidate_index,
+        )
+        if best is None or rank > best["rank"]:
             best = {
-                "base": base,
+                "base": selected_texture_base,
+                "material_base": material_base,
                 "paa": paa_path,
                 "rvmat": rvmat_path,
                 "score": score,
+                "rank": rank,
             }
-            if score == 2:
-                break
     return best
 
 def _build_expected_texture_pair(settings, candidates, match):
@@ -16456,6 +16540,7 @@ def _build_expected_texture_pair(settings, candidates, match):
     texture_base, material_base = _split_texture_candidate_base(used_base)
     if not texture_base and not material_base:
         return None, None, used_base, False, False
+    texture_base = _expected_base_color_base(texture_base)
     paa_path = _make_expected_texture_path_from_base(folder_abs, texture_base, ".paa") if texture_base else None
     rvmat_path = _make_expected_texture_path_from_base(folder_abs, material_base, ".rvmat") if material_base else None
     return paa_path, rvmat_path, used_base, bool(paa_path), bool(rvmat_path)
@@ -16552,11 +16637,62 @@ def _tex_export_source_roots_from_settings(settings) -> list[str]:
         return list(_TEX_EXPORT_DEFAULT_SOURCE_ROOTS)
     return _ensure_tex_source_roots_collection(settings)
 
-def _tex_export_diffuse_suffix(settings) -> str:
-    value = getattr(settings, "output_diffuse_suffix", "NONE")
-    if value == "NONE":
-        return ""
-    return value or ""
+def _find_tex_export_base_color_dds(dds_map, material_base: str, preferred_rel_dir=""):
+    source_names = _base_color_variant_bases(material_base, include_legacy=True)
+    return _find_tex_export_dds(dds_map, *source_names, preferred_rel_dir=preferred_rel_dir)
+
+def _dds_file_has_alpha_channel(dds_path: str):
+    """Read just the DDS header and return True/False, or None for an unknown format."""
+    try:
+        with open(dds_path, "rb") as stream:
+            header = stream.read(148)
+    except OSError:
+        return None
+
+    if len(header) < 128 or header[:4] != b"DDS ":
+        return None
+
+    pixel_flags = int.from_bytes(header[80:84], "little")
+    fourcc = header[84:88].decode("ascii", errors="ignore").replace("\x00", "").strip().upper()
+    alpha_mask = int.from_bytes(header[104:108], "little")
+
+    if fourcc == "DX10":
+        if len(header) < 148:
+            return None
+        dxgi_format = int.from_bytes(header[128:132], "little")
+        if dxgi_format in {74, 75, 77, 78}:  # BC2 / BC3
+            return True
+        if dxgi_format in {71, 72}:  # BC1
+            return bool(pixel_flags & 0x1)
+        return None
+
+    if fourcc in {"DXT2", "DXT3", "DXT4", "DXT5", "BC2", "BC3"}:
+        return True
+    if fourcc in {"DXT1", "BC1"}:
+        return bool(pixel_flags & 0x1)
+    if not fourcc:
+        return bool(alpha_mask or (pixel_flags & 0x1))
+    return None
+
+def _tex_export_base_color_suffix(source_item=None, target_dir: str = "", material_base: str = "") -> str:
+    if source_item:
+        declared = _base_color_suffix(source_item.get("basename") or source_item.get("path") or "")
+        if declared:
+            return declared
+        detected = _dds_file_has_alpha_channel(source_item.get("path") or "")
+        if detected is not None:
+            return "_ca" if detected else "_co"
+
+    stem = _base_color_stem(material_base)
+    if target_dir and stem:
+        for suffix in ("_ca", "_co"):
+            for ext in (".paa", ".png"):
+                if os.path.isfile(os.path.join(target_dir, stem + suffix + ext)):
+                    return suffix
+    return "_co"
+
+def _tex_export_base_color_tried_names(material_base: str):
+    return tuple(_base_color_variant_bases(material_base, include_legacy=True))
 
 def _sanitize_tex_export_base(base: str) -> str:
     raw = _norm_path(str(base or "")).strip().strip("'\"")
@@ -17791,6 +17927,39 @@ def _collect_tex_source_export_requests(context, settings, target_root: str):
         item["material_names"] = _unique_ci(item["material_names"])
         item["candidates"] = _unique_ci(item["candidates"])
     return obj, list(requests.values())
+
+def _auto_select_object_base_color_paths(obj, settings) -> int:
+    """Apply the best available _ca/_co Base Color paths after a DB refresh."""
+    if obj is None:
+        return 0
+
+    db_map, _ = _build_db_map(settings)
+    changed = 0
+    for slot in getattr(obj, "material_slots", []) or []:
+        mat = getattr(slot, "material", None)
+        if mat is None:
+            continue
+
+        candidates = _build_material_candidates(mat)
+        match = _pick_best_db_match(candidates, db_map) if candidates else None
+        if not match or not match.get("paa"):
+            continue
+
+        paa_path, rvmat_path, _, _, _ = _build_expected_texture_pair(settings, candidates, match)
+        current_paa, current_rvmat = _get_a3ob_material_paths(mat)
+        paa_to_set = paa_path or current_paa
+        rvmat_to_set = rvmat_path or current_rvmat
+        if (paa_to_set or "").lower() == (current_paa or "").lower() and (
+            (rvmat_to_set or "").lower() == (current_rvmat or "").lower()
+        ):
+            continue
+
+        try:
+            _set_a3ob_material_paths(mat, paa_to_set, rvmat_to_set)
+            changed += 1
+        except Exception as e:
+            print(f"Base Color auto-select failed for {mat.name}: {_fmt_exc(e)}")
+    return changed
 
 def _walk_folder_build_db(folder_abs: str):
     if not os.path.isdir(folder_abs):
@@ -19342,6 +19511,17 @@ def _enable_preview_material_alpha(material: bpy.types.Material):
     except Exception:
         pass
 
+def _disable_preview_material_alpha(material: bpy.types.Material):
+    try:
+        material.blend_method = "OPAQUE"
+    except Exception:
+        pass
+
+    try:
+        material.shadow_method = "OPAQUE"
+    except Exception:
+        pass
+
 def _apply_image_color_space(image, color_space: str):
     if image is None:
         return
@@ -19374,6 +19554,14 @@ def _has_image_alpha(image) -> bool:
         return int(getattr(image, "channels", 0) or 0) >= 4
     except Exception:
         return False
+
+def _base_color_declared_has_alpha(path_or_name: str):
+    suffix = _base_color_suffix(path_or_name)
+    if suffix == "_ca":
+        return True
+    if suffix == "_co":
+        return False
+    return None
 
 def _remove_image_if_unused(image):
     if image is None:
@@ -19553,10 +19741,10 @@ def _texture_path_rel_variants(raw: str):
     if not norm:
         return []
 
-    variants = [norm]
+    variants = _base_color_path_variants(norm)
     no_suffix = _strip_blender_numeric_suffix(norm)
     if no_suffix != norm:
-        variants.append(no_suffix)
+        variants.extend(_base_color_path_variants(no_suffix))
 
     for item in list(variants):
         ext = os.path.splitext(item)[1].lower()
@@ -19579,7 +19767,7 @@ def _add_texture_resolution_candidate(candidates, value):
     if _is_invalid_windows_filename_component(raw):
         print(f"Skipped invalid texture candidate: {raw}")
         return
-    candidates.append(raw)
+    candidates.extend(_base_color_path_variants(raw))
 
 def _resolve_a3ob_texture_path(texture_path: str) -> str:
     raw = _normalize_drive_relative_path(texture_path)
@@ -19712,14 +19900,18 @@ def _texture_cache_key_for_path(path_abs: str) -> str:
         normalized = os.path.normcase(os.path.abspath(bpy.path.abspath(path_abs))).replace("/", "\\")
     except Exception:
         normalized = os.path.normcase(os.path.abspath(path_abs or "")).replace("/", "\\")
-    return hashlib.sha1(normalized.encode("utf-8", errors="replace")).hexdigest()
+    versioned_key = f"v{_TEXTURE_PREVIEW_CACHE_SCHEMA_VERSION}\0{normalized}"
+    return hashlib.sha1(versioned_key.encode("utf-8", errors="replace")).hexdigest()
 
 def _paa_preview_cache_path(paa_abs_path: str) -> str:
     key = _texture_cache_key_for_path(paa_abs_path)
     basename = os.path.splitext(os.path.basename(paa_abs_path or "texture"))[0] or "texture"
     safe_basename = re.sub(r'[<>:"/\\|?*]+', "_", basename).strip(" .") or "texture"
     folder = os.path.join(_nh_texture_cache_root(create=True), key[:2], key[2:4])
-    return os.path.join(folder, f"{safe_basename}__{key[:12]}.png")
+    return os.path.join(
+        folder,
+        f"{safe_basename}__v{_TEXTURE_PREVIEW_CACHE_SCHEMA_VERSION}_{key[:12]}.png",
+    )
 
 def _texture_cache_is_valid(source_abs_path: str, cache_path: str) -> bool:
     if not source_abs_path or not cache_path or not os.path.isfile(source_abs_path) or not os.path.isfile(cache_path):
@@ -20119,6 +20311,22 @@ def _repair_existing_preview_image_paths():
             print(f"Preview image path repair failed for {getattr(image, 'name', '<image>')}: {_fmt_exc(e)}")
     return repaired
 
+def _selected_base_color_texture_path(original_path: str, resolved_path: str) -> str:
+    selected_suffix = _base_color_suffix(resolved_path)
+    if not selected_suffix or selected_suffix == _base_color_suffix(original_path):
+        return original_path
+
+    original = _normalize_drive_relative_path(original_path)
+    folder, leaf = os.path.split(original)
+    original_base, original_ext = os.path.splitext(leaf)
+    resolved_ext = os.path.splitext(resolved_path)[1]
+    stem = _base_color_stem(original_base)
+    if not stem:
+        return original_path
+
+    selected_leaf = stem + selected_suffix + (original_ext or resolved_ext or ".paa")
+    return _norm_path(os.path.join(folder, selected_leaf) if folder else selected_leaf)
+
 def _load_material_preview_image(
     texture_path: str,
     keep_converted_textures: bool,
@@ -20130,11 +20338,13 @@ def _load_material_preview_image(
     if not resolved_path:
         return None, False, "", "missing", ""
 
+    declared_has_alpha = _base_color_declared_has_alpha(resolved_path)
     ext = os.path.splitext(resolved_path)[1].lower()
     if ext != ".paa":
         try:
             image = _load_external_image(resolved_path, color_space)
-            return image, _has_image_alpha(image), resolved_path, "file", ""
+            has_alpha = _has_image_alpha(image) if declared_has_alpha is None else declared_has_alpha
+            return image, has_alpha, resolved_path, "file", ""
         except Exception:
             return None, False, resolved_path, "missing", ""
 
@@ -20163,7 +20373,8 @@ def _load_material_preview_image(
         if cache_valid:
             try:
                 image = _load_external_image(cache_path, color_space)
-                return image, _has_image_alpha(image), resolved_path, "cache_hit", cache_path
+                has_alpha = _has_image_alpha(image) if declared_has_alpha is None else declared_has_alpha
+                return image, has_alpha, resolved_path, "cache_hit", cache_path
             except Exception:
                 try:
                     os.remove(cache_path)
@@ -20190,12 +20401,18 @@ def _load_material_preview_image(
             has_alpha = getattr(tex, "type", None) == dxt5
     except Exception:
         pass
+    if declared_has_alpha is not None:
+        has_alpha = declared_has_alpha
 
     if keep_converted_textures:
         try:
             _save_image_as_png(image, cache_path)
             cache_image = _load_external_image(cache_path, color_space)
-            cache_has_alpha = _has_image_alpha(cache_image) or has_alpha
+            cache_has_alpha = (
+                (_has_image_alpha(cache_image) or has_alpha)
+                if declared_has_alpha is None
+                else declared_has_alpha
+            )
             _remove_image_if_unused(image)
             return cache_image, cache_has_alpha, resolved_path, "cache_created", cache_path
         except Exception as e:
@@ -20236,6 +20453,8 @@ def _setup_import_preview_nodes(material: bpy.types.Material, image, texture_lab
             _enable_preview_material_alpha(material)
         except Exception:
             pass
+    else:
+        _disable_preview_material_alpha(material)
 
     return True
 
@@ -20290,6 +20509,15 @@ def _postprocess_imported_material_previews(
         if image is None:
             result["missing"] += 1
             continue
+
+        selected_paa_path = _selected_base_color_texture_path(paa_path, resolved_path)
+        if selected_paa_path != paa_path:
+            try:
+                _, rvmat_path = _get_a3ob_material_paths(mat)
+                _set_a3ob_material_paths(mat, selected_paa_path, rvmat_path)
+                paa_path = selected_paa_path
+            except Exception as e:
+                print(f"Base Color auto-select failed for {mat.name}: {_fmt_exc(e)}")
 
         try:
             if _setup_import_preview_nodes(mat, image, resolved_path or paa_path, has_alpha):
@@ -20477,11 +20705,6 @@ class CRAY_PG_TexReplaceSettings(PropertyGroup):
     delete_png_after_paa: BoolProperty(
         name="Delete PNG after PAA",
         default=False,
-    )
-    output_diffuse_suffix: EnumProperty(
-        name="Diffuse Suffix",
-        items=_TEX_EXPORT_DIFFUSE_SUFFIX_ITEMS,
-        default="NONE",
     )
     texture_export_is_running: BoolProperty(
         default=False,
@@ -21131,7 +21354,6 @@ class CRAY_OT_ExportMissingTexturesFromSources(Operator):
         self.source_root = ""
         self.source_roots = []
         self.target_root = ""
-        self.diffuse_suffix = ""
         self.dds_map = {}
         self.dds_scanned = 0
         self.obj = None
@@ -21183,7 +21405,6 @@ class CRAY_OT_ExportMissingTexturesFromSources(Operator):
         self.source_roots = _tex_export_source_roots_from_settings(ts)
         self.source_root = "; ".join(self.source_roots)
         self.target_root = _tex_export_resolve_path(ts.target_textures_folder, fallback=ts.folder)
-        self.diffuse_suffix = _tex_export_diffuse_suffix(ts)
 
         _tex_export_log_event(
             self.events,
@@ -21203,7 +21424,7 @@ class CRAY_OT_ExportMissingTexturesFromSources(Operator):
             export_only_missing=bool(ts.export_only_missing),
             export_overwrite_existing=bool(ts.export_overwrite_existing),
             delete_png_after_paa=bool(ts.delete_png_after_paa),
-            output_diffuse_suffix=self.diffuse_suffix,
+            output_diffuse_suffix="AUTO (_ca / _co)",
         )
 
         if not self.source_roots or not any(os.path.isdir(root) for root in self.source_roots):
@@ -21460,12 +21681,15 @@ class CRAY_OT_ExportMissingTexturesFromSources(Operator):
 
     def _process_request(self, context, ts, req, idx):
         material_base = req["material_base"]
-        diffuse_base = _sanitize_tex_export_base(material_base + self.diffuse_suffix)
         nohq_base = _sanitize_tex_export_base(material_base + "_nohq")
         smdi_base = _sanitize_tex_export_base(material_base + "_smdi")
         rvmat_base = _strip_tex_export_suffixes(material_base)
         preferred_rel_dir = req.get("expected_rel_dir") or ""
-        diffuse_src = _find_tex_export_dds(self.dds_map, material_base, preferred_rel_dir=preferred_rel_dir)
+        diffuse_src = _find_tex_export_base_color_dds(
+            self.dds_map,
+            material_base,
+            preferred_rel_dir=preferred_rel_dir,
+        )
         bump_src = _find_tex_export_dds(self.dds_map, material_base + "_bump", preferred_rel_dir=preferred_rel_dir)
         if diffuse_src:
             print(f"DDS source found: {diffuse_src.get('path')}")
@@ -21473,6 +21697,9 @@ class CRAY_OT_ExportMissingTexturesFromSources(Operator):
             print(f"DDS source found: {bump_src.get('path')}")
         rel_dir = req.get("expected_rel_dir") or (diffuse_src or {}).get("rel_dir") or (bump_src or {}).get("rel_dir") or ""
         target_dir = os.path.normpath(os.path.join(self.target_root, rel_dir)) if rel_dir else self.target_root
+        diffuse_suffix = _tex_export_base_color_suffix(diffuse_src, target_dir, material_base)
+        diffuse_base = _sanitize_tex_export_base(_base_color_stem(material_base) + diffuse_suffix)
+        print(f"Base Color selected: {diffuse_base} ({'alpha' if diffuse_suffix == '_ca' else 'opaque'})")
         diffuse_png = _norm_path(os.path.join(target_dir, diffuse_base + ".png"))
         diffuse_paa = _norm_path(os.path.join(target_dir, diffuse_base + ".paa"))
         nohq_png = _norm_path(os.path.join(target_dir, nohq_base + ".png"))
@@ -21485,7 +21712,18 @@ class CRAY_OT_ExportMissingTexturesFromSources(Operator):
         self._note_missing_output(self._expected_out_path(ts, smdi_png, smdi_paa))
         if ts.generate_rvmat:
             self._note_missing_output(rvmat_path)
-        diffuse_path = self._convert_channel(context, ts, f"{material_base}: diffuse", "diffuse", diffuse_src, diffuse_png, diffuse_paa, rel_dir, (material_base,), material_base)
+        diffuse_path = self._convert_channel(
+            context,
+            ts,
+            f"{material_base}: diffuse",
+            "diffuse",
+            diffuse_src,
+            diffuse_png,
+            diffuse_paa,
+            rel_dir,
+            _tex_export_base_color_tried_names(material_base),
+            material_base,
+        )
         nohq_path = self._convert_channel(context, ts, f"{material_base}: NOHQ", "nohq", bump_src, nohq_png, nohq_paa, rel_dir, (material_base + "_bump",), material_base)
         smdi_path = self._convert_channel(context, ts, f"{material_base}: SMDI", "smdi", bump_src, smdi_png, smdi_paa, rel_dir, (material_base + "_bump",), material_base)
         if ts.generate_rvmat:
@@ -21520,6 +21758,20 @@ class CRAY_OT_ExportMissingTexturesFromSources(Operator):
             if self.target_root:
                 ts.folder = self.target_root
                 self.rebuilt_count = len(_tex_export_refresh_db(ts, self.target_root))
+                auto_updated = _auto_select_object_base_color_paths(self.obj, ts)
+                if auto_updated:
+                    print(f"Base Color paths auto-selected after export: {auto_updated}")
+                    try:
+                        preview_stats = _postprocess_imported_material_previews(
+                            context,
+                            [self.obj],
+                            show_materials=True,
+                            keep_converted_textures=True,
+                            pack_runtime_images=False,
+                        )
+                        _log_import_preview_summary(self.obj.name, preview_stats)
+                    except Exception as preview_e:
+                        self.warnings.append(f"Material preview refresh failed: {_fmt_exc(preview_e)}")
         except Exception as e:
             self._add_failed("db", "DB rebuild", "", self.target_root, _fmt_exc(e))
             self.stats["failed"] += 1
@@ -21630,15 +21882,17 @@ class CRAY_OT_PrintTextureExportDiagnostics(Operator):
             dds_map = {}
             print("DDS scanned: 0 (source root is missing)")
 
-        diffuse_suffix = _tex_export_diffuse_suffix(ts)
         for idx, req in enumerate(requests[:20], start=1):
             material_base = req["material_base"]
-            diffuse_base = _sanitize_tex_export_base(material_base + diffuse_suffix)
             nohq_base = _sanitize_tex_export_base(material_base + "_nohq")
             smdi_base = _sanitize_tex_export_base(material_base + "_smdi")
             rvmat_base = _strip_tex_export_suffixes(material_base)
             preferred_rel_dir = req.get("expected_rel_dir") or ""
-            diffuse_src = _find_tex_export_dds(dds_map, material_base, preferred_rel_dir=preferred_rel_dir)
+            diffuse_src = _find_tex_export_base_color_dds(
+                dds_map,
+                material_base,
+                preferred_rel_dir=preferred_rel_dir,
+            )
             bump_src = _find_tex_export_dds(dds_map, material_base + "_bump", preferred_rel_dir=preferred_rel_dir)
             if diffuse_src:
                 print(f"DDS source found: {diffuse_src.get('path')}")
@@ -21651,6 +21905,8 @@ class CRAY_OT_PrintTextureExportDiagnostics(Operator):
                 or ""
             )
             target_dir = os.path.normpath(os.path.join(target_root, rel_dir)) if rel_dir else target_root
+            diffuse_suffix = _tex_export_base_color_suffix(diffuse_src, target_dir, material_base)
+            diffuse_base = _sanitize_tex_export_base(_base_color_stem(material_base) + diffuse_suffix)
             diffuse_png = _norm_path(os.path.join(target_dir, diffuse_base + ".png"))
             diffuse_paa = _norm_path(os.path.join(target_dir, diffuse_base + ".paa"))
             nohq_png = _norm_path(os.path.join(target_dir, nohq_base + ".png"))
@@ -21664,8 +21920,13 @@ class CRAY_OT_PrintTextureExportDiagnostics(Operator):
             print(f"  diffuse source: {(diffuse_src or {}).get('path') or '<not found>'}")
             if not diffuse_src:
                 print("  diffuse tried:")
-                for tried in _tex_export_source_tried_lines(source_roots, preferred_rel_dir, (material_base,)):
+                for tried in _tex_export_source_tried_lines(
+                    source_roots,
+                    preferred_rel_dir,
+                    _tex_export_base_color_tried_names(material_base),
+                ):
                     print(f"    {tried}")
+            print(f"  Base Color suffix: {diffuse_suffix} ({'alpha' if diffuse_suffix == '_ca' else 'opaque'})")
             print(f"  bump source: {(bump_src or {}).get('path') or '<not found>'}")
             if not bump_src:
                 print("  bump tried:")
@@ -21988,6 +22249,7 @@ def _cache_nh_library_used_textures(op, context, *, force_rebuild: bool = False)
     p3d_files = []
     for folder_abs in folders:
         p3d_files.extend(_iter_p3d_files_direct(folder_abs, settings))
+    p3d_files.extend(_read_custom_asset_p3d_paths())
     p3d_files = sorted({os.path.normcase(fp): fp for fp in p3d_files if fp and os.path.isfile(fp)}.values(), key=lambda item: item.lower())
     if not p3d_files:
         op.report({"ERROR"}, "No .p3d files found in NH_Objects Common/Environment")
@@ -22066,7 +22328,7 @@ def _cache_nh_library_used_textures(op, context, *, force_rebuild: bool = False)
     failed.extend(cache_stats.get("failed", []) or [])
 
     summary, report_path = _write_texture_cache_report(
-        "NH Objects Common/Environment libraries",
+        "NH Objects Common/Environment/Custom libraries",
         f"{mode_label}; workers {workers_used}",
         len(used_paa_paths),
         created,
@@ -22211,6 +22473,56 @@ class CRAY_OT_AssetLibraryFullRebuildFromZero(Operator):
             try:
                 settings.rebuild_existing_libraries = old_rebuild
                 settings.render_textured_previews = old_render
+            except Exception:
+                pass
+
+
+class CRAY_OT_AssetLibraryForceRebuildIconsTextures(Operator):
+    bl_idname = "cray.asset_library_force_rebuild_icons_textures"
+    bl_label = "Force Rebuild All Icons + Textures"
+    bl_description = (
+        "Force-rebuild the PNG cache for textures used by all NH assets, clear the "
+        "Common/Environment asset cache, and render every asset icon with textures"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = context.scene.cray_asset_library_settings
+        old_rebuild = bool(getattr(settings, "rebuild_existing_libraries", False))
+
+        # Keep textured mode enabled after this workflow so later Add New operations
+        # produce matching textured icons instead of reverting them to geometry icons.
+        settings.render_textured_previews = True
+        try:
+            texture_result = _cache_nh_library_used_textures(self, context, force_rebuild=True)
+            if texture_result != {"FINISHED"}:
+                return texture_result
+
+            removed, cleanup_failed = _clear_nh_objects_asset_library_cache_roots(settings)
+            if cleanup_failed:
+                print("=== NH Objects Textured Rebuild: Cache cleanup warnings ===")
+                for item in cleanup_failed:
+                    print(item)
+
+            settings.rebuild_existing_libraries = True
+            result = _build_nh_objects_persistent_asset_libraries(
+                self,
+                context,
+                cache_missing_textures=True,
+            )
+            if result == {"FINISHED"}:
+                message = (
+                    "Textured NH rebuild complete: texture cache refreshed, "
+                    f"cleared {len(removed)} asset cache folder(s)"
+                )
+                if cleanup_failed:
+                    self.report({"WARNING"}, message + f", cleanup warnings {len(cleanup_failed)}")
+                else:
+                    self.report({"INFO"}, message)
+            return result
+        finally:
+            try:
+                settings.rebuild_existing_libraries = old_rebuild
             except Exception:
                 pass
 
@@ -27482,13 +27794,17 @@ _NH_OBJECTS_ASSET_PREVIEWS_FOLDER_NAME = "_NH_previews"
 _NH_OBJECTS_INCREMENTAL_CACHE_FOLDER_NAME = "_NH_incremental"
 _NH_TEXTURE_CACHE_FOLDER_NAME = "NH_TexturePreviewCache"
 _NH_OBJECTS_ASSET_CATALOG_FILE_NAME = "blender_assets.cats.txt"
+_NH_PREVIEW_CAMERA_SELECTION_RE = re.compile(
+    r"^nh_cam(?:_(-?(?:\d+(?:\.\d*)?|\.\d+)))?$",
+    re.IGNORECASE,
+)
 _NH_OBJECTS_LEGACY_SOURCE_CACHE_FILENAMES = {
     _NH_OBJECTS_ASSET_BLEND_NAME,
     _NH_OBJECTS_ASSET_MANIFEST_NAME,
     _NH_OBJECTS_ASSET_CATALOG_FILE_NAME,
 }
 _NH_OBJECTS_ASSET_CATALOG_NAMESPACE = uuid.UUID("c91f1215-9261-4d7e-8df4-4bb81567b6a8")
-_NH_OBJECTS_ASSET_MANIFEST_VERSION = 7
+_NH_OBJECTS_ASSET_MANIFEST_VERSION = 8
 
 def _path_is_under_or_equal(path: str, root: str) -> bool:
     if not path or not root:
@@ -27898,6 +28214,101 @@ def _asset_preview_filename(name: str) -> str:
     return base[:120] + ".png"
 
 
+def _p3d_contains_preview_camera_selection(filepath: str) -> bool:
+    needle = b"nh_cam"
+    tail = b""
+    try:
+        with open(filepath, "rb") as stream:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    return False
+                haystack = (tail + chunk).lower()
+                if needle in haystack:
+                    return True
+                tail = haystack[-(len(needle) - 1):]
+    except Exception:
+        return False
+
+
+def _p3d_preview_camera_hint(filepath: str):
+    """Read nh_cam[_degrees] directly from the P3D Memory LOD."""
+    if not filepath:
+        return None
+    try:
+        filepath_abs = os.path.abspath(bpy.path.abspath(filepath))
+    except Exception:
+        filepath_abs = os.path.abspath(filepath)
+    if not os.path.isfile(filepath_abs):
+        return None
+    if not _p3d_contains_preview_camera_selection(filepath_abs):
+        return None
+
+    p3d_mod = _get_a3ob_data_p3d_module()
+    if p3d_mod is None:
+        return None
+
+    try:
+        mlod = p3d_mod.P3D_MLOD.read_file(filepath_abs, first_lod_only=False)
+    except Exception as e:
+        print(f"NH asset preview camera: could not read {filepath_abs}: {_fmt_exc(e)}")
+        return None
+
+    lod_resolution_cls = getattr(p3d_mod, "P3D_LOD_Resolution", None)
+    memory_lod_id = int(getattr(lod_resolution_cls, "MEMORY", 9)) if lod_resolution_cls is not None else 9
+    candidates = []
+
+    for lod in getattr(mlod, "lods", []) or []:
+        resolution = getattr(lod, "resolution", None)
+        try:
+            lod_id = int(getattr(resolution, "lod", -1))
+        except Exception:
+            lod_id = -1
+        if lod_id != memory_lod_id:
+            continue
+
+        lod_vertices = list(getattr(lod, "verts", []) or [])
+        for tagg_index, tagg in enumerate(getattr(lod, "taggs", []) or []):
+            if not bool(getattr(tagg, "active", True)):
+                continue
+            selection_name = str(getattr(tagg, "name", "") or "").strip()
+            match = _NH_PREVIEW_CAMERA_SELECTION_RE.fullmatch(selection_name)
+            if match is None:
+                continue
+
+            points = []
+            selection_data = getattr(tagg, "data", None)
+            for vert_index, weight in getattr(selection_data, "weight_verts", []) or []:
+                try:
+                    if float(weight) <= 0.0:
+                        continue
+                    co = lod_vertices[int(vert_index)]
+                    points.append(Vector((float(co[0]), float(co[1]), float(co[2]))))
+                except Exception:
+                    continue
+            if not points:
+                continue
+
+            point = sum(points, Vector((0.0, 0.0, 0.0))) / len(points)
+            try:
+                yaw_degrees = float(match.group(1) or 0.0)
+            except Exception:
+                yaw_degrees = 0.0
+            candidates.append({
+                "location": point,
+                "yaw_degrees": yaw_degrees,
+                "selection": selection_name,
+                # An explicit angle is more specific than a plain nh_cam if both exist.
+                "priority": (int(match.group(1) is not None), -tagg_index),
+            })
+
+    if not candidates:
+        return None
+    best = max(candidates, key=lambda item: item["priority"])
+    best.pop("priority", None)
+    return best
+
+
 def _image_filepath_if_loadable(image):
     raw_path = getattr(image, "filepath_raw", "") or getattr(image, "filepath", "")
     if not raw_path:
@@ -27961,6 +28372,69 @@ def _collection_bounds_world(collection):
         max(v.z for v in coords),
     ))
     return min_v, max_v
+
+
+def _preview_view_direction(center, camera_hint=None):
+    default_view_dir = Vector((1.7, -2.2, 1.35)).normalized()
+    if not isinstance(camera_hint, dict):
+        return default_view_dir
+
+    try:
+        camera_point = Vector(camera_hint.get("location"))
+        offset = camera_point - Vector(center)
+    except Exception:
+        return default_view_dir
+    if offset.length_squared <= 1e-12:
+        return default_view_dir
+
+    try:
+        yaw_degrees = float(camera_hint.get("yaw_degrees", 0.0) or 0.0)
+    except Exception:
+        yaw_degrees = 0.0
+    if abs(yaw_degrees) > 1e-9:
+        try:
+            offset = Matrix.Rotation(math.radians(yaw_degrees), 4, "Z") @ offset
+        except Exception:
+            pass
+    if offset.length_squared <= 1e-12:
+        return default_view_dir
+    return offset.normalized()
+
+
+def _preview_projection_axes(view_dir=None):
+    try:
+        view_dir = Vector(view_dir).normalized()
+    except Exception:
+        view_dir = Vector((1.7, -2.2, 1.35)).normalized()
+    if view_dir.length_squared <= 1e-12:
+        view_dir = Vector((1.7, -2.2, 1.35)).normalized()
+
+    right = Vector((0.0, 0.0, 1.0)).cross(view_dir)
+    if right.length_squared <= 1e-12:
+        right = Vector((1.0, 0.0, 0.0))
+    right.normalize()
+    up = view_dir.cross(right)
+    if up.length_squared <= 1e-12:
+        up = Vector((0.0, 1.0, 0.0))
+    up.normalize()
+    return right, up, view_dir
+
+
+def _preview_projected_span(min_v, max_v, view_dir) -> float:
+    right, up, _view_dir = _preview_projection_axes(view_dir)
+    corners = [
+        Vector((x, y, z))
+        for x in (float(min_v.x), float(max_v.x))
+        for y in (float(min_v.y), float(max_v.y))
+        for z in (float(min_v.z), float(max_v.z))
+    ]
+    right_values = [point.dot(right) for point in corners]
+    up_values = [point.dot(up) for point in corners]
+    return max(
+        max(right_values) - min(right_values),
+        max(up_values) - min(up_values),
+        0.25,
+    )
 
 
 def _set_camera_look_at(camera_obj, target):
@@ -28050,7 +28524,7 @@ def _render_scene_preview_safe(scene, filepath: str) -> bool:
                 pass
 
 
-def _asset_rendered_preview_path_for_collection(collection, preview_dir: str, size: int = 256):
+def _asset_rendered_preview_path_for_collection(collection, preview_dir: str, size: int = 256, camera_hint=None):
     if collection is None or not preview_dir:
         return ""
     if _first_image_from_collection_materials(collection) is None:
@@ -28086,14 +28560,24 @@ def _asset_rendered_preview_path_for_collection(collection, preview_dir: str, si
         center = (min_v + max_v) * 0.5
         dims = max_v - min_v
         max_dim = max(float(dims.x), float(dims.y), float(dims.z), 0.25)
-        view_dir = Vector((1.7, -2.2, 1.35)).normalized()
+        view_dir = _preview_view_direction(center, camera_hint)
+        projected_span = _preview_projected_span(min_v, max_v, view_dir)
 
         try:
             camera_data.type = "ORTHO"
-            camera_data.ortho_scale = max_dim * 1.35
+            camera_data.ortho_scale = projected_span * 1.08
+            camera_data.clip_start = 0.01
+            camera_data.clip_end = max(max_dim * 20.0, 100.0)
         except Exception:
             pass
-        camera_obj.location = center + view_dir * max(max_dim * 2.2, 2.0)
+        camera_distance = max(max_dim * 2.2, 2.0)
+        if isinstance(camera_hint, dict):
+            try:
+                hinted_distance = (Vector(camera_hint.get("location")) - center).length
+                camera_distance = max(camera_distance, float(hinted_distance))
+            except Exception:
+                pass
+        camera_obj.location = center + view_dir * camera_distance
         _set_camera_look_at(camera_obj, center)
 
         try:
@@ -28141,9 +28625,33 @@ def _asset_rendered_preview_path_for_collection(collection, preview_dir: str, si
             pass
 
 
-def _asset_preview_path_for_collection(collection, preview_dir: str, render_textured_previews: bool = False):
-    del render_textured_previews
-    geometry_preview = _asset_geometry_preview_path_for_collection(collection, preview_dir)
+def _asset_preview_path_for_collection(
+    collection,
+    preview_dir: str,
+    render_textured_previews: bool = False,
+    source_filepath: str = "",
+):
+    camera_hint = _p3d_preview_camera_hint(source_filepath)
+    if camera_hint:
+        print(
+            "NH asset preview camera: "
+            f"{os.path.basename(source_filepath)} uses {camera_hint.get('selection', 'nh_cam')}"
+        )
+
+    if render_textured_previews:
+        rendered_preview = _asset_rendered_preview_path_for_collection(
+            collection,
+            preview_dir,
+            camera_hint=camera_hint,
+        )
+        if rendered_preview:
+            return rendered_preview
+
+    geometry_preview = _asset_geometry_preview_path_for_collection(
+        collection,
+        preview_dir,
+        camera_hint=camera_hint,
+    )
     if geometry_preview:
         return geometry_preview
     return ""
@@ -28212,19 +28720,6 @@ def _collect_collection_preview_geometry(collection, max_faces=900, max_edges=26
     return vertices, triangles, edges
 
 
-def _preview_projection_axes():
-    view_dir = Vector((1.7, -2.2, 1.35)).normalized()
-    right = Vector((0.0, 0.0, 1.0)).cross(view_dir)
-    if right.length_squared <= 1e-12:
-        right = Vector((1.0, 0.0, 0.0))
-    right.normalize()
-    up = view_dir.cross(right)
-    if up.length_squared <= 1e-12:
-        up = Vector((0.0, 1.0, 0.0))
-    up.normalize()
-    return right, up, view_dir
-
-
 def _set_preview_pixel(pixels, size, x, y, color, alpha=1.0):
     x = int(x)
     y = int(y)
@@ -28275,15 +28770,26 @@ def _fill_preview_triangle(pixels, size, p0, p1, p2, color):
                 _set_preview_pixel(pixels, size, x, y, color, 0.94)
 
 
-def _asset_geometry_preview_path_for_collection(collection, preview_dir: str, size: int = 160):
+def _asset_geometry_preview_path_for_collection(collection, preview_dir: str, size: int = 160, camera_hint=None):
     if collection is None or not preview_dir:
         return ""
     vertices, triangles, edges = _collect_collection_preview_geometry(collection)
     if not vertices:
         return ""
 
-    right, up, view_dir = _preview_projection_axes()
-    center = sum(vertices, Vector((0.0, 0.0, 0.0))) / len(vertices)
+    min_v = Vector((
+        min(point.x for point in vertices),
+        min(point.y for point in vertices),
+        min(point.z for point in vertices),
+    ))
+    max_v = Vector((
+        max(point.x for point in vertices),
+        max(point.y for point in vertices),
+        max(point.z for point in vertices),
+    ))
+    center = (min_v + max_v) * 0.5
+    view_dir = _preview_view_direction(center, camera_hint)
+    right, up, view_dir = _preview_projection_axes(view_dir)
 
     projected_vertices = [((v - center).dot(right), (v - center).dot(up)) for v in vertices]
     min_x = min(p[0] for p in projected_vertices)
@@ -28291,7 +28797,7 @@ def _asset_geometry_preview_path_for_collection(collection, preview_dir: str, si
     min_y = min(p[1] for p in projected_vertices)
     max_y = max(p[1] for p in projected_vertices)
     span = max(max_x - min_x, max_y - min_y, 1e-6)
-    scale = (size * 0.76) / span
+    scale = (size * 0.90) / span
     offset_x = size * 0.5 - (min_x + max_x) * 0.5 * scale
     offset_y = size * 0.5 + (min_y + max_y) * 0.5 * scale
 
@@ -28389,7 +28895,12 @@ def _create_asset_instancer_for_collection(asset_root, collection, filepath: str
         asset_root.objects.link(instancer)
     except Exception:
         pass
-    preview_path = _asset_preview_path_for_collection(collection, preview_dir or "", render_textured_previews=render_textured_previews)
+    preview_path = _asset_preview_path_for_collection(
+        collection,
+        preview_dir or "",
+        render_textured_previews=render_textured_previews,
+        source_filepath=filepath,
+    )
     if preview_path and preview_paths_out is not None:
         try:
             preview_paths_out.append(preview_path)
@@ -28736,7 +29247,7 @@ def _p3d_folder_manifest(source_folder_abs: str, p3d_files, settings=None, previ
     preview_mode = (
         str(preview_mode_override)
         if preview_mode_override
-        else "geometry"
+        else ("textured" if bool(getattr(settings, "render_textured_previews", False)) else "geometry")
     )
     return {
         "version": _NH_OBJECTS_ASSET_MANIFEST_VERSION,
@@ -28854,7 +29365,7 @@ def _custom_asset_manifest(p3d_files, settings=None):
             entries.append(_custom_p3d_file_manifest_entry(fp))
         except Exception:
             continue
-    preview_mode = "geometry"
+    preview_mode = "textured" if bool(getattr(settings, "render_textured_previews", False)) else "geometry"
     return {
         "version": _NH_OBJECTS_ASSET_MANIFEST_VERSION,
         "asset_blend": _NH_OBJECTS_ASSET_BLEND_NAME,
@@ -29046,7 +29557,7 @@ def _p3d_paths_from_asset_manifest(manifest_path: str):
 def _incremental_assets_needing_textured_previews(settings=None):
     out = []
     seen = set()
-    wanted_mode = "geometry"
+    wanted_mode = "textured" if bool(getattr(settings, "render_textured_previews", False)) else "geometry"
     for label, source_root in _iter_nh_objects_source_roots(settings):
         cache_root = _nh_objects_asset_cache_root(label, create=False)
         incremental_root = os.path.join(cache_root, _NH_OBJECTS_INCREMENTAL_CACHE_FOLDER_NAME)
@@ -29227,7 +29738,7 @@ def _build_persistent_asset_library_for_folder(
         if callable(manifest_writer):
             manifest_path = manifest_writer(cache_folder_abs, p3d_files, blend_path, asset_entries, settings=settings)
         else:
-            preview_mode = "geometry"
+            preview_mode = "textured" if render_textured_previews else "geometry"
             manifest_path = _write_persistent_asset_library_manifest(
                 cache_folder_abs,
                 folder_abs,
@@ -29366,8 +29877,8 @@ def _build_custom_persistent_asset_library(op, context, p3d_files, *, open_brows
             cache_folder_abs=_nh_objects_custom_asset_cache_root(create=True),
             catalog_path=_NH_OBJECTS_CUSTOM_LABEL,
             library_label=_NH_OBJECTS_CUSTOM_LIBRARY_NAME,
-            cache_missing_textures=False,
-            render_textured_previews=False,
+            cache_missing_textures=bool(getattr(settings, "render_textured_previews", False)),
+            render_textured_previews=bool(getattr(settings, "render_textured_previews", False)),
             manifest_writer=_write_custom_asset_manifest,
         )
     except Exception as e:
@@ -29538,8 +30049,8 @@ def _build_nh_objects_persistent_asset_libraries(op, context, cache_missing_text
                     cache_folder_abs=_nh_objects_custom_asset_cache_root(create=True),
                     catalog_path=_NH_OBJECTS_CUSTOM_LABEL,
                     library_label=_NH_OBJECTS_CUSTOM_LIBRARY_NAME,
-                    cache_missing_textures=False,
-                    render_textured_previews=False,
+                    cache_missing_textures=cache_missing_textures,
+                    render_textured_previews=bool(getattr(settings, "render_textured_previews", False)),
                     manifest_writer=_write_custom_asset_manifest,
                 )
             except Exception as e:
@@ -29654,6 +30165,7 @@ def _add_new_nh_objects_assets_to_cache(op, context):
     )
 
     icon_updates = 0
+    render_textured_previews = bool(getattr(settings, "render_textured_previews", False))
     for folder_abs, fp, cache_folder_abs, item_kind in build_items:
         try:
             os.makedirs(cache_folder_abs, exist_ok=True)
@@ -29663,8 +30175,8 @@ def _add_new_nh_objects_assets_to_cache(op, context):
                 [fp],
                 settings,
                 cache_folder_abs=cache_folder_abs,
-                cache_missing_textures=False,
-                render_textured_previews=False,
+                cache_missing_textures=render_textured_previews,
+                render_textured_previews=render_textured_previews,
             )
         except Exception as e:
             failed.append(f"{fp}: {_fmt_exc(e)}")
@@ -32490,6 +33002,11 @@ class CRAY_PT_CacheManagerPanel(Panel):
         lbox.label(text="NH Asset Library Cache", icon="ASSET_MANAGER")
         lbox.operator("cray.asset_library_full_rebuild_from_zero", text="Full Rebuild From Zero", icon="FILE_REFRESH")
         lbox.operator("cray.asset_library_add_new_nh_objects", text="Add New P3Ds + Icons", icon="ADD")
+        lbox.operator(
+            "cray.asset_library_force_rebuild_icons_textures",
+            text="Force Rebuild All Icons + Textures",
+            icon="RENDER_STILL",
+        )
         lbox.prop(ts, "texture_cache_workers", text="Cache Workers")
         row = lbox.row(align=True)
         row.operator("cray.asset_library_open_nh_browser", text="Open Asset Browser", icon="FILEBROWSER")
@@ -32550,7 +33067,7 @@ class CRAY_PT_TextureReplacePanel(Panel):
         add_row.prop(ts, "source_root_to_add", text="")
         add_row.operator("cray.tex_source_root_add", text="", icon="ADD")
         ebox.prop(ts, "target_textures_folder")
-        ebox.prop(ts, "output_diffuse_suffix")
+        ebox.label(text="Base Color suffix: automatic _ca / _co", icon="IMAGE_DATA")
         row = ebox.row(align=True)
         row.prop(ts, "convert_dds_to_png")
         row.prop(ts, "convert_png_to_paa")
@@ -32740,6 +33257,7 @@ classes = (
     CRAY_OT_OpenNHAssetCacheFolder,
     CRAY_OT_AssetLibraryRebuildIconCache,
     CRAY_OT_AssetLibraryFullRebuildFromZero,
+    CRAY_OT_AssetLibraryForceRebuildIconsTextures,
     CRAY_OT_TextureCacheRebuildNHLibraryUsed,
 
     CRAY_PG_IEFileItem,

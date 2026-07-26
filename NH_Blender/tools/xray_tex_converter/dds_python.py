@@ -276,6 +276,7 @@ def _parse_dds(data: bytes) -> dict:
         "height": _read_u32(data, 12),
         "width": _read_u32(data, 16),
         "pitch_or_linear_size": _read_u32(data, 20),
+        "pixel_format_flags": _read_u32(data, 80),
         "fourcc": _fourcc(data, 84),
         "rgb_bit_count": _read_u32(data, 88),
         "r_mask": _read_u32(data, 92),
@@ -301,6 +302,24 @@ def _parse_dds(data: bytes) -> dict:
         else:
             raise _unsupported(f"DX10/{dxgi_format}")
     return header
+
+
+def _header_has_alpha_channel(header: dict) -> bool:
+    fmt = str(header.get("fourcc") or "").upper()
+    if fmt in ("DXT2", "DXT3", "DXT4", "DXT5", "BC2", "BC3"):
+        return True
+    if fmt in ("DXT1", "BC1"):
+        return bool(int(header.get("pixel_format_flags", 0)) & 0x1)
+    if not fmt:
+        return bool(int(header.get("a_mask", 0)) or (int(header.get("pixel_format_flags", 0)) & 0x1))
+    return False
+
+
+def dds_has_alpha_channel(input_path: str) -> bool:
+    """Return whether the DDS pixel format carries an alpha channel."""
+    with open(input_path, "rb") as f:
+        data = f.read(148)
+    return _header_has_alpha_channel(_parse_dds(data))
 
 
 def _decode_dds(data: bytes) -> tuple[int, int, bytearray, str]:
@@ -352,22 +371,32 @@ def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
     return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", crc)
 
 
-def _encode_png(width: int, height: int, rgba: bytearray) -> bytes:
+def _encode_png(width: int, height: int, rgba: bytearray, include_alpha: bool = True) -> bytes:
     if width <= 0 or height <= 0:
         raise _invalid(f"PNG image has invalid dimensions: {width}x{height}")
     expected = width * height * 4
     if len(rgba) != expected:
         raise _invalid(f"decoded pixel buffer has unexpected size: {len(rgba)} != {expected}")
 
-    stride = width * 4
+    channels = 4 if include_alpha else 3
+    stride = width * channels
     raw = bytearray((stride + 1) * height)
     for y in range(height):
         row_start = y * (stride + 1)
         raw[row_start] = 0
-        src_start = y * stride
-        raw[row_start + 1:row_start + 1 + stride] = rgba[src_start:src_start + stride]
+        if include_alpha:
+            src_start = y * stride
+            raw[row_start + 1:row_start + 1 + stride] = rgba[src_start:src_start + stride]
+        else:
+            dst = row_start + 1
+            src = y * width * 4
+            for _x in range(width):
+                raw[dst:dst + 3] = rgba[src:src + 3]
+                dst += 3
+                src += 4
 
-    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    color_type = 6 if include_alpha else 2
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, color_type, 0, 0, 0)
     return b"".join([
         b"\x89PNG\r\n\x1a\n",
         _png_chunk(b"IHDR", ihdr),
@@ -381,13 +410,16 @@ def convert_dds_to_png(input_path: str, output_path: str, mode: str = "diffuse")
     try:
         with open(input_path, "rb") as f:
             data = f.read()
+        source_has_alpha = _header_has_alpha_channel(_parse_dds(data))
         width, height, rgba, _fmt = _decode_dds(data)
+        mode = (mode or "diffuse").lower()
         rgba = _transform_mode(rgba, mode)
+        include_alpha = bool(source_has_alpha and mode == "diffuse")
         folder = os.path.dirname(output_path)
         if folder:
             os.makedirs(folder, exist_ok=True)
         with open(output_path, "wb") as f:
-            f.write(_encode_png(width, height, rgba))
+            f.write(_encode_png(width, height, rgba, include_alpha=include_alpha))
     except (DDSInvalidError, DDSUnsupportedFormatError):
         raise
     except OSError as e:
