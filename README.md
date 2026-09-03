@@ -1,315 +1,863 @@
 # NH Blender Plugin
 
-Blender-аддон для пайплайна DayZ/Arma с интеграцией **Arma 3 Object Builder (A3OB)**.
+**NH Blender** — набор инструментов для Blender, предназначенный для подготовки, редактирования и переноса моделей **DayZ / Arma** с поддержкой `.p3d`, LOD, материалов, прокси, коллизий, snap points, библиотек ассетов и массового импорта/экспорта.
 
-Расположение в Blender: `3D Viewport -> N Panel -> NH Plugin`
+Аддон объединяет типовые операции вокруг P3D-пайплайна в одном интерфейсе и может работать как с установленным **Arma 3 Object Builder (A3OB)**, так и со встроенным P3D fallback.
 
-Текущая релизная версия: **0.5.3.16**
+- **Версия в `main`:** `0.6.2.7`
+- **Blender:** `5.1.1+`
+- **Интерфейс:** `3D Viewport -> N-panel -> NH Plugin`
+- **Releases:** <https://github.com/BigbyOn/nh-blender-addon/releases>
+- **Issues:** <https://github.com/BigbyOn/nh-blender-addon/issues>
+- **История изменений:** [CHANGELOG.md](CHANGELOG.md)
 
-Состояние ветки: актуальный релиз `0.5.3.16`; подробности изменений описаны в [CHANGELOG.md](CHANGELOG.md).
+---
 
-## Возможности
+## Что умеет NH Blender
 
-- Scatter clutter-прокси из DayZ-конфига: `CfgWorlds -> CAWorld -> Clutter` + `CfgSurfaceCharacters`
-- `Snap Points (Memory LOD)` с ручным A/V workflow по 2 выбранным вершинам и стабильной нумерацией `0/1`
-- Collider LOD workflow для `Geometry` / `View Geometry` / `Fire Geometry`
-- `Misc / Roadway` workflow для подготовки walkway-LOD мешей
-- `Texture Replace` через A3OB material properties (`.paa` / `.rvmat`)
-- общий PNG-кеш превью для `.paa`, чтобы импорт, карточки материалов и asset icons не конвертировали одни и те же текстуры заново
-- Batch import/export `.p3d`
-- `Import/Export planner` с быстрым добавлением моделей по имени из `NH_Objects`
-- `Model Split / Merge` для part-моделей, named standalone-моделей и объединения `.p3d`-коллекций
-- `P3D Asset Library`: temporary library, persistent `NH_Objects` asset libraries для `Common` / `Environment`, кастомные иконки Asset Browser и конвертация размещённых объектов в A3OB proxy
-- `Cache Manager` для обновления кеша текстур, пересборки NH-библиотек и открытия папок кеша
-- `Menu Settings` для включения/скрытия панелей `NH Plugin` и просмотра кастомных хоткеев
-- `Fixes` для shading, иерархии, component-fix списков и чистки проблемной геометрии
+Основные возможности:
 
-## Основные панели
+- импорт и экспорт `.p3d`;
+- встроенный P3D fallback на базе **Arma 3 Object Builder 2.5.1**;
+- Drag & Drop `.p3d` в Blender;
+- `Import/Export Planner` для массовой работы с моделями;
+- автоматическое сохранение связи импортированной модели с исходным `.p3d` для `Back to source`;
+- работа с `Resolution`, `Geometry`, `View Geometry`, `Fire Geometry`, `Roadway` и `Memory` LOD;
+- отдельный генератор коллизий `Collider`;
+- `Fake Terrain Geometry`;
+- `Snap Points (Memory LOD)`;
+- `P3D Asset Library` и интеграция с Blender Asset Browser;
+- `Custom Assets`, `Cut to New Scene` и `Save to Library`;
+- конвертация расставленных ассетов в P3D proxy;
+- `Model Split / Merge`, `Part Transfer` и разделение модели по сетке/линиям;
+- поиск и исправление проблемной геометрии;
+- работа с `.paa`, `.rvmat`, PNG-preview и общим кешем текстур;
+- текстурные и geometry-preview иконки для Asset Browser;
+- scatter clutter-прокси из DayZ-конфигов;
+- сохраняемые настройки интерфейса и настраиваемый порядок панелей;
+- быстрый доступ к NH hotkeys и восстановление стандартных привязок.
 
-- `Collider`
-- `Geometry LODs`
-- `Clutter Proxies (DayZ)`
-- `Snap Points (Memory LOD)`
-- `P3D Asset Library`
-- `Fixes`
-- `Import/Export planner`
-- `Model Split / Merge`
-- `Cache Manager`
-- `Texture Replace`
-- `Menu Settings`
+---
 
-## Snap Points
+# P3D и Arma 3 Object Builder
 
-Панель `Snap Points (Memory LOD)` работает через ручной workflow:
+## Внешний A3OB больше не обязателен
 
-1. Выберите `A Target` и `V Target`: обычные mesh-объекты нужных моделей.
-2. Нажмите `Create/Find Point clouds > Memory`, если хотите заранее подготовить memory-LOD.
-3. На исходном меше войдите в `Edit Mode`.
-4. Выделите ровно 2 вершины.
-5. Выберите `P3D Name`, `ID` и `Snap Axis`.
-6. Нажмите `Create Snap Points`.
+NH Blender умеет использовать два варианта P3D backend.
 
-Что важно:
+### 1. Оригинальный Arma 3 Object Builder
 
-- `P3D Name` автоматически очищается от пробелов, подчёркиваний, `.p3d` и лишних символов.
-- `Create Snap Points` сам найдёт или создаст `Point clouds > Memory` внутри `.p3d`-веток выбранных `A Target` / `V Target`.
-- `Point clouds > Memory` создаётся в нужной `.p3d`-ветке и не цепляет чужие `Memory` из других моделей.
-- Точки `0/1` сортируются по мировым координатам: сначала выбранная `Snap Axis`, а если пара по ней не различается, то фактическая ось разлёта точек. Меньшая координата получает `0`, большая `1`.
-- Plain-axis pivot инструменты находятся в этой же панели.
+Если оригинальный **Arma 3 Object Builder** установлен и активен, NH Blender использует его P3D import/export операторы.
 
-## Geometry Collider
+Это предпочтительный вариант, если вам нужен полный функционал оригинального A3OB помимо возможностей NH Blender.
 
-Панель `Geometry Collider` рассчитана на workflow, близкий к Object Builder.
+### 2. Встроенный P3D fallback
 
-Что умеет:
+Если оригинальный A3OB отсутствует, NH Blender может зарегистрировать встроенный fallback из папки `NH_bundle`.
 
-- создавать или находить target LOD: `Geometry`, `View Geometry`, `Fire Geometry`
-- автоматически обновлять A3OB LOD props и имя target-объекта при смене `Target LOD`
-- складывать collider-меши в коллекцию `Geometries`
-- красить collider-объекты в отдельный цвет для быстрого визуального отличия от `Resolution`
-- поддерживать OB-style workflow через хоткеи и fallback-кнопки
-- давать быстрые build-операции `Selection -> Hull`, `Selection -> Box`, `Object -> Bounds`
+В bundle включена урезанная копия **Arma 3 Object Builder 2.5.1**, необходимая для:
 
-Основные хоткеи:
+- чтения `.p3d`;
+- записи `.p3d`;
+- P3D object/material properties;
+- LOD properties;
+- proxy и named properties;
+- базовых P3D import/export UI и служебных структур.
 
-- `Ctrl+Shift+C` — `Copy Selected Verts To Geometry`
-- `Ctrl+Shift+X` — `Select Isolated Verts`
-- `Mouse4` — `Selection -> Hull`
-- `Mouse5` — `Selection -> Box`
+Bundle специально изолирован от оригинального A3OB: его RNA-классы и operator idnames переименованы, чтобы минимизировать конфликты при одновременном наличии оригинального аддона.
 
-### Misc / Roadway
+Подробности: [NH_bundle/README.md](NH_bundle/README.md).
 
-В той же панели есть блок `Misc / Roadway`, который умеет:
+> Встроенный bundle не является полной заменой всех инструментов оригинального A3OB. Он предназначен прежде всего для обеспечения P3D-пайплайна внутри NH Blender.
 
-- создавать или находить коллекцию `Misc`
-- создавать или находить `Roadway` LOD внутри `Misc`
-- копировать выделенные полигоны из визуала в `Roadway`
-- назначать `Roadway Material` и путь к `.rvmat` / `.paa`
-- выполнять `Weld Roadway` только по текущему выделению в `Edit Mode`
+---
 
-## Fixes
+# Требования
 
-Панель `Fixes` теперь закрывает несколько разных задач.
+Минимально:
 
-### Shading / Hierarchy
+- **Blender 5.1.1 или новее**;
+- установленный NH Blender Plugin.
 
-- `Fix Shading`
-- `Fix Mesh/Hierarchy`
-- `Repair Invalid A3OB Selections`
+Для работы с P3D:
 
-`Fix Mesh/Hierarchy` рассчитан на большие сцены и умеет:
+- внешний A3OB **не обязателен**, так как имеется встроенный fallback;
+- внешний A3OB можно установить отдельно, если нужен его полный оригинальный набор функций.
 
-- работать от selected/active объекта
-- join'ить меши батчами
-- складывать результат в отдельную fix-коллекцию
-- при необходимости центрировать результат в `(0, 0, 0)`
+Для текстурного workflow:
 
-### Component fixes from `.txt`
+- папки с `.paa` / `.rvmat`, если нужны material previews, Texture Replace или textured asset icons;
+- **ImageToPAA / Pal2PacE из DayZ Tools** нужен только для конвертации PNG обратно в `.paa`;
+- для обычного отображения `.paa` в Blender NH использует общий PNG-preview cache.
 
-Новый workflow для исправления плохих компонентов:
+Для `P3D Asset Library`:
 
-1. Укажите `Fix List .txt`.
-2. Активируйте нужный `Geometry` / `View Geometry` / `Fire Geometry` объект.
-3. Нажмите `Select Bad Components From List`.
-4. После выделения используйте `Delete Faces/Edges Keep Verts`, если нужно удалить проблемные faces/edges, но сохранить точки.
+- доступ к папкам с исходными `.p3d`;
+- при использовании стандартной структуры NH Objects — корни `Common` и `Environment`.
 
-Аддон сопоставляет:
+---
 
-- имя `.p3d` root-коллекции
-- активный LOD
-- vertex groups, перечисленные в fix-list файле
+# Установка
 
-Если каких-то групп не хватает, они выводятся в `System Console`.
+## Обычная установка
 
-### Поиск проблемной геометрии
+1. Откройте страницу [Releases](https://github.com/BigbyOn/nh-blender-addon/releases).
+2. Скачайте ZIP нужной версии NH Blender.
+3. В Blender откройте:
+   `Edit -> Preferences -> Add-ons`.
+4. Установите ZIP-архив аддона.
+5. Включите **NH Plugin for Blender**.
+6. Откройте:
+   `3D Viewport -> N-panel -> NH Plugin`.
+
+## Development build
 
-В `Edit Mode` доступны два поиска:
+Текущая версия аддона находится в пакетной директории:
 
-- `Find Trash` — ищет маленькие connected face islands, которые похожи на мусор
-- `Find Flat Plates` — ищет плоские coplanar-островки в одной плоскости
+```text
+NH_Blender/
+    __init__.py
+    nh_assets.py
+    nh_base.py
+    nh_collider.py
+    nh_collider_exp.py
+    nh_fixes.py
+    nh_model_split.py
+    nh_planner.py
+    nh_scatter.py
+    nh_snap.py
+    nh_statistics.py
+    nh_textures.py
+    nh_ui_icons.py
+    nh_ui_panels.py
+    ...
+```
 
-Это удобно перед экспортом, когда нужно быстро вычистить артефакты меша.
+Для сборки ZIP используется:
 
-## Import/Export planner
+```text
+build_addon_zip_v2.bat
+```
 
-Панель `Import/Export planner` поддерживает batch-import и batch-export `.p3d`.
+Собранные архивы помещаются в `dist`.
 
-Актуально сейчас:
+Для локальной разработки также имеется:
 
-- можно вручную собирать список файлов на импорт
-- можно быстро добавить модель по имени через блок `Quick Add From NH_Objects`
-- batch-export умеет работать с обычными root-коллекциями и `.p3d` root-ветками
+```text
+deploy_local_addon.ps1
+```
 
-Перед экспортом аддон дополнительно проверяет:
+После изменения Python-кода в Blender обычно достаточно:
 
-- дубли `Resolution LOD` индексов внутри одной логической ветки
-- наличие `n-gon`-полигонов в экспортируемых LOD-мешах
+```text
+F3 -> Reload Scripts
+```
 
-Если такая проблема найдена, экспорт конкретной коллекции останавливается заранее, а детали пишутся в `System Console`.
+Если Blender продолжает держать старые зарегистрированные классы, выключите/включите аддон или перезапустите Blender.
 
-## Model Split / Merge
+---
 
-Панель `Model Split / Merge` поддерживает три сценария:
+# Первичная настройка
 
-- создание обычных split-part моделей с суффиксами вида `*_01.p3d`, `*_02.p3d`
-- `Separate -> Named Standalone Model` для сборки новой самостоятельной модели из выбранных объектов
-- `Merge Collections` для объединения нескольких `.p3d` root-коллекций в один target model
+После установки рекомендуется пройти следующие шаги.
 
-Для named standalone workflow доступны:
+1. Откройте `NH Plugin` в N-panel.
+2. Проверьте импорт любого `.p3d`.
+3. Если используете текстуры, укажите корневую папку с `.paa` / `.rvmat` в настройках texture/cache workflow.
+4. Если нужен PNG -> PAA, укажите путь к `ImageToPAA.exe` / `Pal2PacE`.
+5. В `P3D Asset Library` укажите корни библиотек моделей.
+6. В `Cache Manager` подготовьте PNG-кеш используемых текстур.
+7. Соберите или обновите NH Asset Libraries.
+8. Откройте Asset Browser и проверьте иконки ассетов.
+9. В `Import/Export Planner` оставьте включёнными material previews, если хотите видеть текстуры сразу после импорта.
+10. В `Menu Settings` настройте порядок панелей и проверьте горячие клавиши.
 
-- `Move` или `Copy` выбранных объектов
-- экспорт рядом с исходной моделью или в отдельную папку
-- сохранение логических путей вроде `Visuals`, `Geometries`, `Misc`, `Point clouds`
+---
 
-Такой результат затем нормально работает с `Back to source` в `Import/Export planner`.
+# Панели NH Plugin
 
-В `Merge Collections` selector `Source` отсортирован так, чтобы основные `.p3d` root-коллекции шли первыми, а остальные коллекции — ниже по алфавиту. После merge можно нажать `Refresh` в `Import/Export planner`: аддон добавит текущие `.p3d` root-коллекции сцены в список, удалит отсутствующие после merge коллекции и, если root-коллекция была переименована под другой `.p3d`, переназначит `Back to source` по новому имени.
+| Панель | Назначение |
+| --- | --- |
+| `Collider` | Генерация и проверка collision geometry |
+| `Geometry LODs` | Fire Geometry, Fake Terrain Geometry, Roadway и вспомогательные LOD tools |
+| `P3D Asset Library` | NH Objects libraries, Custom Assets, Asset Browser и proxy workflow |
+| `Snap Points (Memory LOD)` | Создание snap-point selections и Memory LOD workflow |
+| `Import/Export Planner` | Batch import/export, Back to source, Drag & Drop интеграция |
+| `Fixes` | Repair, cleanup, geometry checks, component fixes |
+| `Model Split / Merge` | Part Transfer, split, merge и grid/cut-line workflow |
+| `Texture Replace` | Поиск/замена `.paa` и `.rvmat`, material preview и texture export |
+| `Cache Manager` | Texture preview cache, asset cache и пересборка иконок |
+| `Clutter Proxies (DayZ)` | Scatter clutter-прокси из DayZ config |
+| `Menu Settings` | Видимость, порядок панелей и hotkeys |
+| `Object Builder` | Панели оригинального или встроенного P3D backend, интегрированные в NH UI |
 
-Если вручную переименовать `pripyat_fireDepartment_p06.p3d` в `pripyat_fireDepartment_p03.p3d`, после `Refresh` экспорт в режиме `Back to source` будет писать в путь `...p03.p3d`, если этот `.p3d` есть в списке planner-а. Без `Refresh` у коллекции может оставаться старый internal source tag.
+---
 
-## P3D Asset Library
+# Import / Export Planner
 
-Панель `P3D Asset Library` умеет:
+`Import/Export Planner` — центральный workflow для работы с большим количеством `.p3d`.
 
-- временно импортировать набор `.p3d`
-- собирать temporary asset library
-- собирать persistent Blender asset libraries из `NH_Objects/Common` и `NH_Objects/Environment`
-- регистрировать библиотеки `NH Objects - Common` и `NH Objects - Environment` в Asset Browser
-- создавать быстрые geometry-preview и, при включенном `Use textured icons`, textured rendered previews по уже готовому кешу текстур
-- пропускать уже актуальные библиотеки по manifest-файлу и пересобирать только изменившиеся папки
-- конвертировать расставленные объекты в A3OB proxies
+## Добавление моделей
 
-В `Convert Selected Assets To Proxies` поле `Target Resolution / LOD` должно указывать на A3OB LOD mesh, например `Resolution 0`: созданный proxy станет child-объектом внутри этого LOD. Объект, который нужно превратить в proxy, можно указать отдельно через `Proxy Source Object`; если поле пустое, аддон берет выделенные placed asset object(s). Если target не указан, он подбирается автоматически из parent LOD, той же LOD-коллекции или `.p3d` root-коллекции.
+Поддерживаются:
 
-Для `NH_Objects` workflow укажите корни `Common` и `Environment`, затем нажмите `Build NH Libraries`. После сборки можно открыть Asset Browser кнопкой рядом с build-кнопкой или через `Cache Manager`.
+- `Add Files`;
+- быстрое добавление модели по имени из configured NH Objects root;
+- добавление уже существующих `.p3d` root collections из сцены;
+- автоматическое добавление модели после обычного P3D import;
+- Drag & Drop `.p3d`.
 
-## Cache Manager
+Planner хранит путь исходного файла и использует его для режима `Back to source`.
 
-Панель `Cache Manager` собирает операции с кешами в одном месте:
+## Drag & Drop `.p3d`
 
-- `Cache NH Used` / `Rebuild NH Used` обновляют PNG-кеш только для текстур, реально использованных в NH-библиотеках
-- `Update All Folder` / `Rebuild All (slow)` работают с выбранной папкой текстур целиком
-- `Open Texture PNG Cache` и `Report` открывают папку кеша и последний отчет
-- `Build / Update Libraries`, `Rebuild Icons` и `Open NH Library Cache` управляют кешируемыми `.blend`-библиотеками и их иконками
-- `Force Rebuild All Icons + Textures` принудительно пересобирает используемые текстуры и все иконки `Common`, `Environment` и сохраненных `Custom`-ассетов
+`.p3d` можно перетащить непосредственно в Blender.
 
-Для ручного ракурса иконки добавьте в Memory LOD одну точку и назначьте ей selection `nh_cam`. Камера смотрит от этой точки в центр модели, а ортографический масштаб автоматически вписывает модель в квадрат. Если ракурс нужно повернуть вокруг вертикальной оси, используйте суффикс угла: `nh_cam_90`, `nh_cam_180` или `nh_cam_270`. Если в файле одновременно есть `nh_cam` и вариант с углом, используется вариант с углом.
+NH Blender перехватывает P3D drop handler и позволяет:
 
-## Texture Replace
+- добавить файл в `Import/Export Planner`;
+- импортировать `.p3d` сразу.
 
-Панель `Texture Replace` умеет:
+При импорте NH также может:
 
-- собирать базу `.paa` / `.rvmat` из папки
-- находить материалы объекта
-- заменять texture/material paths через A3OB-compatible material properties
-- обновлять material preview nodes и переиспользовать общий PNG-кеш `.paa -> .png`
+- назначить source path импортированным данным;
+- добавить файл в Planner;
+- создать material preview nodes;
+- использовать общий `.paa -> .png` cache.
 
-## Menu Settings
+## Batch Import
 
-Панель `Menu Settings` позволяет скрывать редко используемые блоки `NH Plugin`, оставляя в `N-panel` только нужный workflow.
+Доступны настройки:
 
-В блоке `Custom Keybinds` можно быстро посмотреть актуальные привязки:
+- отображать material textures после импорта;
+- использовать shared `.paa -> .png` cache;
+- после batch-import автоматически скрывать коллекции;
+- либо исключать их из текущего View Layer.
 
-- `Ctrl+Shift+C` — `Copy Selected Verts To Geometry`
-- `Ctrl+Shift+X` — `Select Isolated Verts`
-- `Mouse4` — `Selection -> Hull`
-- `Mouse5` — `Selection -> Box`
-- `Ctrl+Shift+P` — `Create Plain Axis Pivot`, если хоткей свободен
+## Batch Export
 
-## Что нужно пользователю
+Основные режимы:
 
-Минимальный набор:
+- `Back to source` — экспорт обратно в исходный `.p3d`;
+- `Custom folder` — экспорт в выбранную директорию.
 
-- Blender `5.1+`
-- включенный аддон **Arma 3 Object Builder (A3OB)**
-- установленный и включенный `NH Blender Plugin`
-- папка с `.p3d` моделями, если нужен import/export или Asset Browser
-- папка с `.paa` / `.rvmat` текстурами, если нужны превью материалов, texture replace или textured icons
+Дополнительно можно:
 
-Для полного texture workflow дополнительно нужен `ImageToPAA.exe` / `Pal2PacE` из DayZ Tools. Он требуется для конвертации PNG обратно в `.paa`; для обычного просмотра `.paa` в Blender аддон использует PNG-кеш.
+- создавать `.bak` перед перезаписью;
+- экспортировать только `.p3d`-подобные root collections;
+- экспортировать только split parts;
+- использовать `Force export all LODs`.
 
-## Первичная настройка
+### Проверки перед экспортом
 
-1. Установите и включите **Arma 3 Object Builder (A3OB)**.
-2. Установите `NH Blender Plugin` и перезапустите Blender или выполните `F3 -> Reload Scripts`.
-3. Откройте `3D Viewport -> N Panel -> NH Plugin`.
-4. В `Texture Replace` укажите `Texture Cache Source`: корневую папку, где лежат `.paa` / `.rvmat` текстуры.
-5. Если будете экспортировать PNG в `.paa`, укажите `ImageToPAA / Pal2PacE`.
-6. В `P3D Asset Library` укажите `Common Folder` и `Environment Folder` из `NH_Objects`.
-7. В `Import/Export planner` оставьте включенными `Show Materials` и `Keep converted textures`, если хотите видеть текстуры сразу после импорта.
-8. В `Cache Manager` нажмите `Cache NH Used` или `Update All Folder`, чтобы подготовить PNG-кеш текстур.
-9. В `P3D Asset Library` или `Cache Manager` нажмите `Build NH Libraries`.
-10. Откройте Asset Browser через кнопку рядом с `Build NH Libraries` или через `Open NH Asset Browser`.
+Перед записью NH Blender проверяет, среди прочего:
 
-Рекомендуемый порядок для красивых иконок в Asset Browser:
+- дублирующиеся `Resolution LOD` index в одной логической ветке;
+- N-gon полигоны;
+- наличие ожидаемых LOD после экспорта.
 
-1. Сначала соберите PNG-кеш текстур через `Cache Manager`.
-2. Включите `Use textured icons`.
-3. Нажмите `Rebuild Icons` или заново `Build / Update Libraries`.
+При проблеме подробности выводятся в **System Console**.
 
-Если `Use textured icons` выключен, библиотеки все равно работают: аддон создает быстрые geometry-preview без рендера текстур.
+### Force export all LODs
 
-## Проверка настройки
+`Force export all LODs (skip validation)` предназначен как обходной режим для случаев, когда стандартная P3D LOD validation ошибочно пропускает часть LOD.
 
-После настройки проверьте три вещи:
+Используйте его только если понимаете причину ошибки: режим намеренно ослабляет часть проверок экспортера.
 
-- `Import/Export planner` может импортировать `.p3d` через A3OB без ошибки `Arma 3 Object Builder import operators not found`.
-- `Texture Replace` или импорт показывают материалы с Image Texture nodes, а в `Cache Manager` появляется путь к PNG-кешу.
-- `P3D Asset Library` создает или открывает `NH Objects - Common` / `NH Objects - Environment` в Asset Browser.
+## Refresh после переименования
 
-## Частые проблемы
+Если `.p3d` root collection была вручную переименована, например:
 
-- `Arma 3 Object Builder import/export operators not found`: включите A3OB в `Edit -> Preferences -> Add-ons` и перезапустите Blender.
-- `ImageToPAA not found`: укажите путь к `ImageToPAA.exe` / `Pal2PacE` в `Texture Replace`; это нужно только для PNG -> PAA.
-- `No .p3d folders found`: проверьте `Common Folder` и `Environment Folder`; внутри должны быть папки с `.p3d`.
-- Иконки без текстур: сначала соберите PNG-кеш, затем включите `Use textured icons` и нажмите `Rebuild Icons`.
-- Хоткей `Ctrl+Shift+P` не работает: он может быть занят другим аддоном или настройкой Blender; статус видно в `Menu Settings -> Custom Keybinds`.
+```text
+model_p06.p3d -> model_p03.p3d
+```
 
-## Требования
+нажмите `Refresh` в Planner.
 
-- Blender `5.1+`
-- включенный аддон **Arma 3 Object Builder (A3OB)**
-- для PNG -> PAA: установленный DayZ Tools с `ImageToPAA.exe` / `Pal2PacE`
-- для NH Asset Browser: доступные папки `NH_Objects/Common` и `NH_Objects/Environment`
+Это позволяет обновить internal source mapping и корректно использовать `Back to source` для нового имени.
 
-## Установка
+---
 
-1. Скачайте `dist/nh-blender-addon-latest.zip` или архив нужной версии из `dist`.
-2. В Blender откройте `Edit -> Preferences -> Add-ons -> Install...`
-3. Выберите ZIP-архив аддона.
-4. Включите аддон.
+# Collider
 
-Для разработки можно устанавливать одиночный файл `NH_Blender.py`, но для обычного пользователя удобнее ZIP из `dist`.
+Новая панель `Collider` предназначена для быстрого создания collision geometry.
 
-## Обновление во время разработки
+## Source scope
 
-Обычно хватает:
+Коллайдер можно создавать:
 
-- `F3 -> Reload Scripts`
+- `from selected` — из текущего выделения;
+- `per shells` — отдельно для connected shell;
+- `per obj comp` — отдельно для connected components каждого объекта;
+- `per objects` — отдельно для каждого выбранного объекта.
 
-Если Blender держит старую UI-версию аддона:
+## Типы коллайдеров
 
-- выключите и включите аддон в `Preferences -> Add-ons`
-- или перезапустите Blender
+Поддерживаются:
 
-## История изменений
+- `Box`;
+- `Convex Hull`;
+- `Simplify Hull`;
+- `Re-Convex Selected Components`;
+- `Sphere`;
+- `Capsule`.
 
-Полная история изменений: [CHANGELOG.md](CHANGELOG.md)
+Для каждого режима доступны соответствующие настройки размеров, detail/triangle limits, offsets и прочие параметры.
 
-Коротко по актуальному состоянию:
+## Round Box Collision
 
-- `0.5.3.0` (`2026-05-31`) — PNG-кеш превью текстур, persistent `NH_Objects` asset libraries для `Common` / `Environment`, кастомные иконки Asset Browser, `Cache Manager`, `Menu Settings`, обновленные хоткеи collider workflow и улучшения proxy/collider target selection
-- `0.5.2.31` (`2026-05-29`) — drag-and-drop `.p3d` сразу добавляет файлы в `Import/Export planner`, список dropped-файлов сортируется натурально
-- `0.5.2.29` (`2026-05-29`) — drag-and-drop `.p3d`, `Visual 0 Only` / `Show All`, merge workflow в `Model Split`, `Material Safe Merge`, `Plain Axis Pivot` и fixes для snap points
-- `0.4.9.1` (`2026-05-01`) — безопасные `.bak` при batch-export, диагностика missing LOD, рабочий `Force export all LODs`, loose-vertex export checks, auto mass для `Geometry` LOD, `Fix Proxy Triangles` и улучшения `Fire Geometry` / `Roadway` UI
-- `0.4.0` (`2026-04-12`) — ручной A/V workflow для `Snap Points`, автоматическое создание `Point clouds > Memory`, scatter по выделенным полигонам и `Slope Falloff`
-- `0.3.1` (`2026-04-07`) — `Import/Export planner`, `Model Split`, кеш texture preview и batch-export фильтр для split-part коллекций
+Для цилиндрических и трубчатых объектов имеется отдельный workflow:
 
-## Ссылки
+- `Create Cylinder`;
+- `Cylinder Boxes`;
+- `Create Pipe`;
+- `Pipe Boxes`.
 
-- Репозиторий: <https://github.com/BigbyOn/nh-blender-addon>
+Он создаёт набор box-сегментов вокруг цилиндрической или кольцевой формы, сохраняя открытое отверстие у pipe collider.
+
+## Collision QA
+
+Блок `Collision QA` включает:
+
+- `Validate Collision`;
+- контроль ограничений collision geometry;
+- `NH Debug / Run Collision Tool Self Test`.
+
+Также доступны быстрые операции:
+
+- `Select Shell`;
+- `Delete Last`.
+
+---
+
+# Geometry LODs
+
+Панель `Geometry LODs` содержит инструменты для специальных P3D LOD.
+
+## Geometries / Fire Geometry
+
+Поддерживаются:
+
+- выбор/поиск Fire Geometry target;
+- быстрое назначение активного объекта;
+- работа с Fire Geometry material;
+- выбор faces по материалу;
+- переход к папке `.rvmat`.
+
+## Fake Terrain Geometry
+
+`Fake Terrain Geometry` создаёт упрощённую collision representation поверхности.
+
+Настраиваются:
+
+- source object;
+- target;
+- patch size;
+- minimum patch size;
+- допустимая ошибка для depression;
+- допустимая ошибка для hills;
+- thickness.
+
+## Misc / Roadway
+
+Roadway workflow умеет:
+
+- находить или создавать `Roadway` LOD;
+- копировать выбранные faces из visual mesh;
+- назначать texture/material;
+- выбирать faces по roadway material;
+- weld'ить выбранные вершины.
+
+---
+
+# Snap Points (Memory LOD)
+
+Snap Points предназначены для создания согласованных named selections в `Point clouds -> Memory`.
+
+Типовой workflow:
+
+1. Укажите модели/targets.
+2. Найдите или создайте `Point clouds -> Memory`.
+3. Перейдите в `Edit Mode` исходного mesh.
+4. Выделите две вершины.
+5. Укажите P3D name, pair ID и нужные параметры.
+6. Создайте snap pair.
+
+Особенности:
+
+- P3D name нормализуется автоматически;
+- Memory LOD создаётся внутри правильной `.p3d` ветки;
+- точки пары получают стабильную нумерацию `0/1`;
+- при необходимости можно заменить существующие named groups;
+- имеется fallback workflow для определения точки по грани/оси;
+- доступны batch-операции и cleanup импортированных объектов;
+- Plain Axis helpers находятся рядом с snap workflow.
+
+---
+
+# Model Split / Merge
+
+Панель закрывает несколько сценариев работы с большими или составными P3D моделями.
+
+## Part Transfer
+
+Можно переносить выбранную геометрию между `.p3d` моделями в режиме:
+
+- `Copy`;
+- `Move`.
+
+Целевая P3D-категория:
+
+- `Resolution`;
+- `Geometries`;
+- `Point clouds`;
+- `Roadway`.
+
+## Named standalone model
+
+Можно создать самостоятельную новую `.p3d` модель из выбранных объектов.
+
+Поддерживаются:
+
+- `Move` или `Copy`;
+- экспорт рядом с исходной моделью;
+- экспорт в custom directory;
+- сохранение логической P3D category structure.
+
+## Merge
+
+Можно объединять несколько `.p3d` root collections в одну target model.
+
+Selector сортирует `.p3d` roots выше обычных scene collections, чтобы крупные сцены было проще обслуживать.
+
+После merge рекомендуется обновить Planner через `Refresh`.
+
+## Grid / Cut Line Split
+
+Для автоматического разбиения большой модели доступны editable cut guides.
+
+Можно настроить:
+
+- source object или source root collection;
+- количество частей по X/Y;
+- origin по bounds объекта, root collection, selection, 3D Cursor или вручную;
+- output prefix;
+- использование только видимых guides;
+- сохранение оригинала;
+- скрытие guides после split;
+- пропуск пустых частей;
+- минимальное число vertices/faces;
+- автоматическое добавление результата в Planner.
+
+---
+
+# P3D Asset Library
+
+`P3D Asset Library` создаёт persistent Blender Asset Libraries на основе `.p3d` моделей.
+
+## NH Objects Libraries
+
+Поддерживаются основные библиотеки:
+
+- `Common`;
+- `Environment`.
+
+Основные операции:
+
+- `Full Rebuild` — полная пересборка;
+- `Add New` — добавление новых/изменённых объектов без полной пересборки;
+- открытие NH Asset Browser.
+
+Для ускорения обновления используются manifest/cache данные.
+
+## Custom Assets
+
+Можно поддерживать отдельную библиотеку `Custom`:
+
+- найти P3D по имени;
+- добавить конкретную модель;
+- удалить конкретную модель;
+- полностью очистить Custom cache/library.
+
+## Cut / Save Asset
+
+Новый workflow позволяет превратить часть текущей сцены в самостоятельный asset:
+
+- `Cut to New Scene`;
+- `Save to Library`.
+
+Это удобно, когда из большой исходной модели нужно быстро получить переиспользуемый объект.
+
+## Asset previews
+
+Доступны два типа иконок:
+
+- быстрый geometry preview;
+- textured rendered preview.
+
+При построении preview NH использует наиболее детальный `Resolution` LOD и исключает служебные Geometry / View Geometry / Fire Geometry / Roadway LOD из preview-модели.
+
+### Ручной ракурс через `nh_cam`
+
+Чтобы указать желаемый ракурс иконки:
+
+1. Добавьте одну точку в Memory LOD.
+2. Назначьте selection:
+   `nh_cam`.
+
+Для поворота камеры вокруг вертикальной оси поддерживаются:
+
+```text
+nh_cam_90
+nh_cam_180
+nh_cam_270
+```
+
+Ортографический масштаб рассчитывается автоматически так, чтобы модель помещалась в квадрат preview без обрезания.
+
+## Placed Assets -> P3D Proxies
+
+Размещённые объекты из Asset Browser можно конвертировать в P3D proxy.
+
+Proxy можно создавать/дублировать в:
+
+- `Resolution`;
+- `Geometries`;
+- `Roadway`;
+- `Point Clouds`.
+
+При необходимости target `.p3d` collection и target LOD можно указать вручную; иначе NH пытается определить их из текущего контекста.
+
+---
+
+# Cache Manager
+
+`Cache Manager` объединяет операции с texture и asset cache.
+
+## Texture cache
+
+Используется общий PNG cache для `.paa`, чтобы разные части NH Blender не выполняли одну и ту же конвертацию повторно.
+
+Кеш используется для:
+
+- material preview после P3D import;
+- Texture Replace;
+- textured asset icons;
+- NH Asset Libraries.
+
+Операции включают:
+
+- cache только реально используемых NH-текстур;
+- пересборку используемых текстур;
+- обновление всей выбранной папки;
+- полную пересборку;
+- открытие cache directory;
+- просмотр последнего report.
+
+## Asset cache
+
+Можно:
+
+- полностью пересобрать NH Libraries;
+- добавить только новые P3D;
+- пересобрать иконки;
+- открыть NH library cache;
+- выполнить `Force Rebuild All Icons + Textures`.
+
+`Add New` и Custom workflow наследуют режим существующей библиотеки и не должны неожиданно переключать textured preview на geometry preview.
+
+Если требуемая `.paa` ещё не имеет PNG-cache, NH может подготовить preview по мере необходимости.
+
+---
+
+# Texture Replace
+
+Панель предназначена для массовой работы с material texture paths.
+
+Она умеет:
+
+- индексировать `.paa` и `.rvmat` в выбранных директориях;
+- находить используемые материалы;
+- заменять texture/material paths;
+- работать с A3OB-compatible material properties;
+- создавать/обновлять Image Texture preview nodes;
+- переиспользовать shared PNG cache;
+- экспортировать отсутствующие текстуры из source roots;
+- при наличии DayZ Tools конвертировать подготовленные изображения обратно в `.paa`;
+- создавать `.rvmat` в соответствующих workflow.
+
+`ImageToPAA / Pal2PacE` требуется только там, где выполняется PNG -> PAA.
+
+---
+
+# Fixes
+
+`Fixes` содержит операции для восстановления импортированных P3D и очистки проблемной геометрии.
+
+## Repair Invalid P3D Selections
+
+Repair workflow может:
+
+- объединить повреждённые mesh fragments;
+- восстановить нарушенные vertex-group / named-selection связи;
+- собрать результат в корректный `Resolution 0`;
+- вернуть результат в ожидаемую `.p3d` hierarchy.
+
+## Material-safe merge
+
+`Merge By Distance (Keep Materials)` предназначен для объединения близких вершин без нежелательного разрушения material boundaries.
+
+## Proxy repair
+
+`Fix Proxy Triangles` исправляет P3D proxy meshes, у которых ожидается один triangle, но topology повреждена.
+
+## Component fixes from file
+
+Можно загрузить список проблемных компонентов из `.txt`, сопоставить его с активным P3D/LOD и выделить соответствующие vertex groups.
+
+После этого доступны операции удаления faces/edges с сохранением vertices.
+
+## Geometry checks
+
+В зависимости от режима доступны проверки и выбор:
+
+- isolated/loose vertices;
+- loose vertices вне Memory;
+- N-gon meshes;
+- маленькие мусорные connected islands;
+- coplanar flat plates;
+- проблемные planar N-gon cases.
+
+Подробные результаты сложных проверок выводятся в System Console.
+
+---
+
+# Clutter Proxies (DayZ)
+
+NH Blender умеет читать DayZ config и создавать scatter для clutter proxies.
+
+Используются данные вида:
+
+```text
+CfgWorlds
+  -> CAWorld
+     -> Clutter
+
+CfgSurfaceCharacters
+```
+
+Поддерживаются настройки плотности, grid, randomization, ограничений по высоте/дистанции, slope falloff и количества создаваемых proxy.
+
+---
+
+# Menu Settings и интерфейс
+
+`Menu Settings` позволяет адаптировать N-panel под конкретный workflow.
+
+Можно:
+
+- скрывать неиспользуемые панели;
+- менять порядок основных панелей NH Plugin;
+- вернуть стандартный порядок;
+- просматривать текущие NH keybinds;
+- открыть Blender Keymap Preferences;
+- восстановить стандартные NH hotkeys.
+
+Настройки UI сохраняются между сессиями Blender.
+
+## Основные горячие клавиши
+
+Стандартные NH bindings включают:
+
+- `Ctrl+Shift+C` — `Copy Selected Verts To Geometry`;
+- `Ctrl+Shift+X` — `Select Isolated Verts`;
+- `Mouse4` — collider `Selection -> Hull`;
+- `Mouse5` — collider `Selection -> Box`;
+- `Ctrl+Shift+P` — `Create Plain Axis Pivot`, если сочетание свободно.
+
+Фактическую текущую привязку всегда можно проверить в:
+
+```text
+NH Plugin -> Menu Settings -> Custom Keybinds
+```
+
+Если shortcut занят другим аддоном или пользовательской настройкой Blender, NH показывает текущий статус в этом разделе.
+
+---
+
+# Object Builder UI
+
+Если активен оригинальный A3OB или встроенный P3D bundle, его поддерживаемые P3D panels интегрируются в NH Plugin UI.
+
+NH Blender:
+
+- добавляет NH icon в заголовки Object Builder panels;
+- убирает лишний префикс `Object Builder:` из названия там, где это возможно;
+- сохраняет оригинальный P3D functionality backend.
+
+---
+
+# Сохранение настроек и локальные данные
+
+NH Blender сохраняет часть пользовательских настроек между сессиями Blender, включая параметры основных workflow и порядок UI panels.
+
+Persisted UI state хранится локально в Blender user config.
+
+В проекте также присутствует модуль локальной usage statistics, но он **отключён по умолчанию**. В текущей конфигурации данные никуда не отправляются и, если модуль будет вручную включён разработчиком, сохраняются только локально.
+
+Экспериментальный server-side work tracking вынесен в `_staged` и не является активной частью текущего аддона.
+
+---
+
+# Частые проблемы
+
+## P3D import/export недоступен
+
+1. Перезапустите Blender или выполните `F3 -> Reload Scripts`.
+2. Проверьте, что NH Blender включён.
+3. Если установлен оригинальный A3OB — убедитесь, что он корректно активен.
+4. Если A3OB не установлен — NH должен зарегистрировать встроенный P3D fallback.
+5. Посмотрите System Console на сообщения о `bundled P3D module import failed` или `failed to register bundled P3D`.
+
+## Материалы импортированы, но текстуры не видны
+
+- включите material preview после P3D import;
+- проверьте texture source roots;
+- убедитесь, что `.paa` доступны;
+- обновите shared PNG cache через `Cache Manager`.
+
+## `ImageToPAA not found`
+
+Это не мешает обычному P3D import и просмотру уже существующих `.paa`.
+
+`ImageToPAA / Pal2PacE` требуется только для PNG -> PAA. Укажите путь к инструменту из DayZ Tools в texture workflow.
+
+## Asset Browser показывает geometry icons вместо textured icons
+
+1. Проверьте наличие исходных `.paa`.
+2. Обновите PNG cache.
+3. Выполните `Rebuild Icons` или `Force Rebuild All Icons + Textures`.
+
+## Новые P3D не появляются в библиотеке
+
+Используйте `Add New`. Если cache/manifest повреждён или структура библиотек сильно изменилась — используйте `Full Rebuild`.
+
+## `Back to source` указывает на старое имя
+
+Если root collection была переименована вручную, выполните `Refresh` в Planner.
+
+## Export остановлен из-за N-gon или duplicate Resolution LOD
+
+Откройте **System Console**: NH выводит конкретную collection/object path и причину остановки.
+
+Исправление исходной структуры предпочтительнее, чем использование `Force export all LODs`.
+
+## Горячая клавиша не работает
+
+Откройте:
+
+```text
+Menu Settings -> Custom Keybinds -> Open Keymap
+```
+
+Проверьте конфликт с Blender или другим add-on. При необходимости используйте `Restore Defaults`.
+
+---
+
+# Архитектура проекта
+
+Текущий NH Blender разделён на доменные модули вместо одного большого Python-файла.
+
+Основные части:
+
+```text
+NH_Blender/
+├── __init__.py           # регистрация пакета и public surface
+├── nh_base.py            # общие настройки, persistence, keymaps, helpers
+├── nh_assets.py          # P3D Asset Library и proxy workflow
+├── nh_collider.py        # Geometry/Roadway helpers
+├── nh_collider_exp.py    # новый Collider и Collision QA
+├── nh_fixes.py           # repair и geometry fixes
+├── nh_model_split.py     # split / merge / transfer
+├── nh_planner.py         # P3D Planner и Drag & Drop
+├── nh_scatter.py         # settings, UI state, clutter/scatter
+├── nh_snap.py            # Snap Points и P3D backend bridge
+├── nh_textures.py        # texture replace/cache/export
+├── nh_ui_icons.py        # NH UI icons
+├── nh_ui_panels.py       # основные N-panel panels
+└── nh_statistics.py      # отключённая по умолчанию локальная статистика
+```
+
+Дополнительно:
+
+```text
+NH_bundle/                # встроенный P3D/A3OB fallback
+_source_monolith.py       # legacy/reference monolithic source
+_staged/                  # неактивные экспериментальные компоненты
+build_addon_zip_v2.bat    # сборка ZIP
+Deploy_local_addon.ps1    # локальный development deploy
+```
+
+Модульная структура упрощает дальнейшее развитие и позволяет изменять отдельные части аддона без работы с монолитным файлом на десятки тысяч строк.
+
+---
+
+# Сборка релиза
+
+Основной build script:
+
+```bat
+build_addon_zip_v2.bat
+```
+
+Он использует версию из `bl_info` активного package entrypoint и собирает distributable ZIP в `dist`.
+
+Для release/development workflow доступны параметры самого build script; перед публикацией рекомендуется проверить:
+
+- версию в `NH_Blender/__init__.py`;
+- `CHANGELOG.md`;
+- содержимое ZIP;
+- наличие bundled texture tools;
+- наличие `NH_bundle`, если релиз должен работать без внешнего A3OB;
+- импорт и экспорт тестового `.p3d` на чистой установке Blender.
+
+---
+
+# История изменений
+
+Полный changelog:
+
+[CHANGELOG.md](CHANGELOG.md)
+
+Текущая development-версия определяется `bl_info` в:
+
+```text
+NH_Blender/__init__.py
+```
+
+Для опубликованных сборок используйте страницу:
+
+<https://github.com/BigbyOn/nh-blender-addon/releases>
+
+---
+
+# Лицензирование
+
+Собственный код NH Blender сопровождается корневым файлом [LICENSE](LICENSE).
+
+При этом `NH_bundle` содержит код **Arma 3 Object Builder 2.5.1**, распространяемый по **GNU GPL v3**. Bundle имеет собственные сведения о происхождении и лицензии:
+
+- [NH_bundle/README.md](NH_bundle/README.md)
+- [NH_bundle/LICENSE](NH_bundle/LICENSE)
+
+Поэтому сборка NH Blender, которая распространяется вместе с `NH_bundle`, не должна описываться просто как «MIT-only»: при распространении необходимо учитывать условия GPLv3 для включённого A3OB-кода.
+
+---
+
+# Ссылки
+
+- GitHub: <https://github.com/BigbyOn/nh-blender-addon>
+- Releases: <https://github.com/BigbyOn/nh-blender-addon/releases>
 - Issues: <https://github.com/BigbyOn/nh-blender-addon/issues>
-
-## Лицензия
-
-MIT License. См. [LICENSE](LICENSE).
+- Changelog: [CHANGELOG.md](CHANGELOG.md)
+- Bundled P3D backend: [NH_bundle/README.md](NH_bundle/README.md)
