@@ -142,6 +142,25 @@ function Resolve-BundledToolsSource {
     throw "Bundled tools folder not found. Expected NH_Blender\tools or tools under $RepoRoot"
 }
 
+function Resolve-BundledA3OB {
+    param(
+        [string]$RepoRoot
+    )
+
+    $candidates = @(
+        (Join-Path $RepoRoot "NH_Blender\NH_bundle"),
+        (Join-Path $RepoRoot "NH_bundle")
+    )
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath (Join-Path $candidate "io\import_p3d.py") -PathType Leaf) {
+            return $candidate
+        }
+    }
+
+    throw "Bundled NH_bundle (P3D fallback) package not found. Expected NH_Blender\NH_bundle"
+}
+
 function Get-PathContentHash {
     param(
         [string]$Path
@@ -178,11 +197,13 @@ function Get-PathContentHash {
 
 $addonSource = Resolve-AddonSource -RequestedPath $SourcePath -RepoRoot $PSScriptRoot
 $toolsSource = Resolve-BundledToolsSource -RepoRoot $PSScriptRoot
+$a3obSource = Resolve-BundledA3OB -RepoRoot $PSScriptRoot
 $versionPath = Resolve-BlenderVersionPath -RequestedVersion $BlenderVersion
 $addonsDir = Join-Path $versionPath "scripts\addons"
 $targetFile = Join-Path $addonsDir ("{0}.py" -f $addonSource.Name)
 $targetDir = Join-Path $addonsDir $addonSource.Name
 $toolsTargetDir = Join-Path $addonsDir "_nh_blender_tools"
+$a3obTargetDir = Join-Path $addonsDir "Arma3ObjectBuilder"
 $runningBlender = @(Get-Process -Name "blender" -ErrorAction SilentlyContinue)
 
 New-Item -ItemType Directory -Force -Path $addonsDir | Out-Null
@@ -196,6 +217,18 @@ if ($addonSource.Mode -eq "package") {
     }
 
     Copy-Item -LiteralPath $addonSource.SourcePath -Destination $addonsDir -Recurse -Force
+    $nestedBundle = Join-Path $targetDir "NH_bundle"
+    if (Test-Path -LiteralPath $nestedBundle -PathType Container) {
+        Remove-Item -LiteralPath $nestedBundle -Recurse -Force
+    }
+    $nestedTools = Join-Path $targetDir "tools"
+    if (Test-Path -LiteralPath $nestedTools -PathType Container) {
+        Remove-Item -LiteralPath $nestedTools -Recurse -Force
+    }
+    Copy-Item -LiteralPath $a3obSource -Destination (Join-Path $addonsDir "NH_bundle") -Recurse -Force
+    Copy-Item -LiteralPath $toolsSource -Destination (Join-Path $addonsDir "_nh_blender_tools") -Recurse -Force
+    Get-ChildItem -LiteralPath (Join-Path $addonsDir "NH_bundle") -Recurse -Force -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     Remove-AddonCaches -AddonsDir $addonsDir -AddonName $addonSource.Name
     $deployedTarget = $targetDir
 }
@@ -206,12 +239,21 @@ else {
     if (Test-Path -LiteralPath $toolsTargetDir) {
         Remove-Item -LiteralPath $toolsTargetDir -Recurse -Force
     }
+    if (Test-Path -LiteralPath $a3obTargetDir) {
+        Remove-Item -LiteralPath $a3obTargetDir -Recurse -Force
+    }
 
     Copy-Item -LiteralPath $addonSource.SourcePath -Destination $targetFile -Force
     Copy-Item -LiteralPath $toolsSource -Destination $toolsTargetDir -Recurse -Force
+    Copy-Item -LiteralPath $a3obSource -Destination $a3obTargetDir -Recurse -Force
     Get-ChildItem -LiteralPath $toolsTargetDir -Recurse -Force -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue |
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     Get-ChildItem -LiteralPath $toolsTargetDir -Recurse -Force -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Extension -in @(".pyc", ".pyo") } |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -LiteralPath $a3obTargetDir -Recurse -Force -Directory -Filter "__pycache__" -ErrorAction SilentlyContinue |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -LiteralPath $a3obTargetDir -Recurse -Force -File -ErrorAction SilentlyContinue |
         Where-Object { $_.Extension -in @(".pyc", ".pyo") } |
         Remove-Item -Force -ErrorAction SilentlyContinue
     Remove-AddonCaches -AddonsDir $addonsDir -AddonName $addonSource.Name
@@ -230,6 +272,7 @@ Write-Host "Deployed addon to: $deployedTarget"
 Write-Host "Addon mode: $($addonSource.Mode)"
 Write-Host "Addon entry: $($addonSource.EntryFile)"
 Write-Host "Bundled tools: $toolsSource"
+Write-Host "Bundled A3OB fallback: $a3obSource"
 Write-Host "Blender version path: $versionPath"
 Write-Host "Source hash: $sourceHash"
 Write-Host "Target hash: $targetHash"

@@ -1,7 +1,7 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Daryl and Enisam",
-    "version": (0, 5, 4, 7),
+    "version": (0, 5, 4, 11),
     "blender": (5, 1, 1),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "All-in-one Blender toolkit for porting and preparing DayZ/Arma assets: fixes, textures, colliders, proxies, snap points, and P3D workflow helpers.",    
@@ -17,7 +17,6 @@ from bpy.app.handlers import persistent
 from bpy.types import Operator, Panel, PropertyGroup, UIList, OperatorFileListElement, Menu
 from bpy.props import PointerProperty, StringProperty, FloatProperty, IntProperty, BoolProperty, EnumProperty, CollectionProperty
 from mathutils import Vector, Matrix
-from mathutils.geometry import tessellate_polygon
 import math
 import random
 import os
@@ -819,158 +818,7 @@ def _keymap_item_shortcut_label(kmi, default_shortcut=""):
     return "+".join(part for part in parts if part) or default_shortcut or "Unassigned"
 
 # ------------------------------------------------------------------------
-#  Brace helpers
-# ------------------------------------------------------------------------
-
-def _extract_block(src: str, brace_index: int):
-    depth = 1
-    i = brace_index + 1
-    n = len(src)
-    while i < n and depth > 0:
-        c = src[i]
-        if c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-        i += 1
-    if depth != 0:
-        raise RuntimeError("Unbalanced braces while parsing config")
-    return src[brace_index + 1 : i - 1], i
-
-
-def _find_class_block(src: str, class_name: str):
-    m = re.search(r"class\s+" + re.escape(class_name) + r"\b[^{]*{", src)
-    if not m:
-        return None
-    brace_index = src.find("{", m.start())
-    if brace_index == -1:
-        return None
-    body, _ = _extract_block(src, brace_index)
-    return body
-
-
-def _iter_inner_classes(block: str):
-    pos = 0
-    n = len(block)
-    while pos < n:
-        m = re.search(r"class\s+(\w+)[^{]*{", block[pos:])
-        if not m:
-            break
-        name = m.group(1)
-        brace_index = pos + m.end() - 1
-        body, new_pos = _extract_block(block, brace_index)
-        yield name, body
-        pos = new_pos
-
-
-# ------------------------------------------------------------------------
-#  Parsing DayZ .cpp
-# ------------------------------------------------------------------------
-
-def parse_dayz_config(path: str):
-    global CONFIG_SURFACES, CONFIG_CLUTTER
-
-    if not os.path.isfile(path):
-        raise RuntimeError(f"Config file not found: {path}")
-
-    with open(path, "r", encoding="utf-8", errors="ignore") as f:
-        text = f.read()
-
-    text = re.sub(r"//.*?$", "", text, flags=re.MULTILINE)
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
-
-    surfaces = {}
-    clutter = {}
-
-    cfgworlds_block = _find_class_block(text, "CfgWorlds")
-    if cfgworlds_block:
-        caworld_block = _find_class_block(cfgworlds_block, "CAWorld")
-        if caworld_block:
-            clutter_block = _find_class_block(caworld_block, "Clutter")
-            if clutter_block:
-                for c_name, c_body in _iter_inner_classes(clutter_block):
-                    m_model = re.search(r'model\s*=\s*"([^"]+)"', c_body)
-                    if not m_model:
-                        continue
-                    model_path = m_model.group(1)
-                    m_smin = re.search(r"scaleMin\s*=\s*([0-9.eE+-]+)", c_body)
-                    m_smax = re.search(r"scaleMax\s*=\s*([0-9.eE+-]+)", c_body)
-                    smin = float(m_smin.group(1)) if m_smin else 1.0
-                    smax = float(m_smax.group(1)) if m_smax else 1.0
-                    clutter[c_name] = {"model": model_path, "scaleMin": smin, "scaleMax": smax}
-
-    cfgsurf_block = _find_class_block(text, "CfgSurfaceCharacters")
-    if cfgsurf_block:
-        for s_name, s_body in _iter_inner_classes(cfgsurf_block):
-            m_prob = re.search(r"probability\s*\[\]\s*=\s*{([^}]*)}", s_body)
-            m_names = re.search(r"names\s*\[\]\s*=\s*{([^}]*)}", s_body, re.S)
-            if not (m_prob and m_names):
-                continue
-
-            probs_str = m_prob.group(1)
-            names_str = m_names.group(1)
-
-            probs = [p.strip() for p in probs_str.split(",") if p.strip()]
-            names = [n.strip().strip('"') for n in names_str.split(",") if n.strip()]
-
-            if len(probs) != len(names):
-                continue
-
-            probs_f = [float(p) for p in probs]
-            surfaces[s_name] = {"names": names, "probs": probs_f}
-
-    CONFIG_SURFACES = surfaces
-    CONFIG_CLUTTER = clutter
-
-
-def build_clutter_distribution(surface_name: str):
-    if surface_name not in CONFIG_SURFACES:
-        raise RuntimeError(f"Surface '{surface_name}' not found in CfgSurfaceCharacters")
-
-    s_def = CONFIG_SURFACES[surface_name]
-    names = s_def["names"]
-    probs = s_def["probs"]
-
-    used_names, used_probs, used_defs = [], [], {}
-    clutter_map_lc = {k.lower(): k for k in CONFIG_CLUTTER.keys()}
-
-    for n, p in zip(names, probs):
-        if p <= 0.0:
-            continue
-        key = clutter_map_lc.get(n.lower())
-        if key is None:
-            raise RuntimeError(
-                f"Clutter class '{n}' is referenced by surface '{surface_name}' "
-                f"but not found in CfgWorlds->CAWorld->Clutter"
-            )
-        c_def = CONFIG_CLUTTER[key]
-        model_path = (c_def.get("model") or "").strip()
-        if not model_path:
-            raise RuntimeError(f"Clutter class '{key}' has no 'model' defined")
-        used_names.append(n)
-        used_probs.append(p)
-        used_defs[n] = c_def
-
-    if not used_names:
-        raise RuntimeError(f"Surface '{surface_name}' has no clutter with non-zero probability")
-
-    total = sum(used_probs)
-    if total <= 0.0:
-        raise RuntimeError(f"Surface '{surface_name}' probabilities sum to zero")
-
-    norm_probs = [p / total for p in used_probs]
-    return used_names, norm_probs, used_defs
-
-
-def pick_weighted_random(names, probs, rng=None):
-    rng = rng or random
-    r = rng.random()
-    acc = 0.0
-    for n, p in zip(names, probs):
-        acc += p
-        if r <= acc:
-            return n
-    return names[-1]
+# (config block moved to utilities/dayz_config.py)
 
 def _resolve_scatter_edit_mesh_object(context):
     obj = getattr(context, "edit_object", None)
@@ -988,7 +836,10 @@ def _collect_selected_face_triangles_world(obj):
 
     bm = bmesh.from_edit_mesh(obj.data)
     world = obj.matrix_world
-    normal_matrix = world.to_3x3().inverted().transposed()
+    try:
+        normal_matrix = world.to_3x3().inverted_safe().transposed()
+    except Exception:
+        normal_matrix = Matrix.Identity(3)
     triangles = []
 
     for face in bm.faces:
@@ -1180,7 +1031,8 @@ def set_a3ob_proxy_properties(proxy_obj, model_path: str, proxy_index: int):
     proxy_name = _proxy_name_from_a3ob_props(pg, arma_path, proxy_index)
     proxy_obj.name = proxy_name
     if getattr(proxy_obj, "data", None) is not None:
-        proxy_obj.data.name = proxy_name
+        if str(getattr(proxy_obj.data, "name", "") or "") != _PROXY_MESH_NAME:
+            proxy_obj.data.name = proxy_name
     try:
         proxy_obj.display_type = "WIRE"
         proxy_obj.show_name = True
@@ -1217,6 +1069,13 @@ def create_proxy_object(context, collection, parent_obj, location: Vector, norma
 
     collection.objects.link(proxy_obj)
     proxy_obj.parent = parent_obj
+    try:
+        proxy_obj.matrix_parent_inverse = parent_obj.matrix_world.inverted_safe()
+    except Exception:
+        try:
+            proxy_obj.matrix_parent_inverse = Matrix.Identity(4)
+        except Exception:
+            pass
     try:
         proxy_obj[_SCATTER_PROXY_TAG_PROP] = True
     except Exception:
@@ -1277,7 +1136,7 @@ def _repair_mojibake_text(text):
         return original
 
     def _score(value):
-        marker_count = sum(value.count(marker) for marker in ("Р", "С", "Ð", "Ñ", "�"))
+        marker_count = sum(value.count(marker) for marker in ("Р ", "РЎ", "Гђ", "Г‘", "пїЅ"))
         cyrillic_count = sum(1 for ch in value if "\u0400" <= ch <= "\u04ff")
         return marker_count * 4 - cyrillic_count
 
@@ -1606,21 +1465,21 @@ class CRAY_PG_ModelSplitSettings(PropertyGroup):
     )
     grid_cell_size_x: FloatProperty(
         name="Cell Size X",
-        description="Cutter cube size along local X",
+        description="Legacy cutter size along X; line split uses Parts X/Y count",
         default=10.0,
         min=0.001,
         soft_min=0.001,
     )
     grid_cell_size_y: FloatProperty(
         name="Cell Size Y",
-        description="Cutter cube size along local Y",
+        description="Legacy cutter size along Y; line split uses Parts X/Y count",
         default=10.0,
         min=0.001,
         soft_min=0.001,
     )
     grid_cell_size_z: FloatProperty(
         name="Cell Size Z",
-        description="Cutter cube size along local Z",
+        description="Legacy cutter size along Z; not used by line grid split",
         default=10.0,
         min=0.001,
         soft_min=0.001,
@@ -2948,17 +2807,17 @@ class CRAY_PG_UIPanelSettings(PropertyGroup):
     order_texture_replace: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["texture_replace"], min=1, update=_on_ui_panel_layout_setting_changed)
     order_cache_manager: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["cache_manager"], min=1, update=_on_ui_panel_layout_setting_changed)
     order_object_builder: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["object_builder"], min=1, update=_on_ui_panel_layout_setting_changed)
-    show_snap_points: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
-    show_asset_library: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
-    show_fixes: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
-    show_import_export: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
-    show_model_split: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
-    show_texture_replace: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
-    show_collider: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
-    show_geometry_lods: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
-    show_object_builder: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=False, update=_on_ui_panel_layout_setting_changed)
-    show_cache_manager: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
-    show_custom_keybinds: BoolProperty(name="Custom Keybinds", description="Показывать список кастомных хоткеев аддона", default=False, update=_on_ui_panel_layout_setting_changed)
+    show_snap_points: BoolProperty(name="Show", description="РџРѕРєР°Р·С‹РІР°С‚СЊ РёР»Рё СЃРєСЂС‹РІР°С‚СЊ СЌС‚Рѕ РјРµРЅСЋ РІ РїР°РЅРµР»Рё NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_asset_library: BoolProperty(name="Show", description="РџРѕРєР°Р·С‹РІР°С‚СЊ РёР»Рё СЃРєСЂС‹РІР°С‚СЊ СЌС‚Рѕ РјРµРЅСЋ РІ РїР°РЅРµР»Рё NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_fixes: BoolProperty(name="Show", description="РџРѕРєР°Р·С‹РІР°С‚СЊ РёР»Рё СЃРєСЂС‹РІР°С‚СЊ СЌС‚Рѕ РјРµРЅСЋ РІ РїР°РЅРµР»Рё NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_import_export: BoolProperty(name="Show", description="РџРѕРєР°Р·С‹РІР°С‚СЊ РёР»Рё СЃРєСЂС‹РІР°С‚СЊ СЌС‚Рѕ РјРµРЅСЋ РІ РїР°РЅРµР»Рё NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_model_split: BoolProperty(name="Show", description="РџРѕРєР°Р·С‹РІР°С‚СЊ РёР»Рё СЃРєСЂС‹РІР°С‚СЊ СЌС‚Рѕ РјРµРЅСЋ РІ РїР°РЅРµР»Рё NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_texture_replace: BoolProperty(name="Show", description="РџРѕРєР°Р·С‹РІР°С‚СЊ РёР»Рё СЃРєСЂС‹РІР°С‚СЊ СЌС‚Рѕ РјРµРЅСЋ РІ РїР°РЅРµР»Рё NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_collider: BoolProperty(name="Show", description="РџРѕРєР°Р·С‹РІР°С‚СЊ РёР»Рё СЃРєСЂС‹РІР°С‚СЊ СЌС‚Рѕ РјРµРЅСЋ РІ РїР°РЅРµР»Рё NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_geometry_lods: BoolProperty(name="Show", description="РџРѕРєР°Р·С‹РІР°С‚СЊ РёР»Рё СЃРєСЂС‹РІР°С‚СЊ СЌС‚Рѕ РјРµРЅСЋ РІ РїР°РЅРµР»Рё NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_object_builder: BoolProperty(name="Show", description="РџРѕРєР°Р·С‹РІР°С‚СЊ РёР»Рё СЃРєСЂС‹РІР°С‚СЊ СЌС‚Рѕ РјРµРЅСЋ РІ РїР°РЅРµР»Рё NH Plugin", default=False, update=_on_ui_panel_layout_setting_changed)
+    show_cache_manager: BoolProperty(name="Show", description="РџРѕРєР°Р·С‹РІР°С‚СЊ РёР»Рё СЃРєСЂС‹РІР°С‚СЊ СЌС‚Рѕ РјРµРЅСЋ РІ РїР°РЅРµР»Рё NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_custom_keybinds: BoolProperty(name="Custom Keybinds", description="РџРѕРєР°Р·С‹РІР°С‚СЊ СЃРїРёСЃРѕРє РєР°СЃС‚РѕРјРЅС‹С… С…РѕС‚РєРµРµРІ Р°РґРґРѕРЅР°", default=False, update=_on_ui_panel_layout_setting_changed)
 
 
 class CRAY_OT_MoveUIPanelLayoutItem(Operator):
@@ -3223,6 +3082,23 @@ _A3OB_IMPORT_CANDIDATES = (
     ("import_scene.a3ob_p3d", ("filepath",)),
     ("import_scene.a3ob_model", ("filepath",)),
     ("a3ob.import_model", ("filepath",)),
+    (
+        "nh.import_p3d",
+        (
+            "filepath",
+            "first_lod_only",
+            "absolute_paths",
+            "enclose",
+            "groupby",
+            "additional_data_allowed",
+            "additional_data",
+            "validate_meshes",
+            "proxy_action",
+            "translate_selections",
+            "cleanup_empty_selections",
+            "load_textures",
+        ),
+    ),
 )
 
 _A3OB_EXPORT_CANDIDATES = (
@@ -3249,6 +3125,27 @@ _A3OB_EXPORT_CANDIDATES = (
     ),
     ("export_scene.a3ob_p3d", ("filepath", "use_selection")),
     ("a3ob.export_model", ("filepath", "use_selection")),
+    (
+        "nh.export_p3d",
+        (
+            "filepath",
+            "use_selection",
+            "visible_only",
+            "relative_paths",
+            "preserve_normals",
+            "validate_meshes",
+            "apply_transforms",
+            "apply_modifiers",
+            "sort_sections",
+            "lod_collisions",
+            "validate_lods",
+            "validate_lods_warning_errors",
+            "generate_components",
+            "renumber_components",
+            "translate_selections",
+            "force_lowercase",
+        ),
+    ),
 )
 
 _A3OB_IMPORT_READ_FILE_PATCHES = []
@@ -3264,7 +3161,14 @@ def _op_handle(op_idname: str):
     mod_obj = getattr(bpy.ops, mod, None)
     if mod_obj is None:
         return None
-    return getattr(mod_obj, op, None)
+    fn = getattr(mod_obj, op, None)
+    if fn is None:
+        return None
+    try:
+        fn.get_rna_type()
+    except Exception:
+        return None
+    return fn
 
 def _has_any_a3ob_import_ops():
     return any(_op_handle(op) is not None for op, _ in _A3OB_IMPORT_CANDIDATES)
@@ -3273,6 +3177,142 @@ def _has_any_a3ob_io_ops():
     has_import = _has_any_a3ob_import_ops()
     has_export = any(_op_handle(op) is not None for op, _ in _A3OB_EXPORT_CANDIDATES)
     return has_import and has_export
+
+
+_A3OB_BUNDLE_REGISTRY = {
+    "registered": False,
+    "props_modules": [],
+    "ops_classes": [],
+}
+
+
+def _has_original_a3ob_addon():
+    if _op_handle("a3ob.import_p3d") is not None or _op_handle("a3ob.export_p3d") is not None:
+        return True
+    try:
+        return "bl_ext.user_default.Arma3ObjectBuilder" in sys.modules
+    except Exception:
+        return False
+
+
+def _import_bundled_a3ob_module(module_name: str):
+    try:
+        return importlib.import_module(module_name)
+    except Exception as e:
+        print(f"[NH Plugin] bundled A3OB module import failed: {module_name}: {_fmt_exc(e)}")
+        return None
+
+
+def _ensure_a3ob_bundle_registered():
+    """Register the embedded A3OB codec fallback when the original add-on is absent.
+
+    Registers:
+    - A3OB object/material/scene property groups (classes renamed NHA3_* to avoid
+      RNA identifier collisions if the original add-on is enabled later)
+    - nh.import_p3d / nh.export_p3d wrapper operators that use the
+      embedded codec, plus a .p3d file handler.
+    """
+    reg = _A3OB_BUNDLE_REGISTRY
+    if reg["registered"]:
+        return True
+    if _has_original_a3ob_addon():
+        return False
+
+    prop_obj = _import_bundled_a3ob_module("Arma3ObjectBuilder.props.object")
+    prop_mat = _import_bundled_a3ob_module("Arma3ObjectBuilder.props.material")
+    prop_scn = _import_bundled_a3ob_module("Arma3ObjectBuilder.props.scene")
+    ui_mod = _import_bundled_a3ob_module("Arma3ObjectBuilder.ui.import_export_p3d")
+    ui_mesh_mod = _import_bundled_a3ob_module("Arma3ObjectBuilder.ui.props_object_mesh")
+    ui_mat_mod = _import_bundled_a3ob_module("Arma3ObjectBuilder.ui.props_material")
+    if prop_obj is None or prop_mat is None or prop_scn is None or ui_mod is None:
+        return False
+
+    new_prop_modules = []
+    new_ui_modules = []
+    try:
+        for mod, existing_attr in (
+            (prop_obj, hasattr(bpy.types.Object, "a3ob_properties_object")),
+            (prop_mat, hasattr(bpy.types.Material, "a3ob_properties_material")),
+            (prop_scn, hasattr(bpy.types.Scene, "a3ob_outliner")),
+        ):
+            if existing_attr:
+                continue
+            mod.register()
+            new_prop_modules.append(mod)
+    except Exception as e:
+        for mod in reversed(new_prop_modules):
+            try:
+                mod.unregister()
+            except Exception:
+                pass
+        print(f"[NH Plugin] failed to register bundled A3OB property groups: {_fmt_exc(e)}")
+        return False
+
+    try:
+        for mod in (ui_mesh_mod, ui_mat_mod):
+            if mod is None:
+                continue
+            mod.register()
+            new_ui_modules.append(mod)
+    except Exception as e:
+        for mod in reversed(new_ui_modules):
+            try:
+                mod.unregister()
+            except Exception:
+                pass
+        for mod in reversed(new_prop_modules):
+            try:
+                mod.unregister()
+            except Exception:
+                pass
+        print(f"[NH Plugin] failed to register bundled A3OB UI panels: {_fmt_exc(e)}")
+        return False
+
+    new_op_classes = []
+    try:
+        if ui_mod is not None and callable(getattr(ui_mod, "register", None)):
+            ui_mod.register()
+            new_ui_modules.append(ui_mod)
+    except Exception as e:
+        for mod in reversed(new_ui_modules):
+            try:
+                mod.unregister()
+            except Exception:
+                pass
+        for mod in reversed(new_prop_modules):
+            try:
+                mod.unregister()
+            except Exception:
+                pass
+        print(f"[NH Plugin] failed to register bundled A3OB operators: {_fmt_exc(e)}")
+        return False
+
+    reg["registered"] = True
+    reg["props_modules"] = new_prop_modules
+    reg["ui_modules"] = new_ui_modules
+    reg["ops_classes"] = new_op_classes
+    print("[NH Plugin] A3OB bundled fallback registered (P3D codec + property groups + UI panels)")
+    return True
+
+
+def _unregister_a3ob_bundle():
+    reg = _A3OB_BUNDLE_REGISTRY
+    if not reg["registered"]:
+        return
+    for mod in reversed(reg.get("ui_modules", [])):
+        try:
+            mod.unregister()
+        except Exception:
+            pass
+    for mod in reversed(reg["props_modules"]):
+        try:
+            mod.unregister()
+        except Exception:
+            pass
+    reg["props_modules"] = []
+    reg["ui_modules"] = []
+    reg["ops_classes"] = []
+    reg["registered"] = False
 
 
 def _iter_file_handler_subclasses(base_cls):
@@ -3303,7 +3343,13 @@ def _iter_a3ob_p3d_file_handlers():
             continue
         if ".p3d" not in extensions:
             continue
-        if import_operator.startswith("a3ob.") or cls.__name__ == "A3OB_FH_import_p3d":
+        if (
+            import_operator.startswith("a3ob.")
+            or import_operator.startswith("cray.a3ob_")
+            or import_operator.startswith("nh.")
+            or cls.__name__ == "A3OB_FH_import_p3d"
+            or cls.__name__ == "NH_FH_import_p3d"
+        ):
             yield cls
 
 
@@ -3814,16 +3860,6 @@ def _is_a3ob_lod_root_object(obj) -> bool:
         return False
     try:
         return bool(getattr(obj.a3ob_properties_object, "is_a3_lod", False))
-    except Exception:
-        return False
-
-def _is_a3ob_proxy_object(obj) -> bool:
-    if obj is None or obj.type != "MESH":
-        return False
-    if not hasattr(obj, "a3ob_properties_object_proxy"):
-        return False
-    try:
-        return bool(getattr(obj.a3ob_properties_object_proxy, "is_a3_proxy", False))
     except Exception:
         return False
 
@@ -4698,10 +4734,18 @@ def _collect_a3ob_lod_export_diagnostics(context, source_obj, force_all_lods: bo
         return ["ERROR: A3OB export diagnostics are unavailable (module API not found)"]
 
     temp_collection = None
+    source_had_edit_mode = False
     lines = []
     operator = _make_a3ob_export_diagnostic_operator(force_all_lods)
     try:
         temp_collection = export_mod.create_temp_collection(context)
+        source_had_edit_mode = getattr(source_obj, "mode", "") == "EDIT"
+        if source_had_edit_mode:
+            try:
+                _deselect_all_in_view_layer(context)
+                _select_object_in_view_layer(context, source_obj, active=True)
+            except Exception:
+                pass
         if getattr(source_obj, "mode", "OBJECT") != "OBJECT":
             try:
                 bpy.ops.object.mode_set(mode="OBJECT")
@@ -4768,6 +4812,14 @@ def _collect_a3ob_lod_export_diagnostics(context, source_obj, force_all_lods: bo
         if temp_collection is not None:
             try:
                 export_mod.cleanup_temp_collection(temp_collection)
+            except Exception:
+                pass
+        if source_had_edit_mode and _is_live_blender_object_exp(source_obj):
+            try:
+                if context.mode == "OBJECT":
+                    _deselect_all_in_view_layer(context)
+                    _select_object_in_view_layer(context, source_obj, active=True)
+                    bpy.ops.object.mode_set(mode="EDIT")
             except Exception:
                 pass
 
@@ -5523,7 +5575,7 @@ def _set_p3d_visual_collection_visibility(context, *, visuals_only: bool):
 class CRAY_OT_SnapSetP3DVisualsOnly(Operator):
     bl_idname = "cray.snap_set_p3d_visuals_only"
     bl_label = "Visual 0 Only"
-    bl_description = "Показывает только Resolution 0 в Visuals и оставляет видимыми Point clouds внутри каждой .p3d коллекции"
+    bl_description = "РџРѕРєР°Р·С‹РІР°РµС‚ С‚РѕР»СЊРєРѕ Resolution 0 РІ Visuals Рё РѕСЃС‚Р°РІР»СЏРµС‚ РІРёРґРёРјС‹РјРё Point clouds РІРЅСѓС‚СЂРё РєР°Р¶РґРѕР№ .p3d РєРѕР»Р»РµРєС†РёРё"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -5541,7 +5593,7 @@ class CRAY_OT_SnapSetP3DVisualsOnly(Operator):
 class CRAY_OT_SnapShowAllP3DCollections(Operator):
     bl_idname = "cray.snap_show_all_p3d_collections"
     bl_label = "Show All"
-    bl_description = "Показывает все ветки и объекты внутри каждой .p3d коллекции"
+    bl_description = "РџРѕРєР°Р·С‹РІР°РµС‚ РІСЃРµ РІРµС‚РєРё Рё РѕР±СЉРµРєС‚С‹ РІРЅСѓС‚СЂРё РєР°Р¶РґРѕР№ .p3d РєРѕР»Р»РµРєС†РёРё"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -5556,7 +5608,7 @@ class CRAY_OT_SnapShowAllP3DCollections(Operator):
 class CRAY_OT_EnsureMemoryLOD(Operator):
     bl_idname = "cray.ensure_memory_lod"
     bl_label = "Create/Find Point clouds > Memory"
-    bl_description = "Находит или создаёт Point clouds > Memory для выбранных A Target и V Target; если цели не выбраны, готовит Memory для всех .p3d коллекций сцены"
+    bl_description = "РќР°С…РѕРґРёС‚ РёР»Рё СЃРѕР·РґР°С‘С‚ Point clouds > Memory РґР»СЏ РІС‹Р±СЂР°РЅРЅС‹С… A Target Рё V Target; РµСЃР»Рё С†РµР»Рё РЅРµ РІС‹Р±СЂР°РЅС‹, РіРѕС‚РѕРІРёС‚ Memory РґР»СЏ РІСЃРµС… .p3d РєРѕР»Р»РµРєС†РёР№ СЃС†РµРЅС‹"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -5610,7 +5662,7 @@ class CRAY_OT_CreateSnapPairFromModelEdge(Operator):
     bl_idname = "cray.create_snap_pair_from_model_edge"
     bl_label = "Create Snap Points"
     bl_description = (
-        "Копирует 2 выделенные вершины из Edit Mode в Point clouds > Memory выбранных A Target и V Target, создавая пары .sp_a/.sp_v по текущему шаблону имени"
+        "РљРѕРїРёСЂСѓРµС‚ 2 РІС‹РґРµР»РµРЅРЅС‹Рµ РІРµСЂС€РёРЅС‹ РёР· Edit Mode РІ Point clouds > Memory РІС‹Р±СЂР°РЅРЅС‹С… A Target Рё V Target, СЃРѕР·РґР°РІР°СЏ РїР°СЂС‹ .sp_a/.sp_v РїРѕ С‚РµРєСѓС‰РµРјСѓ С€Р°Р±Р»РѕРЅСѓ РёРјРµРЅРё"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -5690,6 +5742,11 @@ class CRAY_OT_SnapBatchProcess(Operator):
             try:
                 if os.path.exists(bak_path) and not ss.batch_overwrite_bak:
                     bak_path = filepath + ".bak.prev"
+                    if os.path.exists(bak_path):
+                        prev2_path = filepath + ".bak.prev2"
+                        if os.path.exists(prev2_path):
+                            os.remove(prev2_path)
+                        shutil.move(bak_path, prev2_path)
                 shutil.copy2(filepath, bak_path)
                 backup_count += 1
             except Exception as e:
@@ -6131,7 +6188,8 @@ def _set_collider_settings_object(context, attr_name, obj):
     try:
         if current == obj:
             setattr(cs, attr_name, None)
-        setattr(cs, attr_name, obj)
+        else:
+            setattr(cs, attr_name, obj)
     except Exception:
         pass
 
@@ -7222,6 +7280,7 @@ def _append_world_vertices_to_object(target_obj, world_points):
                 continue
 
         bm.verts.ensure_lookup_table()
+        bm.verts.index_update()
         new_indices = [vert.index for vert in new_verts if vert.is_valid]
         if not new_indices:
             raise RuntimeError("Selected vertices already exist in Geometry")
@@ -7266,6 +7325,7 @@ def _duplicate_selected_verts_as_loose_points_in_edit_object(target_obj):
 
     bm.select_flush_mode()
     bmesh.update_edit_mesh(mesh, loop_triangles=False, destructive=True)
+    bm.verts.index_update()
     return [vert.index for vert in new_verts if vert.is_valid]
 
 
@@ -7340,8 +7400,9 @@ def _append_selected_faces_to_object(target_obj, source_obj, recalc_normals=True
         if not created_faces:
             raise RuntimeError("Could not copy selected polygons to Roadway")
 
-        if weld_distance > 0.0 and bm.verts:
-            bmesh.ops.remove_doubles(bm, verts=list(bm.verts), dist=weld_distance)
+        if weld_distance > 0.0 and created_faces:
+            weld_verts = list({vert for face in created_faces if face.is_valid for vert in face.verts})
+            bmesh.ops.remove_doubles(bm, verts=weld_verts, dist=weld_distance)
             bm.verts.ensure_lookup_table()
             bm.faces.ensure_lookup_table()
             created_faces = [face for face in created_faces if face.is_valid]
@@ -7450,19 +7511,6 @@ def _activate_object_vertex_edit(context, obj, selected_indices=None):
             if 0 <= idx < len(bm.verts):
                 bm.verts[idx].select = True
     bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
-
-
-def _activate_object_edit_mode(context, obj, select_mode="VERT"):
-    if obj is None or obj.type != "MESH":
-        raise RuntimeError("Target object must be a mesh")
-
-    if context.mode != "OBJECT":
-        bpy.ops.object.mode_set(mode="OBJECT")
-
-    _deselect_all_in_view_layer(context)
-    _select_object_in_view_layer(context, obj, active=True)
-    bpy.ops.object.mode_set(mode="EDIT")
-    bpy.ops.mesh.select_mode(type=select_mode)
 
 
 def _build_convex_hull_from_loose_geometry_verts(context, target_obj, merge_distance=0.0, recalc_normals=True):
@@ -8311,51 +8359,6 @@ def _append_fake_terrain_component(world_vertices, faces, hull_xy, plane, thickn
     return True
 
 
-def _dedupe_fake_terrain_mesh_vertices(world_vertices, faces, precision=5):
-    if not world_vertices or not faces:
-        return world_vertices, faces
-
-    vertex_map = {}
-    remap = {}
-    deduped_vertices = []
-    for old_index, point in enumerate(world_vertices):
-        key = (
-            round(float(point.x), precision),
-            round(float(point.y), precision),
-            round(float(point.z), precision),
-        )
-        new_index = vertex_map.get(key)
-        if new_index is None:
-            new_index = len(deduped_vertices)
-            vertex_map[key] = new_index
-            deduped_vertices.append(point.copy())
-        remap[old_index] = new_index
-
-    deduped_faces = []
-    seen_faces = set()
-    for face in faces:
-        remapped = []
-        for old_index in face:
-            new_index = remap.get(int(old_index))
-            if new_index is None:
-                continue
-            if remapped and remapped[-1] == new_index:
-                continue
-            remapped.append(new_index)
-        if len(remapped) > 1 and remapped[0] == remapped[-1]:
-            remapped.pop()
-        if len(set(remapped)) < 3:
-            continue
-        face_key = tuple(remapped)
-        reverse_key = tuple(reversed(remapped))
-        if face_key in seen_faces or reverse_key in seen_faces:
-            continue
-        seen_faces.add(face_key)
-        deduped_faces.append(tuple(remapped))
-
-    return deduped_vertices, deduped_faces
-
-
 
 
 
@@ -8373,7 +8376,6 @@ def _build_fake_terrain_mesh_from_triangles(
     depression_error,
     hill_error,
     thickness,
-    existing_footprint_bboxes=None,
 ):
     if not triangles:
         raise RuntimeError("No matching source faces found for fake terrain")
@@ -8409,13 +8411,12 @@ def _build_fake_terrain_mesh_from_triangles(
 
     world_vertices = []
     faces = []
-    occupied_bboxes = list(existing_footprint_bboxes or [])
+    occupied_bboxes = []
     stats = {
         "components": 0,
         "source_tris": len(triangles),
         "split_cells": 0,
         "max_depth": 0,
-        "existing_footprints": len(occupied_bboxes),
         "skipped_existing": 0,
         "build_mode": "GRID_PATCHES",
     }
@@ -8551,6 +8552,7 @@ class CRAY_OT_GenerateFakeTerrainGeometry(Operator):
             self.report({"ERROR"}, err)
             return {"CANCELLED"}
 
+        source_was_edit = False
         try:
             source_was_edit = getattr(source_obj, "mode", "") == "EDIT"
             source_tris, matched_faces, source_objects = _collect_fake_terrain_edit_selection_triangles(
@@ -8560,7 +8562,6 @@ class CRAY_OT_GenerateFakeTerrainGeometry(Operator):
             )
             if context.mode != "OBJECT":
                 bpy.ops.object.mode_set(mode="OBJECT")
-
             target_obj = _ensure_collider_lod_object(
                 context,
                 source_obj,
@@ -8594,7 +8595,6 @@ class CRAY_OT_GenerateFakeTerrainGeometry(Operator):
                 source_objects=source_objects,
                 data_items=source_tris,
             )
-            existing_footprints = []
             world_vertices, faces, build_stats = _build_fake_terrain_mesh_from_triangles(
                 source_tris,
                 patch_size=cs.fake_terrain_patch_size,
@@ -8602,7 +8602,6 @@ class CRAY_OT_GenerateFakeTerrainGeometry(Operator):
                 depression_error=cs.fake_terrain_depression_error,
                 hill_error=cs.fake_terrain_hill_error,
                 thickness=cs.fake_terrain_thickness,
-                existing_footprint_bboxes=existing_footprints,
             )
             if not world_vertices or not faces:
                 self.report(
@@ -8638,7 +8637,6 @@ class CRAY_OT_GenerateFakeTerrainGeometry(Operator):
                     "target_lod": actual_target_lod,
                     "material_name": material_name,
                     "components": build_stats.get("components", 0),
-                    "existing_footprints": build_stats.get("existing_footprints", 0),
                     "skipped_existing": build_stats.get("skipped_existing", 0),
                     "matched_faces": matched_faces,
                     "source_tris": build_stats.get("source_tris", 0),
@@ -8652,6 +8650,10 @@ class CRAY_OT_GenerateFakeTerrainGeometry(Operator):
 
             _restore_collider_exp_source_context_exp(context, source_obj, restore_edit_mode=source_was_edit)
         except Exception as e:
+            try:
+                _restore_collider_exp_source_context_exp(context, source_obj, restore_edit_mode=source_was_edit)
+            except Exception:
+                pass
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
 
@@ -8708,6 +8710,7 @@ class CRAY_OT_CopySelectedVertsToGeometry(Operator):
         )
         _set_collider_settings_object(context, "geometry_object", target_obj)
 
+        source_was_edit = context.mode == "EDIT"
         try:
             if target_obj == source_obj and source_obj.mode == "EDIT":
                 added_indices = _duplicate_selected_verts_as_loose_points_in_edit_object(target_obj)
@@ -8719,6 +8722,13 @@ class CRAY_OT_CopySelectedVertsToGeometry(Operator):
                 added_indices = _append_world_vertices_to_object(target_obj, world_points)
                 _activate_object_vertex_edit(context, target_obj, added_indices)
         except Exception as e:
+            try:
+                if source_was_edit and context.mode == "OBJECT":
+                    _deselect_all_in_view_layer(context)
+                    _select_object_in_view_layer(context, source_obj, active=True)
+                    bpy.ops.object.mode_set(mode="EDIT")
+            except Exception:
+                pass
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
 
@@ -10320,7 +10330,8 @@ def _set_collider_exp_settings_object_exp(context, obj):
     try:
         if getattr(es, "geometry_object", None) == obj:
             es.geometry_object = None
-        es.geometry_object = obj
+        else:
+            es.geometry_object = obj
     except Exception:
         pass
 
@@ -12504,7 +12515,7 @@ def _delete_collider_exp_vertices_exp(target_obj, vertex_indices):
         bm.from_mesh(mesh)
         bm.verts.ensure_lookup_table()
         wanted = {int(idx) for idx in vertex_indices if isinstance(idx, int) or str(idx).isdigit()}
-        verts = [bm.verts[idx] for idx in wanted if 0 <= idx < len(bm.verts)]
+        verts = [bm.verts[idx] for idx in wanted if 0 <= idx < len(bm.verts) and bm.verts[idx].is_valid]
         if not verts:
             raise RuntimeError("Stored experimental collider vertices are no longer available")
         bmesh.ops.delete(bm, geom=verts, context="VERTS")
@@ -13747,10 +13758,8 @@ def _pipe_inner_factor_for_data_exp(data, axis_a, axis_b, radius_a, radius_b, op
             inner_factor = configured_inner / avg_radius
     elif inferred_inner > 0.0:
         inner_factor = inferred_inner
-    elif configured_inner <= 0.98:
-        inner_factor = configured_inner
     else:
-        inner_factor = configured_inner / avg_radius
+        inner_factor = 0.0
     inner_factor = max(0.0, min(inner_factor, 0.98))
     return min(inner_factor, max(0.0, 1.0 - (thickness / avg_radius)))
 
@@ -14329,8 +14338,7 @@ def _capsule_mesh_from_data_exp(data, op):
     for idx in range(1, cap_rings + 1):
         phi = -math.pi * 0.5 + (math.pi * 0.5) * (idx / cap_rings)
         rings.append((max(math.cos(phi), 0.0), -body_half + math.sin(phi) * cap_z))
-    if body_half > 1e-8:
-        rings.append((1.0, body_half))
+    rings.append((1.0, body_half))
     for idx in range(1, cap_rings + 1):
         phi = (math.pi * 0.5) * (idx / cap_rings)
         rings.append((max(math.cos(phi), 0.0), body_half + math.sin(phi) * cap_z))
@@ -15016,6 +15024,7 @@ class CRAY_OT_CreateCylinderGuideColliderExp(Operator):
         if settings is None:
             return {"CANCELLED"}
         source_was_edit = False
+        source_obj = None
         try:
             target_obj, source_obj, data_items = _prepare_collider_exp_scope_build_exp(
                 context,
@@ -15046,6 +15055,10 @@ class CRAY_OT_CreateCylinderGuideColliderExp(Operator):
                 _merge_collider_exp_stats_exp(stats, part_stats)
             _restore_collider_exp_source_context_exp(context, source_obj, restore_edit_mode=source_was_edit)
         except Exception as e:
+            try:
+                _restore_collider_exp_source_context_exp(context, source_obj, restore_edit_mode=source_was_edit)
+            except Exception:
+                pass
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
 
@@ -15129,6 +15142,7 @@ class CRAY_OT_CreatePipeGuideColliderExp(Operator):
         if settings is None:
             return {"CANCELLED"}
         source_was_edit = False
+        source_obj = None
         try:
             target_obj, source_obj, data_items = _prepare_collider_exp_scope_build_exp(
                 context,
@@ -15159,6 +15173,10 @@ class CRAY_OT_CreatePipeGuideColliderExp(Operator):
                 _merge_collider_exp_stats_exp(stats, part_stats)
             _restore_collider_exp_source_context_exp(context, source_obj, restore_edit_mode=source_was_edit)
         except Exception as e:
+            try:
+                _restore_collider_exp_source_context_exp(context, source_obj, restore_edit_mode=source_was_edit)
+            except Exception:
+                pass
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
 
@@ -15287,6 +15305,10 @@ class CRAY_OT_GenerateCylinderBoxesColliderExp(Operator):
                 _remove_collider_exp_guide_after_conversion_exp(context, source_obj)
             _restore_collider_exp_source_context_exp(context, restore_obj, restore_edit_mode=restore_edit)
         except Exception as e:
+            try:
+                _restore_collider_exp_source_context_exp(context, restore_obj, restore_edit_mode=restore_edit)
+            except Exception:
+                pass
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
 
@@ -15408,6 +15430,10 @@ class CRAY_OT_GeneratePipeBoxesColliderExp(Operator):
                 _remove_collider_exp_guide_after_conversion_exp(context, source_obj)
             _restore_collider_exp_source_context_exp(context, restore_obj, restore_edit_mode=restore_edit)
         except Exception as e:
+            try:
+                _restore_collider_exp_source_context_exp(context, restore_obj, restore_edit_mode=restore_edit)
+            except Exception:
+                pass
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
 
@@ -16083,9 +16109,6 @@ def _unique_ci(values):
         seen.add(key)
         out.append(s)
     return out
-
-def _strip_blender_numeric_suffix(value: str) -> str:
-    return re.sub(r"\.\d{3,}$", "", str(value or "").strip())
 
 def _candidate_base_no_ext(name_or_path: str) -> str:
     s = _strip_blender_numeric_suffix(_norm_path(str(name_or_path or "")))
@@ -16942,11 +16965,13 @@ class Stage7
 """
 
 def _generate_dayz_super_rvmat(base_path, co_path=None, nohq_path=None, smdi_path=None, target_root=None, warnings=None):
-    del co_path
     target_root = target_root or os.path.dirname(base_path)
     nohq_texture = (
         _to_dayz_relative_texture_path(nohq_path, target_root, warnings=warnings)
-        if nohq_path else _TEX_EXPORT_NOHQ_FALLBACK
+        if nohq_path else (
+            _to_dayz_relative_texture_path(co_path, target_root, warnings=warnings)
+            if co_path else _TEX_EXPORT_NOHQ_FALLBACK
+        )
     )
     smdi_texture = (
         _to_dayz_relative_texture_path(smdi_path, target_root, warnings=warnings)
@@ -16962,7 +16987,9 @@ def _generate_dayz_super_rvmat(base_path, co_path=None, nohq_path=None, smdi_pat
 def _tex_export_should_write(path: str, settings) -> bool:
     if bool(getattr(settings, "export_overwrite_existing", False)):
         return True
-    return not os.path.exists(path)
+    if bool(getattr(settings, "export_only_missing", True)):
+        return not os.path.exists(path)
+    return True
 
 def _tex_export_existing_preferred(png_path: str, paa_path: str, prefer_paa: bool):
     if prefer_paa and os.path.isfile(paa_path):
@@ -17386,11 +17413,13 @@ def _convert_dds_to_png_blender(dds_path: str, output_png: str, mode: str, event
     return output_png
 
 def _convert_dds_to_png_export(dds_path, output_png, mode, settings, events=None, material_base=""):
-    requested = "BUILTIN_PYTHON"
+    requested = str(getattr(settings, "dds_backend", "BUILTIN_PYTHON") or "BUILTIN_PYTHON")
     label = f"{material_base}: {mode}" if material_base else mode
     errors = []
 
-    backends = ["BUILTIN_PYTHON"]
+    backends = [requested] if requested in _TEX_EXPORT_DDS_BACKEND_LABELS else ["BUILTIN_PYTHON"]
+    if backends == [requested] and requested == "AUTO":
+        backends = ["BUILTIN_PYTHON"]
 
     _tex_export_log_event(
         events,
@@ -19600,6 +19629,79 @@ def _find_existing_paa_preview_image(filepath: str, color_space: str):
 
     return None
 
+def _flatten_image_channels(mip, width: int, height: int, channels: int = 4):
+    """Convert a PAA mip buffer to a flat row-major interleaved float list for image.pixels.
+
+    Accepts flat interleaved buffers, row-major rows of raw bytes/ints, and rows of pixel
+    tuples (RGBA/RGB), normalizing 0-255 values to 0-1 floats. Falls back to simple
+    type-shape detection so images are never transposed or channel-garbled.
+    """
+    data = getattr(mip, "data", None)
+    if data is None:
+        width, height = int(width or 1), int(height or 1)
+        return [0.0] * (width * height * channels)
+    try:
+        total = width * height * channels
+        values = []
+
+        def _norm_num(v):
+            try:
+                f = float(v)
+            except Exception:
+                return 0.0
+            return f / 255.0 if f > 1.5 else f
+
+        if isinstance(data, (bytes, bytearray)):
+            raw = data
+        else:
+            try:
+                seq = list(data)
+            except Exception:
+                seq = []
+            if seq and not isinstance(seq[0], (bytes, bytearray)) and not isinstance(seq[0], (list, tuple)):
+                raw = seq
+            elif seq and len(seq) == height:
+                flat = []
+                for row in seq:
+                    if isinstance(row, (bytes, bytearray)) or (row and not isinstance(row[0], (list, tuple, bytes, bytearray))):
+                        flat.extend(row)
+                    elif row:
+                        sub = row[0]
+                        if isinstance(sub, (list, tuple)):
+                            for pix in row:
+                                flat.extend(pix if isinstance(pix, (list, tuple)) else [pix])
+                        else:
+                            flat.extend([sub])
+                raw = flat
+            else:
+                raw = seq
+
+        if len(raw) == total:
+            values = [_norm_num(v) for v in raw]
+        elif len(raw) == width * height * 4 and channels == 3:
+            values = []
+            for i in range(width * height):
+                v = raw[i * 4:i * 4 + 3]
+                values.extend(_norm_num(x) for x in v)
+        elif len(raw) == width * height:
+            rows = raw
+            values = []
+            for i in range(width * height):
+                pix = rows[i]
+                pix = pix if isinstance(pix, (list, tuple, bytes, bytearray)) else [pix]
+                chs = list(pix[:channels]) if isinstance(pix, (list, tuple)) else list(pix)
+                chs = chs + [0] * max(0, channels - len(chs))
+                values.extend(_norm_num(x) for x in chs[:channels])
+        else:
+            values = [_norm_num(v) for v in raw][:total]
+        if len(values) < total:
+            values = values + [0.0] * (total - len(values))
+        return values[:total]
+    except Exception:
+        width, height = int(width or 1), int(height or 1)
+        return [0.0] * (width * height * channels)
+
+
 def _create_blender_image_from_paa_texture(filepath: str, tex, color_space: str):
     paa_ns = _import_first_available_module(
         (
@@ -19641,7 +19743,7 @@ def _create_blender_image_from_paa_texture(filepath: str, tex, color_space: str)
 
     _apply_image_color_space(img, color_space)
 
-    img.pixels = [value for c in zip(*mip.data) for value in c]
+    img.pixels = _flatten_image_channels(mip, mip.width, mip.height, channels=4 if alpha else 3)
     img.update()
     img.pack()
     return img
@@ -19919,7 +20021,7 @@ def _texture_cache_is_valid(source_abs_path: str, cache_path: str) -> bool:
     try:
         return os.path.getmtime(cache_path) >= os.path.getmtime(source_abs_path)
     except Exception:
-        return True
+        return False
 
 def _iter_paa_files_recursive(root_abs: str):
     root_abs = os.path.abspath(bpy.path.abspath(root_abs or ""))
@@ -20098,8 +20200,15 @@ def _run_texture_cache_workers(paa_files, *, force_rebuild: bool = False, settin
             with open(input_path, "w", encoding="utf-8", newline="\n") as f:
                 json.dump({"files": chunk, "force_rebuild": bool(force_rebuild)}, f, ensure_ascii=False)
             log_file = open(log_path, "w", encoding="utf-8", newline="\n")
-            cmd = [blender_binary, "--background", "--python", script_path, "--", addon_path, input_path, output_path]
-            proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+            try:
+                cmd = [blender_binary, "--background", "--python", script_path, "--", addon_path, input_path, output_path]
+                proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+            except Exception:
+                try:
+                    log_file.close()
+                except Exception:
+                    pass
+                raise
             processes.append({
                 "proc": proc,
                 "log_file": log_file,
@@ -20110,6 +20219,8 @@ def _run_texture_cache_workers(paa_files, *, force_rebuild: bool = False, settin
             })
 
         completed = 0
+        import time
+        deadline = time.monotonic() + max(120.0, min(3600.0, 5.0 * max(len(unique_files), 1)))
         try:
             if context is not None:
                 context.window_manager.progress_begin(0, len(unique_files))
@@ -20117,6 +20228,21 @@ def _run_texture_cache_workers(paa_files, *, force_rebuild: bool = False, settin
             pass
         try:
             while any(not item["done"] for item in processes):
+                if time.monotonic() > deadline:
+                    for item in processes:
+                        if item["done"]:
+                            continue
+                        item["done"] = True
+                        proc = item["proc"]
+                        item["log_file"] = None
+                        try:
+                            proc.kill()
+                        except Exception:
+                            pass
+                        io_item_log = item.get("log_path") or ""
+                        if io_item_log:
+                            stats["failed"].append(f"Worker timed out: {io_item_log}")
+                    break
                 for item in processes:
                     if item["done"]:
                         continue
@@ -20125,10 +20251,11 @@ def _run_texture_cache_workers(paa_files, *, force_rebuild: bool = False, settin
                         continue
                     item["done"] = True
                     completed += int(item["chunk_size"])
-                    try:
-                        item["log_file"].close()
-                    except Exception:
-                        pass
+                    if item["log_file"] is not None:
+                        try:
+                            item["log_file"].close()
+                        except Exception:
+                            pass
                     try:
                         if context is not None:
                             context.window_manager.progress_update(min(completed, len(unique_files)))
@@ -20142,8 +20269,8 @@ def _run_texture_cache_workers(paa_files, *, force_rebuild: bool = False, settin
                             continue
                         except Exception:
                             pass
-                    import time
-                    time.sleep(0.1)
+                    import time as _time  # noqa: PLC0415
+                    _time.sleep(0.1)
         finally:
             try:
                 if context is not None:
@@ -20181,6 +20308,23 @@ def _run_texture_cache_workers(paa_files, *, force_rebuild: bool = False, settin
             except Exception as e:
                 stats["failed"].append(f"Could not read worker output: {_fmt_exc(e)}")
     finally:
+        try:
+            for item in processes:
+                proc = item["proc"]
+                try:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait(timeout=30)
+                except Exception:
+                    pass
+                try:
+                    log_file_handle = item.get("log_file")
+                    if log_file_handle is not None and not log_file_handle.closed:
+                        log_file_handle.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
         try:
             shutil.rmtree(work_dir, ignore_errors=True)
         except Exception:
@@ -20640,14 +20784,14 @@ class CRAY_PG_TexReplaceSettings(PropertyGroup):
         name="Texture Cache Source",
         subtype="DIR_PATH",
         default=_nh_texture_export_output_root(create=False),
-        description="Корневая папка с .paa текстурами для общего PNG-кеша Blender",
+        description="РљРѕСЂРЅРµРІР°СЏ РїР°РїРєР° СЃ .paa С‚РµРєСЃС‚СѓСЂР°РјРё РґР»СЏ РѕР±С‰РµРіРѕ PNG-РєРµС€Р° Blender",
     )
     texture_cache_workers: IntProperty(
         name="Cache Workers",
         default=4,
         min=1,
         max=8,
-        description="Количество фоновых Blender worker-процессов для параллельной сборки PNG-кеша текстур",
+        description="РљРѕР»РёС‡РµСЃС‚РІРѕ С„РѕРЅРѕРІС‹С… Blender worker-РїСЂРѕС†РµСЃСЃРѕРІ РґР»СЏ РїР°СЂР°Р»Р»РµР»СЊРЅРѕР№ СЃР±РѕСЂРєРё PNG-РєРµС€Р° С‚РµРєСЃС‚СѓСЂ",
     )
     texture_cache_last_summary: StringProperty(
         default="",
@@ -21393,8 +21537,8 @@ class CRAY_OT_ExportMissingTexturesFromSources(Operator):
             return {"CANCELLED"}
 
         self._init_runtime()
+        self.dds_backend = str(getattr(ts, "dds_backend", "BUILTIN_PYTHON") or "BUILTIN_PYTHON")
         try:
-            ts.dds_backend = "BUILTIN_PYTHON"
             ts.texture_export_cancel_requested = False
             ts.texture_export_last_summary = ""
             ts.texture_export_last_report_path = ""
@@ -21416,7 +21560,7 @@ class CRAY_OT_ExportMissingTexturesFromSources(Operator):
             target_root=self.target_root,
             texture_tools_folder=_texture_tools_folder_from_settings(ts),
             convert_dds_to_png=bool(ts.convert_dds_to_png),
-            dds_backend="BUILTIN_PYTHON",
+            dds_backend=str(getattr(ts, "dds_backend", "BUILTIN_PYTHON") or "BUILTIN_PYTHON"),
             python_converter_path=_get_bundled_python_dds_converter_path(ts),
             convert_png_to_paa=bool(ts.convert_png_to_paa),
             image_to_paa_path=_tex_export_resolve_path(ts.image_to_paa_path),
@@ -21776,7 +21920,7 @@ class CRAY_OT_ExportMissingTexturesFromSources(Operator):
             self._add_failed("db", "DB rebuild", "", self.target_root, _fmt_exc(e))
             self.stats["failed"] += 1
         self._finalize_lists()
-        summary = {"source_root": self.source_root, "target_root": self.target_root, "dds_backend": _dds_backend_display_name("BUILTIN_PYTHON"), "dds_scanned": self.stats["dds_scanned"], "missing_requested": self.stats["missing_requested"], "diffuse_converted": self.stats["diffuse_converted"], "nohq_converted": self.stats["nohq_converted"], "smdi_converted": self.stats["smdi_converted"], "paa_converted": self.stats["paa_converted"], "rvmat_created": self.stats["rvmat_created"], "skipped_existing": self.stats["skipped_existing"], "source_not_found": self.stats["source_not_found"], "failed": self.stats["failed"], "db_rebuilt": self.rebuilt_count, "cancelled": self.cancelled}
+        summary = {"source_root": self.source_root, "target_root": self.target_root, "dds_backend": _dds_backend_display_name(getattr(self, "dds_backend", "BUILTIN_PYTHON")), "dds_scanned": self.stats["dds_scanned"], "missing_requested": self.stats["missing_requested"], "diffuse_converted": self.stats["diffuse_converted"], "nohq_converted": self.stats["nohq_converted"], "smdi_converted": self.stats["smdi_converted"], "paa_converted": self.stats["paa_converted"], "rvmat_created": self.stats["rvmat_created"], "skipped_existing": self.stats["skipped_existing"], "source_not_found": self.stats["source_not_found"], "failed": self.stats["failed"], "db_rebuilt": self.rebuilt_count, "cancelled": self.cancelled}
         print("=== Texture Source Export Summary ===")
         for key, label in (("source_root", "Source root"), ("target_root", "Target root"), ("dds_backend", "DDS Backend"), ("dds_scanned", "DDS scanned"), ("missing_requested", "Missing requested"), ("diffuse_converted", "Diffuse converted"), ("nohq_converted", "NOHQ converted"), ("smdi_converted", "SMDI converted"), ("paa_converted", "PAA converted"), ("rvmat_created", "RVMAT created"), ("skipped_existing", "Skipped existing"), ("source_not_found", "Source not found"), ("failed", "Failed"), ("db_rebuilt", "DB rebuilt"), ("cancelled", "Cancelled")):
             if summary.get(key) is not None:
@@ -21966,7 +22110,7 @@ class CRAY_OT_PrintTextureConverterDiagnostics(Operator):
         print(f"converter_js_path: {_get_bundled_xray_converter_js(ts) or '<missing>'}")
         print(f"node_exe_found: {_find_node_exe(ts) or '<missing>'}")
         print(f"external_converter_path: {_tex_export_resolve_path(ts.external_dds_converter_path) or '<empty>'}")
-        print("dds_backend: BUILTIN_PYTHON")
+        print(f"dds_backend: {_dds_backend_display_name(getattr(ts, 'dds_backend', 'BUILTIN_PYTHON'))}")
         print(f"image_to_paa_path: {_tex_export_resolve_path(ts.image_to_paa_path) or '<empty>'}")
 
         self.report({"INFO"}, "Printed converter diagnostics to System Console")
@@ -22076,13 +22220,13 @@ class CRAY_OT_CleanTextureConverterTestOutputs(Operator):
 class CRAY_OT_TextureCacheBuild(Operator):
     bl_idname = "cray.texture_cache_build"
     bl_label = "Build Texture PNG Cache"
-    bl_description = "Сканирует выбранную папку текстур. Update добавляет только отсутствующие или устаревшие PNG, Rebuild All пересоздает весь кеш"
+    bl_description = "РЎРєР°РЅРёСЂСѓРµС‚ РІС‹Р±СЂР°РЅРЅСѓСЋ РїР°РїРєСѓ С‚РµРєСЃС‚СѓСЂ. Update РґРѕР±Р°РІР»СЏРµС‚ С‚РѕР»СЊРєРѕ РѕС‚СЃСѓС‚СЃС‚РІСѓСЋС‰РёРµ РёР»Рё СѓСЃС‚Р°СЂРµРІС€РёРµ PNG, Rebuild All РїРµСЂРµСЃРѕР·РґР°РµС‚ РІРµСЃСЊ РєРµС€"
     bl_options = {"REGISTER", "UNDO"}
 
     missing_only: BoolProperty(
-        name="Только новые/устаревшие",
+        name="РўРѕР»СЊРєРѕ РЅРѕРІС‹Рµ/СѓСЃС‚Р°СЂРµРІС€РёРµ",
         default=False,
-        description="Пропускать уже валидные PNG и конвертировать только отсутствующие или устаревшие .paa",
+        description="РџСЂРѕРїСѓСЃРєР°С‚СЊ СѓР¶Рµ РІР°Р»РёРґРЅС‹Рµ PNG Рё РєРѕРЅРІРµСЂС‚РёСЂРѕРІР°С‚СЊ С‚РѕР»СЊРєРѕ РѕС‚СЃСѓС‚СЃС‚РІСѓСЋС‰РёРµ РёР»Рё СѓСЃС‚Р°СЂРµРІС€РёРµ .paa",
     )
 
     def execute(self, context):
@@ -22360,13 +22504,13 @@ def _cache_nh_library_used_textures(op, context, *, force_rebuild: bool = False)
 class CRAY_OT_TextureCacheBuildNHLibraryUsed(Operator):
     bl_idname = "cray.texture_cache_build_nh_library_used"
     bl_label = "Cache NH Library Textures"
-    bl_description = "Импортирует .p3d из NH библиотек и кеширует только те .paa текстуры, которые реально используются этими ассетами"
+    bl_description = "РРјРїРѕСЂС‚РёСЂСѓРµС‚ .p3d РёР· NH Р±РёР±Р»РёРѕС‚РµРє Рё РєРµС€РёСЂСѓРµС‚ С‚РѕР»СЊРєРѕ С‚Рµ .paa С‚РµРєСЃС‚СѓСЂС‹, РєРѕС‚РѕСЂС‹Рµ СЂРµР°Р»СЊРЅРѕ РёСЃРїРѕР»СЊР·СѓСЋС‚СЃСЏ СЌС‚РёРјРё Р°СЃСЃРµС‚Р°РјРё"
     bl_options = {"REGISTER", "UNDO"}
 
     force_rebuild: BoolProperty(
-        name="Пересоздать существующие PNG",
+        name="РџРµСЂРµСЃРѕР·РґР°С‚СЊ СЃСѓС‰РµСЃС‚РІСѓСЋС‰РёРµ PNG",
         default=False,
-        description="Пересоздать PNG для используемых текстур NH библиотеки вместо использования валидного кеша",
+        description="РџРµСЂРµСЃРѕР·РґР°С‚СЊ PNG РґР»СЏ РёСЃРїРѕР»СЊР·СѓРµРјС‹С… С‚РµРєСЃС‚СѓСЂ NH Р±РёР±Р»РёРѕС‚РµРєРё РІРјРµСЃС‚Рѕ РёСЃРїРѕР»СЊР·РѕРІР°РЅРёСЏ РІР°Р»РёРґРЅРѕРіРѕ РєРµС€Р°",
     )
 
     def execute(self, context):
@@ -22376,7 +22520,7 @@ class CRAY_OT_TextureCacheBuildNHLibraryUsed(Operator):
 class CRAY_OT_OpenTexturePreviewCacheFolder(Operator):
     bl_idname = "cray.open_texture_preview_cache_folder"
     bl_label = "Open Texture PNG Cache"
-    bl_description = "Открывает папку общего PNG-кеша, куда складываются превью для .paa текстур"
+    bl_description = "РћС‚РєСЂС‹РІР°РµС‚ РїР°РїРєСѓ РѕР±С‰РµРіРѕ PNG-РєРµС€Р°, РєСѓРґР° СЃРєР»Р°РґС‹РІР°СЋС‚СЃСЏ РїСЂРµРІСЊСЋ РґР»СЏ .paa С‚РµРєСЃС‚СѓСЂ"
     bl_options = {"REGISTER"}
 
     def execute(self, context):
@@ -22392,7 +22536,7 @@ class CRAY_OT_OpenTexturePreviewCacheFolder(Operator):
 class CRAY_OT_OpenTextureCacheLastReport(Operator):
     bl_idname = "cray.open_texture_cache_last_report"
     bl_label = "Open Texture Cache Report"
-    bl_description = "Открывает последний отчет по сборке PNG-кеша текстур"
+    bl_description = "РћС‚РєСЂС‹РІР°РµС‚ РїРѕСЃР»РµРґРЅРёР№ РѕС‚С‡РµС‚ РїРѕ СЃР±РѕСЂРєРµ PNG-РєРµС€Р° С‚РµРєСЃС‚СѓСЂ"
     bl_options = {"REGISTER"}
 
     def execute(self, context):
@@ -22412,7 +22556,7 @@ class CRAY_OT_OpenTextureCacheLastReport(Operator):
 class CRAY_OT_OpenNHAssetCacheFolder(Operator):
     bl_idname = "cray.open_nh_asset_cache_folder"
     bl_label = "Open NH Library Cache"
-    bl_description = "Открывает папку, где лежат кешированные .blend asset libraries и их превью"
+    bl_description = "РћС‚РєСЂС‹РІР°РµС‚ РїР°РїРєСѓ, РіРґРµ Р»РµР¶Р°С‚ РєРµС€РёСЂРѕРІР°РЅРЅС‹Рµ .blend asset libraries Рё РёС… РїСЂРµРІСЊСЋ"
     bl_options = {"REGISTER"}
 
     def execute(self, context):
@@ -22428,7 +22572,7 @@ class CRAY_OT_OpenNHAssetCacheFolder(Operator):
 class CRAY_OT_AssetLibraryRebuildIconCache(Operator):
     bl_idname = "cray.asset_library_rebuild_icon_cache"
     bl_label = "Rebuild Library Icons"
-    bl_description = "Пересобирает NH asset libraries и заново создает иконки ассетов с текущими настройками превью"
+    bl_description = "РџРµСЂРµСЃРѕР±РёСЂР°РµС‚ NH asset libraries Рё Р·Р°РЅРѕРІРѕ СЃРѕР·РґР°РµС‚ РёРєРѕРЅРєРё Р°СЃСЃРµС‚РѕРІ СЃ С‚РµРєСѓС‰РёРјРё РЅР°СЃС‚СЂРѕР№РєР°РјРё РїСЂРµРІСЊСЋ"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -22530,7 +22674,7 @@ class CRAY_OT_AssetLibraryForceRebuildIconsTextures(Operator):
 class CRAY_OT_TextureCacheRebuildNHLibraryUsed(Operator):
     bl_idname = "cray.texture_cache_rebuild_nh_library_used"
     bl_label = "Rebuild NH Library Texture Cache"
-    bl_description = "Пересоздает PNG-кеш только для текстур, которые используются ассетами NH библиотек"
+    bl_description = "РџРµСЂРµСЃРѕР·РґР°РµС‚ PNG-РєРµС€ С‚РѕР»СЊРєРѕ РґР»СЏ С‚РµРєСЃС‚СѓСЂ, РєРѕС‚РѕСЂС‹Рµ РёСЃРїРѕР»СЊР·СѓСЋС‚СЃСЏ Р°СЃСЃРµС‚Р°РјРё NH Р±РёР±Р»РёРѕС‚РµРє"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -22868,7 +23012,7 @@ def _normalize_p3d_lookup_key(value: str) -> str:
         return ""
     raw = raw.split("\\")[-1]
     raw = _strip_blender_numeric_suffix(raw)
-    if raw.lower().endswith(".p3d"):
+    if raw.lower().endswith(".p3d") or raw.lower().endswith(".png"):
         raw = raw[:-4]
     return raw.strip().lower()
 
@@ -23246,17 +23390,6 @@ def _object_has_ancestor_in_pointer_set(obj, object_ptrs):
     return False
 
 
-def _plain_axis_constraint_helper_delta(helper_obj, constraints):
-    if helper_obj is None:
-        return None
-    for con in constraints or ():
-        try:
-            return helper_obj.matrix_world @ con.inverse_matrix.copy()
-        except Exception:
-            continue
-    return None
-
-
 def _plain_axis_helper_root_collections(context, helper_obj):
     roots = []
     seen = set()
@@ -23303,13 +23436,10 @@ def _snapshot_plain_axis_memory_restore_state(context, live_helpers):
 
         constrained = []
         constrained_ptrs = set()
-        helper_delta = None
         for obj in bpy.data.objects:
             constraints = list(_iter_plain_axis_constraints(obj, helper_ptrs={helper_ptr}))
             if not constraints:
                 continue
-            if helper_delta is None:
-                helper_delta = _plain_axis_constraint_helper_delta(helper_obj, constraints)
             try:
                 constrained_ptrs.add(obj.as_pointer())
             except Exception:
@@ -23349,7 +23479,6 @@ def _snapshot_plain_axis_memory_restore_state(context, live_helpers):
         if memory_items:
             states.append({
                 "constrained": constrained,
-                "helper_delta": helper_delta,
                 "memory": memory_items,
             })
 
@@ -24716,15 +24845,15 @@ def _resolve_model_split_target_part_root(context, settings, source_root, *, for
         target_root = _ensure_split_part_root_collection(context, target_container, part_number)
         if target_root is None:
             raise RuntimeError("Could not create destination part collection")
+        try:
+            settings.part_number = part_number
+        except Exception:
+            pass
     else:
         target_root = target_container
 
     try:
         settings.named_target_collection = target_container
-    except Exception:
-        pass
-    try:
-        settings.part_number = _next_split_part_collection_number(target_container)
     except Exception:
         pass
 
@@ -26543,13 +26672,9 @@ def _model_split_grid_create_cube_mesh(name: str):
 
 
 def _model_split_grid_config_values(settings):
-    size_x = max(0.001, float(getattr(settings, "grid_cell_size_x", 10.0) or 10.0))
-    size_y = max(0.001, float(getattr(settings, "grid_cell_size_y", 10.0) or 10.0))
-    size_z = max(0.001, float(getattr(settings, "grid_cell_size_z", 10.0) or 10.0))
     count_x = max(1, int(getattr(settings, "grid_count_x", 1) or 1))
     count_y = max(1, int(getattr(settings, "grid_count_y", 1) or 1))
-    count_z = max(1, int(getattr(settings, "grid_count_z", 1) or 1))
-    return size_x, size_y, size_z, count_x, count_y, count_z
+    return count_x, count_y
 
 
 def _model_split_grid_expanded_bounds(bounds, min_span: float = 0.01):
@@ -26707,6 +26832,10 @@ def _model_split_grid_create_cell_cutter(context, temp_collection, name: str, bo
         pass
     _link_object_to_collection(obj, temp_collection)
     _ensure_collection_visible_in_view_layer(context, temp_collection)
+    try:
+        context.view_layer.update()
+    except Exception:
+        pass
     return obj
 
 
@@ -27262,7 +27391,7 @@ class CRAY_OT_ModelSplitGridCreateCutters(Operator):
             if bounds is None:
                 raise RuntimeError("Could not calculate source bounds for cut lines")
 
-            _size_x, _size_y, _size_z, count_x, count_y, _count_z = _model_split_grid_config_values(settings)
+            count_x, count_y = _model_split_grid_config_values(settings)
             guide_collection = _model_split_grid_cutter_collection(context, settings, create=True)
             if guide_collection is None:
                 raise RuntimeError("Could not create cut lines collection")
@@ -28309,21 +28438,6 @@ def _p3d_preview_camera_hint(filepath: str):
     return best
 
 
-def _image_filepath_if_loadable(image):
-    raw_path = getattr(image, "filepath_raw", "") or getattr(image, "filepath", "")
-    if not raw_path:
-        return ""
-    try:
-        path = os.path.abspath(bpy.path.abspath(raw_path))
-    except Exception:
-        path = os.path.abspath(raw_path)
-    if not os.path.isfile(path):
-        return ""
-    if os.path.splitext(path)[1].lower() in {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".tif", ".tiff", ".webp"}:
-        return path
-    return ""
-
-
 def _first_image_from_collection_materials(collection):
     if collection is None:
         return None
@@ -28989,13 +29103,13 @@ class CRAY_PG_AssetLibrarySettings(PropertyGroup):
         name="Common Folder",
         default=_NH_OBJECTS_DEFAULT_COMMON_ROOT,
         subtype="DIR_PATH",
-        description="Папка Common с .p3d ассетами; подпапка Buildings игнорируется",
+        description="РџР°РїРєР° Common СЃ .p3d Р°СЃСЃРµС‚Р°РјРё; РїРѕРґРїР°РїРєР° Buildings РёРіРЅРѕСЂРёСЂСѓРµС‚СЃСЏ",
     )
     environment_root: StringProperty(
         name="Environment Folder",
         default=_NH_OBJECTS_DEFAULT_ENVIRONMENT_ROOT,
         subtype="DIR_PATH",
-        description="Папка Environment с .p3d ассетами",
+        description="РџР°РїРєР° Environment СЃ .p3d Р°СЃСЃРµС‚Р°РјРё",
     )
     custom_search_root: StringProperty(
         name="Custom Search Root",
@@ -29019,12 +29133,12 @@ class CRAY_PG_AssetLibrarySettings(PropertyGroup):
     rebuild_existing_libraries: BoolProperty(
         name="Rebuild existing NH libraries",
         default=False,
-        description="Заново импортировать папки, даже если кешированная _NH_AssetLibrary.blend библиотека уже актуальна",
+        description="Р—Р°РЅРѕРІРѕ РёРјРїРѕСЂС‚РёСЂРѕРІР°С‚СЊ РїР°РїРєРё, РґР°Р¶Рµ РµСЃР»Рё РєРµС€РёСЂРѕРІР°РЅРЅР°СЏ _NH_AssetLibrary.blend Р±РёР±Р»РёРѕС‚РµРєР° СѓР¶Рµ Р°РєС‚СѓР°Р»СЊРЅР°",
     )
     render_textured_previews: BoolProperty(
         name="Textured rendered previews",
         default=False,
-        description="Рендерить иконки Asset Browser с уже кешированными текстурами. Если PNG для .paa еще нет в кеше, иконка быстро создается как geometry preview без конвертации текстуры",
+        description="Р РµРЅРґРµСЂРёС‚СЊ РёРєРѕРЅРєРё Asset Browser СЃ СѓР¶Рµ РєРµС€РёСЂРѕРІР°РЅРЅС‹РјРё С‚РµРєСЃС‚СѓСЂР°РјРё. Р•СЃР»Рё PNG РґР»СЏ .paa РµС‰Рµ РЅРµС‚ РІ РєРµС€Рµ, РёРєРѕРЅРєР° Р±С‹СЃС‚СЂРѕ СЃРѕР·РґР°РµС‚СЃСЏ РєР°Рє geometry preview Р±РµР· РєРѕРЅРІРµСЂС‚Р°С†РёРё С‚РµРєСЃС‚СѓСЂС‹",
     )
 
 class CRAY_OT_AssetLibraryBuildFromFolder(Operator):
@@ -29997,6 +30111,7 @@ def _build_nh_objects_persistent_asset_libraries(op, context, cache_missing_text
     failed = []
     preview_errors = []
     rebuild = bool(getattr(settings, "rebuild_existing_libraries", False))
+    prev_import_first_lod_only = bool(getattr(settings, "import_first_lod_only", True))
     try:
         settings.import_first_lod_only = True
     except Exception:
@@ -30081,6 +30196,10 @@ def _build_nh_objects_persistent_asset_libraries(op, context, cache_missing_text
             print(item)
 
     if built == 0 and skipped_current == 0:
+        try:
+            settings.import_first_lod_only = prev_import_first_lod_only
+        except Exception:
+            pass
         op.report({"ERROR"}, "No NH asset libraries built (see System Console)")
         return {"CANCELLED"}
 
@@ -30100,6 +30219,10 @@ def _build_nh_objects_persistent_asset_libraries(op, context, cache_missing_text
         op.report({"WARNING"}, msg + f", preview warnings {len(preview_errors)} (see System Console)")
     else:
         op.report({"INFO"}, msg)
+    try:
+        settings.import_first_lod_only = prev_import_first_lod_only
+    except Exception:
+        pass
     return {"FINISHED"}
 
 
@@ -30142,6 +30265,7 @@ def _add_new_nh_objects_assets_to_cache(op, context):
         op.report({"INFO"}, f"No new or outdated NH .p3d assets found: scanned {scanned}, cached {cached_existing}")
         return {"FINISHED"}
 
+    prev_import_first_lod_only = bool(getattr(settings, "import_first_lod_only", True))
     try:
         settings.import_first_lod_only = True
     except Exception:
@@ -30208,6 +30332,10 @@ def _add_new_nh_objects_assets_to_cache(op, context):
             print(item)
 
     if built <= 0:
+        try:
+            settings.import_first_lod_only = prev_import_first_lod_only
+        except Exception:
+            pass
         op.report({"ERROR"}, f"No NH assets updated; found {len(new_items)} new and {len(icon_update_items)} icon candidate(s), failed {len(failed)}")
         return {"CANCELLED"}
 
@@ -30230,6 +30358,10 @@ def _add_new_nh_objects_assets_to_cache(op, context):
         op.report({"WARNING"}, msg + f", preview warnings {len(preview_errors)} (see System Console)")
     else:
         op.report({"INFO"}, msg)
+    try:
+        settings.import_first_lod_only = prev_import_first_lod_only
+    except Exception:
+        pass
     return {"FINISHED"}
 
 
@@ -30237,8 +30369,8 @@ class CRAY_OT_AssetLibraryBuildNHObjects(Operator):
     bl_idname = "cray.asset_library_build_nh_objects"
     bl_label = "Build NH Libraries"
     bl_description = (
-        "Создает или обновляет Blender asset libraries из выбранных папок Common и Environment, "
-        "включая подпапки и исключая Common\\Buildings"
+        "РЎРѕР·РґР°РµС‚ РёР»Рё РѕР±РЅРѕРІР»СЏРµС‚ Blender asset libraries РёР· РІС‹Р±СЂР°РЅРЅС‹С… РїР°РїРѕРє Common Рё Environment, "
+        "РІРєР»СЋС‡Р°СЏ РїРѕРґРїР°РїРєРё Рё РёСЃРєР»СЋС‡Р°СЏ Common\\Buildings"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -31627,6 +31759,11 @@ def _fix_proxy_triangle_mesh(obj):
         new_mesh.polygons[0].material_index = max(0, min(material_index, max(0, len(old_materials) - 1)))
         new_mesh.polygons[0].use_smooth = use_smooth
     obj.data = new_mesh
+    if getattr(old_mesh, "users", 0) == 0:
+        try:
+            bpy.data.meshes.remove(old_mesh)
+        except Exception:
+            pass
     return {
         "name": obj.name,
         "old_verts": verts_count,
@@ -31850,7 +31987,7 @@ class CRAY_OT_CreatePlainAxisPivot(Operator):
     bl_idname = "cray.create_plain_axis_pivot"
     bl_label = "Create Plain Axis Pivot"
     bl_description = (
-        "В Edit Mode берёт одну выделенную вершину как pivot, создаёт Plain Axes helper и добавляет Child Of constraints, чтобы helper двигал всю импортированную модель"
+        "Р’ Edit Mode Р±РµСЂС‘С‚ РѕРґРЅСѓ РІС‹РґРµР»РµРЅРЅСѓСЋ РІРµСЂС€РёРЅСѓ РєР°Рє pivot, СЃРѕР·РґР°С‘С‚ Plain Axes helper Рё РґРѕР±Р°РІР»СЏРµС‚ Child Of constraints, С‡С‚РѕР±С‹ helper РґРІРёРіР°Р» РІСЃСЋ РёРјРїРѕСЂС‚РёСЂРѕРІР°РЅРЅСѓСЋ РјРѕРґРµР»СЊ"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -31942,7 +32079,7 @@ class CRAY_OT_CreatePlainAxisPivot(Operator):
 class CRAY_OT_ClearPlainAxisPivots(Operator):
     bl_idname = "cray.clear_plain_axis_pivots"
     bl_label = "Delete All Plain Axes"
-    bl_description = "Удаляет все Plain Axes helper-ы, созданные этой кнопкой, и снимает их Child Of constraints"
+    bl_description = "РЈРґР°Р»СЏРµС‚ РІСЃРµ Plain Axes helper-С‹, СЃРѕР·РґР°РЅРЅС‹Рµ СЌС‚РѕР№ РєРЅРѕРїРєРѕР№, Рё СЃРЅРёРјР°РµС‚ РёС… Child Of constraints"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -31983,8 +32120,8 @@ class CRAY_OT_ClearPlainAxisPivotsKeepZ(Operator):
     bl_idname = "cray.clear_plain_axis_pivots_keep_z"
     bl_label = "Delete All Plain Axes + Save Z"
     bl_description = (
-        "Удаляет все Plain Axes helper-ы, возвращает модели по X/Y как при обычном удалении, "
-        "но сохраняет текущую мировую высоту Z для объектов коллекций"
+        "РЈРґР°Р»СЏРµС‚ РІСЃРµ Plain Axes helper-С‹, РІРѕР·РІСЂР°С‰Р°РµС‚ РјРѕРґРµР»Рё РїРѕ X/Y РєР°Рє РїСЂРё РѕР±С‹С‡РЅРѕРј СѓРґР°Р»РµРЅРёРё, "
+        "РЅРѕ СЃРѕС…СЂР°РЅСЏРµС‚ С‚РµРєСѓС‰СѓСЋ РјРёСЂРѕРІСѓСЋ РІС‹СЃРѕС‚Сѓ Z РґР»СЏ РѕР±СЉРµРєС‚РѕРІ РєРѕР»Р»РµРєС†РёР№"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -32212,8 +32349,19 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
                     failed.append(f"{col.name} -> backup stage failed: {backup_stage_err}")
                     continue
 
-            material_restore = _strip_collision_lod_materials_for_export(selectable)
-            named_property_restore = _strip_a3ob_named_properties_for_export(selectable)
+            material_restore = {}
+            named_property_restore = {}
+            try:
+                material_restore = _strip_collision_lod_materials_for_export(selectable)
+                named_property_restore = _strip_a3ob_named_properties_for_export(selectable)
+            except Exception as e:
+                if pending_backup_path:
+                    try:
+                        _discard_pending_export_backup(pending_backup_path)
+                    except Exception:
+                        pass
+                failed.append(f"{col.name} -> prep failed: {_fmt_exc(e)}")
+                continue
             try:
                 _, op_id, err = _call_export_with_optional_relaxed_validation(
                     force_all_lods=bool(st.export_force_all_lods),
@@ -33071,10 +33219,6 @@ class CRAY_PT_TextureReplacePanel(Panel):
         row = ebox.row(align=True)
         row.prop(ts, "convert_dds_to_png")
         row.prop(ts, "convert_png_to_paa")
-        try:
-            ts.dds_backend = "BUILTIN_PYTHON"
-        except Exception:
-            pass
         ebox.prop(ts, "dds_backend")
         if ts.convert_png_to_paa:
             ebox.prop(ts, "image_to_paa_path")
@@ -33322,8 +33466,18 @@ classes = (
 def register():
     global _PERSISTED_UI_STATE_CACHE
 
-    for cls in classes:
-        bpy.utils.register_class(cls)
+    _registered_classes = []
+    try:
+        for cls in classes:
+            bpy.utils.register_class(cls)
+            _registered_classes.append(cls)
+    except Exception:
+        for cls in reversed(_registered_classes):
+            try:
+                bpy.utils.unregister_class(cls)
+            except Exception:
+                pass
+        raise
     bpy.types.Scene.cray_settings = PointerProperty(type=CRAY_PG_Settings)
     bpy.types.Scene.cray_snap_settings = PointerProperty(type=CRAY_PG_SnapSettings)
     bpy.types.Scene.cray_collider_settings = PointerProperty(type=CRAY_PG_ColliderSettings)
@@ -33344,6 +33498,7 @@ def register():
         bpy.app.handlers.load_post.append(_restore_persisted_ui_state_on_load)
     if not bpy.app.timers.is_registered(_persisted_ui_state_timer):
         bpy.app.timers.register(_persisted_ui_state_timer, first_interval=_PERSISTED_UI_STATE_TIMER_INTERVAL, persistent=True)
+    _ensure_a3ob_bundle_registered()
     _patch_a3ob_import_read_file()
     if not bpy.app.timers.is_registered(_ensure_a3ob_import_patch_timer):
         bpy.app.timers.register(_ensure_a3ob_import_patch_timer, first_interval=1.0, persistent=True)
@@ -33354,6 +33509,7 @@ def register():
 
 def unregister():
     _unregister_collider_keymaps()
+    _unregister_a3ob_bundle()
     _save_current_persisted_ui_state(getattr(bpy.context, "scene", None))
     if bpy.app.timers.is_registered(_deferred_restore_persisted_ui_state):
         bpy.app.timers.unregister(_deferred_restore_persisted_ui_state)
@@ -33389,3 +33545,4 @@ def unregister():
 
 if __name__ == "__main__":
     register()
+

@@ -39,13 +39,18 @@ echo === NH Blender addon ZIP build ===
 echo Working directory: %CD%
 echo.
 
-if exist "%ADDON_SINGLE_FILE%" (
+if exist "%ADDON_PACKAGE_DIR%\__init__.py" (
+    set "ADDON_SOURCE_MODE=package"
+    set "ADDON_ENTRY_FILE=%ADDON_PACKAGE_DIR%/__init__.py"
+) else if exist "%ADDON_SINGLE_FILE%" (
     set "ADDON_ENTRY_FILE=%ADDON_SINGLE_FILE%"
     set "ADDON_SOURCE_MODE=file"
 ) else (
     echo ERROR: addon source not found.
     echo Expected:
     echo   %CD%\%ADDON_SINGLE_FILE%
+    echo   or package dir:
+    echo   %CD%\%ADDON_PACKAGE_DIR%\__init__.py
     exit /b 1
 )
 
@@ -84,7 +89,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$repo=(Resolve-Path '.').Path;" ^
     "$dist=Join-Path $repo '%DIST_DIR%';" ^
     "$zipBase='%ZIP_BASENAME%';" ^
-    "$single=Join-Path $repo '%ADDON_SINGLE_FILE%';" ^
+    "$single=Join-Path $repo '%ADDON_ENTRY_FILE%';" ^
     "if(-not (Test-Path -LiteralPath $single)){ throw 'No addon source file found for version update: %ADDON_SINGLE_FILE%'; }" ^
     "function Get-BlInfoVersion([string]$path){" ^
     "  $text=Get-Content -Raw -Encoding UTF8 -LiteralPath $path;" ^
@@ -193,6 +198,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$sourceMode='%ADDON_SOURCE_MODE%';" ^
     "$packageDir='%ADDON_PACKAGE_DIR%';" ^
     "$singleFile='%ADDON_SINGLE_FILE%';" ^
+    "$entryFile='%ADDON_ENTRY_FILE%';" ^
     "$version='%RELEASE_VERSION%';" ^
     "$writeLatest='%WRITE_LATEST%';" ^
     "$tempRoot=Join-Path ([System.IO.Path]::GetTempPath()) ('nh_blender_zip_' + [guid]::NewGuid().ToString('N'));" ^
@@ -202,14 +208,28 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "}" ^
     "New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null;" ^
     "try {" ^
-    "  Copy-Item -LiteralPath (Join-Path $repo $singleFile) -Destination (Join-Path $tempRoot $singleFile) -Force;" ^
+    "  if($sourceMode -eq 'package'){" ^
+    "    $pkgSrc=(Join-Path $repo $packageDir);" ^
+    "    Copy-Item -LiteralPath $pkgSrc -Destination (Join-Path $tempRoot $packageDir) -Recurse -Force;" ^
+    "    $nestedBundle=Join-Path $tempRoot (Join-Path $packageDir 'NH_bundle');" ^
+    "    if(Test-Path -LiteralPath $nestedBundle){ Remove-Item -LiteralPath $nestedBundle -Recurse -Force };" ^
+    "    $nestedTools=Join-Path $tempRoot (Join-Path $packageDir 'tools');" ^
+    "    if(Test-Path -LiteralPath $nestedTools){ Remove-Item -LiteralPath $nestedTools -Recurse -Force };" ^
+    "  } else {" ^
+    "    Copy-Item -LiteralPath (Join-Path $repo $singleFile) -Destination (Join-Path $tempRoot $singleFile) -Force;" ^
+    "  }" ^
     "  $toolsBundleDir='%TOOLS_BUNDLE_DIR%';" ^
     "  $toolDstRoot=Join-Path $tempRoot $toolsBundleDir;" ^
-    "  $toolSrcCandidates=@((Join-Path $repo 'tools'), (Join-Path $repo (Join-Path $packageDir 'tools')));" ^
+    "  $toolSrcCandidates=@((Join-Path $repo (Join-Path $packageDir 'tools')), (Join-Path $repo 'tools'));" ^
     "  $toolSrc=$null;" ^
     "  foreach($candidate in $toolSrcCandidates){ if(Test-Path -LiteralPath $candidate -PathType Container){ $toolSrc=$candidate; break } }" ^
     "  if($toolSrc -eq $null){ throw 'Bundled tools folder not found. Expected NH_Blender\tools or tools.' }" ^
     "  Copy-Item -LiteralPath $toolSrc -Destination $toolDstRoot -Recurse -Force;" ^
+    "  $bundleSrcCandidates=@((Join-Path $repo (Join-Path $packageDir 'NH_bundle')), (Join-Path $repo 'NH_bundle'));" ^
+    "  $bundleSrc=$null;" ^
+    "  foreach($candidate in $bundleSrcCandidates){ if(Test-Path -LiteralPath $candidate -PathType Container){ $bundleSrc=$candidate; break } }" ^
+    "  if($bundleSrc -eq $null){ throw 'Bundled NH_bundle (P3D fallback) package not found. Expected NH_Blender\NH_bundle.' }" ^
+    "  Copy-Item -LiteralPath $bundleSrc -Destination (Join-Path $tempRoot 'NH_bundle') -Recurse -Force;" ^
     "  foreach($doc in @('README.md','LICENSE','CHANGELOG.md')){" ^
     "    $docPath=Join-Path $repo $doc;" ^
     "    if(Test-Path -LiteralPath $docPath){" ^
@@ -249,11 +269,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "    $badSlash=@($entries | Where-Object { $_ -like '*\*' });" ^
     "    if($badSlash.Count -gt 0){ throw ('Archive validation failed. Backslash entries: ' + ($badSlash -join ', ')); }" ^
     "    $required=@(" ^
-    "      $singleFile," ^
+    "      $entryFile," ^
     "      ($toolsBundleDir + '/xray_tex_converter/dds_python.py')," ^
-    "      ($toolsBundleDir + '/xray_tex_converter/converter.js')" ^
+    "      ($toolsBundleDir + '/xray_tex_converter/converter.js')," ^
+    "      'NH_bundle/io/import_p3d.py'," ^
+    "      'NH_bundle/utilities/validator.py'," ^
+    "      'NH_bundle/LICENSE'" ^
     "    );" ^
     "    foreach($req in $required){" ^
+    "      $req=$req.Replace('\\','/');" ^
     "      if($entries -notcontains $req){ throw ('Archive validation failed. Missing entry: ' + $req); }" ^
     "    }" ^
     "    $bad=@($entries | Where-Object { $_ -match '(^|/)__pycache__/' -or $_ -match '\.pyc$' -or $_ -match '\.pyo$' });" ^
