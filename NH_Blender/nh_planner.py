@@ -144,6 +144,10 @@ class CRAY_PG_IEFileItem(PropertyGroup):
     path: StringProperty(name="File", default="", subtype="FILE_PATH")
 
 class CRAY_PG_IEPlannerSettings(PropertyGroup):
+    tb_models_directory: StringProperty(
+        name="Terrain Builder P3D folder", default="", subtype="DIR_PATH",
+        description="Last model folder used by the Terrain Builder TXT importer",
+    )
     import_files: CollectionProperty(type=CRAY_PG_IEFileItem)
     import_active_index: IntProperty(default=0)
     quick_add_p3d_name: StringProperty(

@@ -243,6 +243,7 @@ _PERSISTED_UI_SETTINGS = {
         "split_planar_ngon_plane_tolerance",
     ),
     "cray_ie_settings": (
+        "tb_models_directory",
         "quick_add_p3d_name",
         "quick_add_search_root",
         "import_show_materials",

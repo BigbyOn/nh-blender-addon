@@ -582,6 +582,8 @@ class CRAY_PT_ImportExportPlannerPanel(Panel):
 
         ibox = layout.box()
         ibox.label(text="Batch Import (Arma 3 Object Builder)", icon="IMPORT")
+        ibox.operator("cray.import_tb_txt", text="Import Terrain Builder (.txt)", icon="IMPORT")
+        ibox.separator()
         ibox.label(text="Quick Add From NH_Objects", icon="VIEWZOOM")
         ibox.prop(st, "quick_add_search_root")
         quick_row = ibox.row(align=True)

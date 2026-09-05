@@ -1,13 +1,13 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Enisam",
-    "version": (0, 6, 2, 7),
+    "version": (0, 6, 2, 8),
     "blender": (5, 1, 1),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "All-in-one Blender toolkit for porting and preparing DayZ/Arma assets: fixes, textures, colliders, proxies, snap points, and P3D workflow helpers.",    
-    "doc_url": "https://github.com/BigbyOn/nh-blender-addon",
-    "tracker_url": "https://github.com/BigbyOn/nh-blender-addon/issues",
-    "mclink": "https://github.com/BigbyOn/nh-blender-addon",
+    "doc_url": "https://github.com/T3Z-ONE/nh-blender-addon",
+    "tracker_url": "https://github.com/T3Z-ONE/nh-blender-addon/issues",
+    "mclink": "https://github.com/T3Z-ONE/nh-blender-addon",
     "category": "Object",
 }
 
@@ -75,10 +75,13 @@ from .nh_snap import (_P3D_BUNDLE_REGISTRY, _P3D_IMPORT_CANDIDATES, _P3D_EXPORT_
 from .utilities.dayz_config import (parse_dayz_config, build_clutter_distribution,
     pick_weighted_random, CONFIG_SURFACES, CONFIG_CLUTTER)
 
+from .nh_tb_import import CRAY_OT_ImportTerrainBuilderTXT, menu_import as _tb_menu_import
+
 from . import nh_statistics as _stats
 from . import nh_ui_icons as _nh_icons
 
 classes = (
+    CRAY_OT_ImportTerrainBuilderTXT,
     CRAY_PG_Settings,
     CRAY_PG_SnapSettings,
     CRAY_PG_ColliderSettings,
@@ -272,6 +275,7 @@ def register():
     if not bpy.app.timers.is_registered(_persisted_ui_state_timer):
         bpy.app.timers.register(_persisted_ui_state_timer, first_interval=_PERSISTED_UI_STATE_TIMER_INTERVAL, persistent=True)
     _ensure_p3d_bundle_registered()
+    bpy.types.TOPBAR_MT_file_import.append(_tb_menu_import)
     _stats.start()
     _patch_p3d_import_read_file()
     if not bpy.app.timers.is_registered(_ensure_p3d_import_patch_timer):
@@ -284,6 +288,7 @@ def register():
         bpy.app.timers.register(_ensure_p3d_panel_icon_patch_timer, first_interval=1.0)
 
 def unregister():
+    bpy.types.TOPBAR_MT_file_import.remove(_tb_menu_import)
     _clear_geometry_audit_cache()
     _nh_icons.dispose()
     _stats.stop()
