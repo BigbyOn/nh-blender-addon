@@ -444,6 +444,64 @@ class CRAY_PT_FixesPanel(Panel):
         layout = self.layout
         ts = context.scene.cray_texreplace_settings
 
+        from .nh_geometry_audit_ops import _geometry_audit_has_live_cache
+
+        audit_settings = context.scene.cray_geometry_audit_settings
+        audit_box = layout.box()
+        audit_box.label(text="Geometry Audit", icon="VIEWZOOM")
+        audit_box.prop(audit_settings, "scope", text="Scope")
+        audit_box.prop(audit_settings, "inside_threshold", text="Inside Threshold")
+        audit_box.operator("cray.geometry_audit_scan", text="Scan Geometry", icon="VIEWZOOM")
+
+        if audit_settings.has_results:
+            audit_box.label(text=audit_settings.scope_label, icon="OUTLINER_COLLECTION")
+            for lod_result in audit_settings.lod_results:
+                result_box = audit_box.box()
+                result_box.label(text=lod_result.lod_name, icon="MESH_ICOSPHERE")
+                for label, property_name in (
+                    ("Raw Components", "raw_components"),
+                    ("Effective Components", "effective_components"),
+                    ("Faceless vertices", "loose_vertices"),
+                    ("Faceless islands", "faceless_islands"),
+                    ("Tiny components", "tiny_components"),
+                    ("Nested suspicious", "nested_suspicious"),
+                    ("Nested strong", "nested_strong"),
+                ):
+                    row = result_box.row(align=True)
+                    row.label(text=label)
+                    row.label(text=str(getattr(lod_result, property_name)))
+                if lod_result.not_testable_pairs:
+                    warning = result_box.row()
+                    warning.alert = True
+                    warning.label(
+                        text=f"Not testable pairs: {lod_result.not_testable_pairs}",
+                        icon="INFO",
+                    )
+                if lod_result.details:
+                    detail_row = result_box.row(align=True)
+                    detail_row.prop(
+                        lod_result,
+                        "show_details",
+                        text=f"Issue details ({len(lod_result.details)})",
+                        emboss=False,
+                        icon="TRIA_DOWN" if lod_result.show_details else "TRIA_RIGHT",
+                    )
+                    if lod_result.show_details:
+                        details = result_box.column(align=True)
+                        for detail in lod_result.details:
+                            details.label(text=detail.text)
+
+            actions = audit_box.column(align=True)
+            actions.enabled = _geometry_audit_has_live_cache(context)
+            row = actions.row(align=True)
+            op = row.operator("cray.geometry_audit_select", text="Select Faceless", icon="VERTEXSEL")
+            op.issue = "FACELESS"
+            op = row.operator("cray.geometry_audit_select", text="Select Tiny", icon="VERTEXSEL")
+            op.issue = "TINY"
+            op = actions.operator("cray.geometry_audit_select", text="Select Nested", icon="GROUP_VERTEX")
+            op.issue = "NESTED"
+            actions.operator("cray.geometry_audit_clean_safe", text="Clean Safe Garbage", icon="TRASH")
+
         check_box = layout.box()
         check_box.label(text="Export checks", icon="ERROR")
         check_box.prop(ts, "export_warn_loose_vertices", text="Loose vertices outside Memory")
