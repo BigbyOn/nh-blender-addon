@@ -1,14 +1,16 @@
 # NH Blender Plugin
 
+Форк [T3Z-ONE](https://github.com/T3Z-ONE/nh-blender-addon) на основе [BigbyOn/nh-blender-addon](https://github.com/BigbyOn/nh-blender-addon).
+
 **NH Blender** — набор инструментов для Blender, предназначенный для подготовки, редактирования и переноса моделей **DayZ / Arma** с поддержкой `.p3d`, LOD, материалов, прокси, коллизий, snap points, библиотек ассетов и массового импорта/экспорта.
 
 Аддон объединяет типовые операции вокруг P3D-пайплайна в одном интерфейсе и может работать как с установленным **Arma 3 Object Builder (A3OB)**, так и со встроенным P3D fallback.
 
-- **Версия в `main`:** `0.6.2.7`
+- **Версия:** `0.6.2.8`
 - **Blender:** `5.1.1+`
 - **Интерфейс:** `3D Viewport -> N-panel -> NH Plugin`
-- **Releases:** <https://github.com/BigbyOn/nh-blender-addon/releases>
-- **Issues:** <https://github.com/BigbyOn/nh-blender-addon/issues>
+- **Releases:** <https://github.com/T3Z-ONE/nh-blender-addon/releases>
+- **Issues:** <https://github.com/T3Z-ONE/nh-blender-addon/issues>
 - **История изменений:** [CHANGELOG.md](CHANGELOG.md)
 
 ---
@@ -18,6 +20,7 @@
 Основные возможности:
 
 - импорт и экспорт `.p3d`;
+- импорт расстановки Terrain Builder из `.txt` с автоматической загрузкой P3D и поправкой центра всех LOD;
 - встроенный P3D fallback на базе **Arma 3 Object Builder 2.5.1**;
 - Drag & Drop `.p3d` в Blender;
 - `Import/Export Planner` для массовой работы с моделями;
@@ -72,6 +75,45 @@ Bundle специально изолирован от оригинального
 
 ---
 
+## Импорт расстановки Terrain Builder (.txt)
+
+Откройте **NH Plugin → Import/Export planner → Import Terrain Builder (.txt)**
+или **File → Import → NH Terrain Builder (.txt)**.
+
+Выберите TXT и папку исходных P3D. По умолчанию используется `NH_Objects Root`
+из планировщика; последняя успешно использованная папка TXT-импорта запоминается отдельно.
+Исходные P3D не изменяются. Каждая расстановка создаётся в новой коллекции `TB: имя_файла`.
+
+Формат строки (восемь столбцов, углы в градусах, десятичная точка):
+
+```text
+"имя_модели";easting;northing;yaw;pitch;roll;scale;elevation;
+"yantar_PipeTunnel_B_turn_r_01";204688.307990;8987.692831;175.758499;0;0;1.000002;14;
+```
+
+Для тоннеля Yantar: папка `P:\NH_Objects\Locations\Yantar`, **Map easting = 200000**,
+**Map northing = 0**, **Height offset = 0**, **Model anchor = Terrain Builder XY**.
+Пример восьми секций находится в `tests/fixtures/yantar_tunnel_tb.txt` в репозитории.
+
+- **Terrain Builder XY** учитывает центр общих габаритов всех LOD по X/Y. При
+  `autocenter=0` в Geometry LOD (либо первом LOD при отсутствии Geometry) используется ноль P3D.
+  Есть отдельные режимы принудительной поправки XY, исходного нуля и центра XYZ.
+- Поворот использует Euler `(pitch, roll, -yaw)` с порядком `ZXY`, масштаб берётся из TXT.
+- **First object (XY)** вычитает координаты первой записи вместо заданного начала карты.
+- **Linked copies** связывает mesh повторений одной модели; отключите для независимой геометрии.
+- Поддерживаются UTF-8, UTF-16 с BOM и Windows-1251; имя может содержать расширение `.p3d`
+  и относительный путь от выбранной папки. Неоднозначные и отсутствующие модели дают ошибку.
+
+Импорт использует встроенный NH P3D backend либо активный A3OB, отдельный TXT-аддон не нужен.
+Требуются исходные **MLOD P3D**; бинаризованные ODOL не поддерживаются. В сцену загружается
+первый визуальный LOD, остальные читаются для расчёта габаритов. Внешние модели proxy
+рекурсивно не загружаются. Высота `elevation` применяется буквально: рельеф не семплируется,
+поэтому высоту над землёй при необходимости сначала нужно перевести в абсолютную.
+
+Расстановка проверена на восьми секциях Yantar с нулевыми pitch/roll. Стыки наклонённых
+моделей в Buldozer отдельно не проверялись. При ошибке загрузки незавершённая расстановка
+удаляется, очередь P3D планировщика не изменяется.
+
 # Требования
 
 Минимально:
@@ -101,7 +143,7 @@ Bundle специально изолирован от оригинального
 
 ## Обычная установка
 
-1. Откройте страницу [Releases](https://github.com/BigbyOn/nh-blender-addon/releases).
+1. Откройте страницу [Releases](https://github.com/T3Z-ONE/nh-blender-addon/releases).
 2. Скачайте ZIP нужной версии NH Blender.
 3. В Blender откройте:
    `Edit -> Preferences -> Add-ons`.
@@ -837,7 +879,7 @@ NH_Blender/__init__.py
 
 Для опубликованных сборок используйте страницу:
 
-<https://github.com/BigbyOn/nh-blender-addon/releases>
+<https://github.com/T3Z-ONE/nh-blender-addon/releases>
 
 ---
 
@@ -856,8 +898,8 @@ NH_Blender/__init__.py
 
 # Ссылки
 
-- GitHub: <https://github.com/BigbyOn/nh-blender-addon>
-- Releases: <https://github.com/BigbyOn/nh-blender-addon/releases>
-- Issues: <https://github.com/BigbyOn/nh-blender-addon/issues>
+- GitHub: <https://github.com/T3Z-ONE/nh-blender-addon>
+- Releases: <https://github.com/T3Z-ONE/nh-blender-addon/releases>
+- Issues: <https://github.com/T3Z-ONE/nh-blender-addon/issues>
 - Changelog: [CHANGELOG.md](CHANGELOG.md)
 - Bundled P3D backend: [NH_bundle/README.md](NH_bundle/README.md)

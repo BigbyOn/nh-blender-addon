@@ -3,7 +3,7 @@ setlocal EnableExtensions DisableDelayedExpansion
 
 cd /d "%~dp0"
 
-set "REPO_URL=https://github.com/BigbyOn/nh-blender-addon.git"
+set "REPO_URL=https://github.com/T3Z-ONE/nh-blender-addon.git"
 set "ADDON_SINGLE_FILE=NH_Blender.py"
 set "ADDON_PACKAGE_DIR=NH_Blender"
 set "TOOLS_BUNDLE_DIR=_nh_blender_tools"
