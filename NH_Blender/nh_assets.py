@@ -954,13 +954,13 @@ class CRAY_PG_AssetLibrarySettings(PropertyGroup):
         name="Common Folder",
         default=_NH_OBJECTS_DEFAULT_COMMON_ROOT,
         subtype="DIR_PATH",
-        description="РџР°РїРєР° Common СЃ .p3d Р°СЃСЃРµС‚Р°РјРё; РїРѕРґРїР°РїРєР° Buildings РёРіРЅРѕСЂРёСЂСѓРµС‚СЃСЏ",
+        description="Папка Common с .p3d ассетами; подпапка Buildings игнорируется",
     )
     environment_root: StringProperty(
         name="Environment Folder",
         default=_NH_OBJECTS_DEFAULT_ENVIRONMENT_ROOT,
         subtype="DIR_PATH",
-        description="РџР°РїРєР° Environment СЃ .p3d Р°СЃСЃРµС‚Р°РјРё",
+        description="Папка Environment с .p3d ассетами",
     )
     custom_search_root: StringProperty(
         name="Custom Search Root",
@@ -984,12 +984,12 @@ class CRAY_PG_AssetLibrarySettings(PropertyGroup):
     rebuild_existing_libraries: BoolProperty(
         name="Rebuild existing NH libraries",
         default=False,
-        description="Р—Р°РЅРѕРІРѕ РёРјРїРѕСЂС‚РёСЂРѕРІР°С‚СЊ РїР°РїРєРё, РґР°Р¶Рµ РµСЃР»Рё РєРµС€РёСЂРѕРІР°РЅРЅР°СЏ _NH_AssetLibrary.blend Р±РёР±Р»РёРѕС‚РµРєР° СѓР¶Рµ Р°РєС‚СѓР°Р»СЊРЅР°",
+        description="Заново импортировать папки, даже если кешированная _NH_AssetLibrary.blend библиотека уже актуальна",
     )
     render_textured_previews: BoolProperty(
         name="Textured rendered previews",
         default=False,
-        description="Р РµРЅРґРµСЂРёС‚СЊ РёРєРѕРЅРєРё Asset Browser СЃ СѓР¶Рµ РєРµС€РёСЂРѕРІР°РЅРЅС‹РјРё С‚РµРєСЃС‚СѓСЂР°РјРё. Р•СЃР»Рё PNG РґР»СЏ .paa РµС‰Рµ РЅРµС‚ РІ РєРµС€Рµ, РёРєРѕРЅРєР° Р±С‹СЃС‚СЂРѕ СЃРѕР·РґР°РµС‚СЃСЏ РєР°Рє geometry preview Р±РµР· РєРѕРЅРІРµСЂС‚Р°С†РёРё С‚РµРєСЃС‚СѓСЂС‹",
+        description="Рендерить иконки Asset Browser с уже кешированными текстурами. Если PNG для .paa еще нет в кеше, иконка быстро создается как geometry preview без конвертации текстуры",
     )
     asset_cut_name: StringProperty(
         name="Asset Name",
@@ -1006,7 +1006,7 @@ class CRAY_OT_AssetLibraryBuildFromFolder(Operator):
         from .nh_snap import (_has_any_p3d_import_ops)
         st = context.scene.cray_asset_library_settings
         if not _has_any_p3d_import_ops():
-            self.report({"ERROR"}, "Arma 3 Object Builder import operators not found")
+            self.report({"ERROR"}, "NH internal P3D import backend is unavailable")
             return {"CANCELLED"}
         folder_abs = bpy.path.abspath(st.folder)
         if not folder_abs or not os.path.isdir(folder_abs):
@@ -1036,7 +1036,7 @@ class CRAY_OT_AssetLibraryBuildFromFiles(Operator):
     def execute(self, context):
         from .nh_snap import (_has_any_p3d_import_ops)
         if not _has_any_p3d_import_ops():
-            self.report({"ERROR"}, "Arma 3 Object Builder import operators not found")
+            self.report({"ERROR"}, "NH internal P3D import backend is unavailable")
             return {"CANCELLED"}
         dir_abs = bpy.path.abspath(self.directory) if self.directory else ""
         files = []
@@ -2088,7 +2088,7 @@ def _build_custom_persistent_asset_library(op, context, p3d_files, *, open_brows
         op.report({"INFO"}, "Custom asset library cleared")
         return {"FINISHED"}
     if not _has_any_p3d_import_ops():
-        op.report({"ERROR"}, "Arma 3 Object Builder import operators not found")
+        op.report({"ERROR"}, "NH internal P3D import backend is unavailable")
         return {"CANCELLED"}
 
     _register_nh_objects_blender_asset_libraries()
@@ -2207,7 +2207,7 @@ def _build_nh_objects_persistent_asset_libraries(op, context, cache_missing_text
     from .nh_snap import (_has_any_p3d_import_ops)
     settings = context.scene.cray_asset_library_settings
     if not _has_any_p3d_import_ops():
-        op.report({"ERROR"}, "Arma 3 Object Builder import operators not found")
+        op.report({"ERROR"}, "NH internal P3D import backend is unavailable")
         return {"CANCELLED"}
 
     registered, missing_roots = _register_nh_objects_blender_asset_libraries()
@@ -2364,7 +2364,7 @@ def _add_new_nh_objects_assets_to_cache(op, context):
     from .nh_snap import (_has_any_p3d_import_ops)
     settings = context.scene.cray_asset_library_settings
     if not _has_any_p3d_import_ops():
-        op.report({"ERROR"}, "Arma 3 Object Builder import operators not found")
+        op.report({"ERROR"}, "NH internal P3D import backend is unavailable")
         return {"CANCELLED"}
 
     registered, missing_roots = _register_nh_objects_blender_asset_libraries()
@@ -2525,8 +2525,8 @@ class CRAY_OT_AssetLibraryBuildNHObjects(Operator):
     bl_idname = "cray.asset_library_build_nh_objects"
     bl_label = "Build NH Libraries"
     bl_description = (
-        "РЎРѕР·РґР°РµС‚ РёР»Рё РѕР±РЅРѕРІР»СЏРµС‚ Blender asset libraries РёР· РІС‹Р±СЂР°РЅРЅС‹С… РїР°РїРѕРє Common Рё Environment, "
-        "РІРєР»СЋС‡Р°СЏ РїРѕРґРїР°РїРєРё Рё РёСЃРєР»СЋС‡Р°СЏ Common\\Buildings"
+        "Создает или обновляет Blender asset libraries из выбранных папок Common и Environment, "
+        "включая подпапки и исключая Common\\Buildings"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -4482,4 +4482,3 @@ class CRAY_OT_AssetSaveToLibrary(Operator):
             return {"FINISHED"}
         self.report({"INFO"}, f"Saved {os.path.basename(filepath)} and added it to the '{library_label}' library")
         return {"FINISHED"}
-

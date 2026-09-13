@@ -279,6 +279,26 @@ def _restore_collider_exp_source_context_exp(context, source_obj, restore_edit_m
             pass
 
 
+def _select_collider_exp_result_object_exp(context, target_obj):
+    """Make the collider target the active selection after a successful build."""
+    from .nh_snap import (_deselect_all_in_view_layer, _select_object_in_view_layer)
+    if not _is_live_blender_object_exp(target_obj) or getattr(target_obj, "type", None) != "MESH":
+        return
+
+    active_obj = getattr(getattr(context, "view_layer", None), "objects", None)
+    active_obj = getattr(active_obj, "active", None) if active_obj is not None else None
+    if active_obj == target_obj and getattr(target_obj, "mode", "") == "EDIT":
+        return
+
+    try:
+        if context.mode != "OBJECT":
+            bpy.ops.object.mode_set(mode="OBJECT")
+        _deselect_all_in_view_layer(context)
+        _select_object_in_view_layer(context, target_obj, active=True)
+    except Exception:
+        pass
+
+
 def _collider_exp_guide_source_object_exp(context, guide_obj, settings=None):
     from .nh_collider import (_COLLIDER_EXP_GUIDE_SOURCE_PROP)
     if not _is_collider_exp_guide_object_exp(guide_obj):
@@ -2587,6 +2607,74 @@ def _append_collider_exp_hull_to_object_exp(target_obj, world_points, op, materi
     return _apply_collider_exp_hull_build_stats_exp(stats, build)
 
 
+def _build_hull_from_selected_vertices_in_edit_object_exp(context, target_obj, recalc_normals=True):
+    from .nh_collider import (_vector_quantized_key)
+    from .nh_snap import (_tag_redraw_all_areas)
+    if target_obj is None or getattr(target_obj, "type", None) != "MESH":
+        raise RuntimeError("Target object must be a mesh")
+    if context.mode != "EDIT_MESH" or getattr(target_obj, "mode", "") != "EDIT":
+        raise RuntimeError("Hull requires the active mesh to be in Edit Mode")
+
+    mesh = target_obj.data
+    bm = bmesh.from_edit_mesh(mesh)
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+
+    selected_verts = [vert for vert in bm.verts if vert.is_valid and vert.select]
+    unique_point_keys = {_vector_quantized_key(vert.co) for vert in selected_verts}
+    if len(unique_point_keys) < 4:
+        raise RuntimeError("Need at least 4 unique selected vertices to build a hull")
+
+    before_vert_count = len(bm.verts)
+    before_face_count = len(bm.faces)
+    try:
+        bpy.ops.mesh.select_mode(type="VERT")
+        result = bpy.ops.mesh.convex_hull(
+            delete_unused=True,
+            use_existing_faces=False,
+            make_holes=False,
+            join_triangles=True,
+            face_threshold=0.0001745329,
+            shape_threshold=0.0001745329,
+            uvs=False,
+            vcols=False,
+            seam=False,
+            sharp=False,
+            materials=False,
+        )
+        if "FINISHED" not in set(result or []):
+            raise RuntimeError("Blender could not build a convex hull from the selection")
+
+        bm = bmesh.from_edit_mesh(mesh)
+        bm.verts.ensure_lookup_table()
+        bm.edges.ensure_lookup_table()
+        bm.faces.ensure_lookup_table()
+        result_faces = [face for face in bm.faces if face.is_valid and face.select]
+        if not result_faces:
+            raise RuntimeError("Convex hull did not create faces (selection may be flat or degenerate)")
+        if recalc_normals:
+            bmesh.ops.recalc_face_normals(bm, faces=result_faces)
+        bm.normal_update()
+        bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
+        bpy.ops.mesh.select_mode(type="FACE")
+    except Exception:
+        bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
+        raise
+
+    try:
+        mesh.update(calc_edges=True)
+    except Exception:
+        pass
+    _tag_redraw_all_areas(context)
+    return {
+        "verts_added": len(bm.verts) - before_vert_count,
+        "faces_added": len(bm.faces) - before_face_count,
+        "result_faces": len(result_faces),
+        "used_verts": len(unique_point_keys),
+    }
+
+
 def _build_collider_exp_hull_from_selected_loose_verts_in_place_exp(context, target_obj, op, material_index=None):
     from .nh_collider import (_finalize_convex_hull_geometry, _select_only_faces_in_bmesh, _vector_quantized_key)
     from .nh_snap import (_tag_redraw_all_areas)
@@ -4158,6 +4246,7 @@ class CRAY_OT_EnsureColliderLODExp(Operator):
             settings,
             prop_names=("target_lod",),
         )
+        _select_collider_exp_result_object_exp(context, target_obj)
         self.report({"INFO"}, f"Experimental collider LOD ready: {target_obj.name}")
         return {"FINISHED"}
 
@@ -4251,6 +4340,7 @@ class CRAY_OT_GenerateBoxColliderExp(Operator):
                 "parts": len(data_items),
             },
         )
+        _select_collider_exp_result_object_exp(context, target_obj)
         self.report({"INFO"}, f"Generated {len(data_items)} box collider part(s) in {target_obj.name}: +{stats['verts_added']} verts, +{stats['faces_added']} faces")
         return {"FINISHED"}
 
@@ -4386,6 +4476,7 @@ class CRAY_OT_GenerateConvexHullColliderExp(Operator):
                 ),
             },
         )
+        _select_collider_exp_result_object_exp(context, target_obj)
         report_level = {"WARNING"} if (
             int(stats.get("max_triangles", 0)) > 0
             and int(stats.get("triangles", 0)) > int(stats.get("max_triangles", 0))
@@ -4681,6 +4772,62 @@ class CRAY_OT_ReconvexSelectedComponentsExp(Operator):
         return {"FINISHED"}
 
 
+class CRAY_OT_HullSelectedVerticesExp(Operator):
+    """Build a convex hull directly from the current mesh vertex selection"""
+
+    bl_idname = "cray.hull_selected_vertices_exp"
+    bl_label = "Hull Selected Vertices"
+    bl_description = "Create convex hull geometry from the selected vertices without expanding the selection to connected components"
+    bl_options = {"REGISTER", "UNDO"}
+
+    recalc_normals: BoolProperty(name="Recalculate Normals", default=True)
+
+    @classmethod
+    def poll(cls, context):
+        obj = getattr(context, "edit_object", None)
+        return obj is not None and getattr(obj, "type", None) == "MESH" and getattr(obj, "mode", "") == "EDIT"
+
+    def invoke(self, context, event):
+        from .nh_collider import (_collider_exp_settings_exp)
+        del event
+        _copy_collider_exp_settings_to_operator_exp(
+            self,
+            _collider_exp_settings_exp(context),
+            prop_names=("recalc_normals",),
+        )
+        return self.execute(context)
+
+    def draw(self, context):
+        del context
+        self.layout.prop(self, "recalc_normals")
+
+    def execute(self, context):
+        from .nh_base import (_fmt_exc)
+        target_obj = getattr(context, "edit_object", None) or getattr(context, "active_object", None)
+        if target_obj is None or getattr(target_obj, "type", None) != "MESH" or getattr(target_obj, "mode", "") != "EDIT":
+            self.report({"ERROR"}, "Open a mesh in Edit Mode and select at least 4 vertices")
+            return {"CANCELLED"}
+
+        try:
+            stats = _build_hull_from_selected_vertices_in_edit_object_exp(
+                context,
+                target_obj,
+                recalc_normals=bool(self.recalc_normals),
+            )
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        self.report(
+            {"INFO"},
+            (
+                f"Built hull from {stats['used_verts']} selected vertices in {target_obj.name}: "
+                f"{stats['result_faces']} hull faces"
+            ),
+        )
+        return {"FINISHED"}
+
+
 class CRAY_OT_DeleteLastColliderExp(Operator):
     """Delete the most recently generated experimental collider geometry"""
 
@@ -4865,6 +5012,7 @@ class CRAY_OT_CreateCylinderGuideColliderExp(Operator):
                 "parts": len(data_items),
             },
         )
+        _select_collider_exp_result_object_exp(context, target_obj)
         self.report({"INFO"}, f"Created {len(data_items)} cylinder collider part(s) in {target_obj.name}")
         return {"FINISHED"}
 
@@ -4998,6 +5146,7 @@ class CRAY_OT_CreatePipeGuideColliderExp(Operator):
                 "parts": len(data_items),
             },
         )
+        _select_collider_exp_result_object_exp(context, target_obj)
         self.report({"INFO"}, f"Created {len(data_items)} pipe collider part(s) in {target_obj.name}")
         return {"FINISHED"}
 
@@ -5127,6 +5276,7 @@ class CRAY_OT_GenerateCylinderBoxesColliderExp(Operator):
                 "parts": len(data_items),
             },
         )
+        _select_collider_exp_result_object_exp(context, target_obj)
         self.report({"INFO"}, f"Generated {actual_segments} cylinder box segments in {target_obj.name}")
         return {"FINISHED"}
 
@@ -5261,6 +5411,7 @@ class CRAY_OT_GeneratePipeBoxesColliderExp(Operator):
                 "parts": len(data_items),
             },
         )
+        _select_collider_exp_result_object_exp(context, target_obj)
         self.report({"INFO"}, f"Generated {actual_segments} pipe box segments in {target_obj.name}")
         return {"FINISHED"}
 
@@ -5356,6 +5507,7 @@ class CRAY_OT_GenerateSphereColliderExp(Operator):
                 "parts": len(data_items),
             },
         )
+        _select_collider_exp_result_object_exp(context, target_obj)
         self.report({"INFO"}, f"Generated {len(data_items)} sphere collider part(s) in {target_obj.name}: +{stats['verts_added']} verts, +{stats['faces_added']} faces")
         return {"FINISHED"}
 
@@ -5478,6 +5630,7 @@ class CRAY_OT_GenerateCapsuleColliderExp(Operator):
                 "capsule_follow_source_angle": bool(self.capsule_follow_source_angle),
             },
         )
+        _select_collider_exp_result_object_exp(context, target_obj)
         self.report({"INFO"}, f"Generated {len(data_items)} capsule collider part(s) in {target_obj.name}: +{stats['verts_added']} verts, +{stats['faces_added']} faces")
         return {"FINISHED"}
 

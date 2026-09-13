@@ -6,8 +6,8 @@
 #  Copyright (C) MrClock, Hans-Joerg "Alwarren" Frieden and contributors.
 #  See the LICENSE file in this directory for the full license text.
 #
-#  This bundle is used by the NH Blender plugin as a fallback ONLY when the
-#  original "Arma 3 Object Builder" extension is not installed. It contains
+#  This bundle is the primary internal P3D backend used by the NH Blender
+#  plugin. External "Arma 3 Object Builder" remains a compatibility fallback. It contains
 #  the modules needed for P3D import/export, PAA texture decoding and the
 #  A3OB object/material/scene property groups referenced by NH.
 #

@@ -6,7 +6,7 @@
 
 Аддон объединяет типовые операции вокруг P3D-пайплайна в одном интерфейсе и может работать как с установленным **Arma 3 Object Builder (A3OB)**, так и со встроенным P3D fallback.
 
-- **Версия:** `0.6.2.8`
+- **Версия:** `0.6.2.22`
 - **Blender:** `5.1.1+`
 - **Интерфейс:** `3D Viewport -> N-panel -> NH Plugin`
 - **Releases:** <https://github.com/T3Z-ONE/nh-blender-addon/releases>
@@ -21,9 +21,11 @@
 
 - импорт и экспорт `.p3d`;
 - импорт расстановки Terrain Builder из `.txt` с автоматической загрузкой P3D и поправкой центра всех LOD;
-- встроенный P3D fallback на базе **Arma 3 Object Builder 2.5.1**;
+- внутренний P3D backend на базе **Arma 3 Object Builder 2.5.1**;
+- внутренний backend используется первым во всех NH import/export workflow; внешний A3OB остаётся только резервом совместимости;
 - Drag & Drop `.p3d` в Blender;
 - `Import/Export Planner` для массовой работы с моделями;
+- drag-and-drop `.p3d` в окно Blender сразу добавляет файлы в очередь `Import/Export Planner` и немедленно обновляет список;
 - автоматическое сохранение связи импортированной модели с исходным `.p3d` для `Back to source`;
 - работа с `Resolution`, `Geometry`, `View Geometry`, `Fire Geometry`, `Roadway` и `Memory` LOD;
 - отдельный генератор коллизий `Collider`;
@@ -225,7 +227,7 @@ F3 -> Reload Scripts
 | `P3D Asset Library` | NH Objects libraries, Custom Assets, Asset Browser и proxy workflow |
 | `Snap Points (Memory LOD)` | Создание snap-point selections и Memory LOD workflow |
 | `Import/Export Planner` | Batch import/export, Back to source, Drag & Drop интеграция |
-| `Fixes` | Repair, cleanup, geometry checks, component fixes |
+| `P3D Tools & Checks` | Snap magnet check, repair, cleanup, geometry checks and component fixes |
 | `Model Split / Merge` | Part Transfer, split, merge и grid/cut-line workflow |
 | `Texture Replace` | Поиск/замена `.paa` и `.rvmat`, material preview и texture export |
 | `Cache Manager` | Texture preview cache, asset cache и пересборка иконок |
@@ -276,6 +278,8 @@ NH Blender перехватывает P3D drop handler и позволяет:
 - после batch-import автоматически скрывать коллекции;
 - либо исключать их из текущего View Layer.
 
+При импорте NH также распознаёт старые P3D, где Resolution/Geometry/Roadway LOD накопили большой общий сдвиг относительно `Resolution 0`, и автоматически возвращает их в одну систему координат. `Memory` при этой коррекции не перемещается, чтобы не повредить snap points.
+
 ## Batch Export
 
 Основные режимы:
@@ -289,6 +293,8 @@ NH Blender перехватывает P3D drop handler и позволяет:
 - экспортировать только `.p3d`-подобные root collections;
 - экспортировать только split parts;
 - использовать `Force export all LODs`.
+
+Batch Export сохраняет мировые матрицы и исходную видимость объектов/коллекций. Перед записью он также исправляет большой legacy-сдвиг LOD в уже открытых старых `.blend`, поэтому для исправления такой сцены не требуется повторный импорт.
 
 ### Проверки перед экспортом
 
@@ -422,7 +428,7 @@ Snap Points предназначены для создания согласов�
 2. Найдите или создайте `Point clouds -> Memory`.
 3. Перейдите в `Edit Mode` исходного mesh.
 4. Выделите две вершины.
-5. Укажите P3D name, pair ID и нужные параметры.
+5. Укажите P3D name и нужные параметры; pair ID выбирается автоматически.
 6. Создайте snap pair.
 
 Особенности:
@@ -430,10 +436,13 @@ Snap Points предназначены для создания согласов�
 - P3D name нормализуется автоматически;
 - Memory LOD создаётся внутри правильной `.p3d` ветки;
 - точки пары получают стабильную нумерацию `0/1`;
+- числовой pair ID не вводится вручную: единственным источником нумерации служат существующие `.sp_` vertex groups во всех Memory LOD сцены; проверка начинается с `01` и увеличивает номер, пока не найдёт первый свободный ID для текущего P3D name; имена roots и номера `_pNN_` на ID не влияют, а выбранные пользователем A/V targets никогда не переориентируются автоматически;
+- ось `X/Y/Z` всегда задаёт порядок точек `0/1`, но добавляется в имя только при включённом `Include Axis in Name`;
+- создание останавливается до изменения Memory LOD, если выделено не ровно две вершины или если возле обеих выбранных позиций нет вершин одновременно в A Target и V Target; допустимое расстояние задаётся через `Target Match Distance`;
 - при необходимости можно заменить существующие named groups;
 - имеется fallback workflow для определения точки по грани/оси;
 - доступны batch-операции и cleanup импортированных объектов;
-- Plain Axis helpers находятся рядом с snap workflow.
+- Plain Axis helpers находятся рядом с snap workflow: обычное удаление возвращает все LOD в исходные transforms, а удаление с `Save Z` возвращает исходные X/Y и сохраняет Z от `Resolution 0`; `Memory` и все остальные P3D LOD выравниваются по этой высоте.
 
 ---
 
@@ -632,9 +641,11 @@ Proxy можно создавать/дублировать в:
 
 ---
 
-# Fixes
+# P3D Tools & Checks
 
-`Fixes` содержит операции для восстановления импортированных P3D и очистки проблемной геометрии.
+`P3D Tools & Checks` содержит проверки, операции восстановления импортированных P3D и очистки проблемной геометрии.
+
+`Snap Magnet Check` не требует ручного выбора A/V моделей или имени. Он находит во всех P3D Memory LOD точки с одинаковым ID, строит непрерывные цепочки `01 -> 02 -> 03...` и собирает их по соответствиям `_0 -> _0` и `_1 -> _1`. Посторонние P3D без `.sp_` игнорируются, а односторонние коннекторы к отсутствующим в сцене моделям выводятся как предупреждения и не блокируют готовую цепочку. Дубликаты, неполные пары `_0/_1`, пропуски ID, неверные расстояния и разрывы цепи подробно выводятся в System Console и нижний статус Blender. Для цепочек старого локального нумератора вида `01, 02, 01, 02` проверка может безопасно восстановить `01...NN` по однозначному порядку P3D roots `_p01_, _p02_...`. Перемещаются только visual Resolution LOD; Memory, Geometry и другие служебные LOD остаются на месте.
 
 ## Repair Invalid P3D Selections
 

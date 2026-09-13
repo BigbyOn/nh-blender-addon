@@ -1033,6 +1033,38 @@ def _obj_depth(obj):
         p = p.parent
     return d
 
+
+def _set_object_world_matrix_stable(obj, world_matrix) -> bool:
+    """Commit a world transform even when an object's collection is excluded."""
+    if obj is None or world_matrix is None:
+        return False
+    try:
+        desired = world_matrix.copy()
+    except Exception:
+        desired = Matrix(world_matrix)
+
+    try:
+        has_constraints = len(obj.constraints) > 0
+    except Exception:
+        has_constraints = True
+
+    try:
+        if not has_constraints:
+            parent = getattr(obj, "parent", None)
+            if parent is None:
+                obj.matrix_basis = desired
+            else:
+                parent_space = parent.matrix_world @ obj.matrix_parent_inverse
+                obj.matrix_basis = parent_space.inverted_safe() @ desired
+        obj.matrix_world = desired
+        return True
+    except Exception:
+        try:
+            obj.matrix_world = desired
+            return True
+        except Exception:
+            return False
+
 _HELPER_OBJ_PREFIXES = (
     "sector",
     "sectors",
@@ -1338,7 +1370,7 @@ def _set_resolution0_p3d_lod_props(obj):
     if obj is None or obj.type != "MESH":
         raise RuntimeError("Repair result must be a mesh")
     if not hasattr(obj, "a3ob_properties_object"):
-        raise RuntimeError("P3D object properties are missing. Enable Arma 3 Object Builder first.")
+        raise RuntimeError("P3D object properties are missing. Re-enable the NH internal P3D backend.")
 
     props = obj.a3ob_properties_object
     props.lod = "0"
@@ -2673,8 +2705,8 @@ def _create_blender_image_from_paa_texture(filepath: str, tex, color_space: str)
     from .nh_snap import (_import_first_available_module)
     paa_ns = _import_first_available_module(
         (
-            "bl_ext.user_default.Arma3ObjectBuilder.io.data_paa",
             "NH_bundle.io.data_paa",
+            "bl_ext.user_default.Arma3ObjectBuilder.io.data_paa",
         )
     )
     if paa_ns is None:
@@ -2726,8 +2758,8 @@ def _load_paa_image_with_original_p3d(filepath: str, color_space: str = "SRGB", 
 
     paa_mod = _import_first_available_module(
         (
-            "bl_ext.user_default.Arma3ObjectBuilder.io.data_paa",
             "NH_bundle.io.data_paa",
+            "bl_ext.user_default.Arma3ObjectBuilder.io.data_paa",
         )
     )
     if paa_mod is None:
@@ -2745,8 +2777,8 @@ def _ensure_p3d_import_paa_helpers():
     from .nh_snap import (_import_first_available_module)
     import_paa_mod = _import_first_available_module(
         (
-            "bl_ext.user_default.Arma3ObjectBuilder.io.import_paa",
             "NH_bundle.io.import_paa",
+            "bl_ext.user_default.Arma3ObjectBuilder.io.import_paa",
         )
     )
     if import_paa_mod is None:
@@ -2845,7 +2877,7 @@ def _add_texture_resolution_candidate(candidates, value):
         return
     candidates.extend(_base_color_path_variants(raw))
 
-def _resolve_p3d_texture_path(texture_path: str) -> str:
+def _resolve_p3d_texture_path(texture_path: str, extra_roots=None) -> str:
     from .nh_collider_exp import (_is_blender_install_texture_path_invalid, _is_invalid_windows_filename_component, _is_placeholder_material_name, _iter_texture_resolution_roots, _norm_path)
     from .nh_snap import (_import_first_available_module)
     raw = _normalize_drive_relative_path(texture_path)
@@ -2860,8 +2892,8 @@ def _resolve_p3d_texture_path(texture_path: str) -> str:
 
     import_p3d_mod = _import_first_available_module(
         (
-            "bl_ext.user_default.Arma3ObjectBuilder.io.import_p3d",
             "NH_bundle.io.import_p3d",
+            "bl_ext.user_default.Arma3ObjectBuilder.io.import_p3d",
         )
     )
     resolver = getattr(import_p3d_mod, "resolve_texture_path", None) if import_p3d_mod is not None else None
@@ -2877,8 +2909,8 @@ def _resolve_p3d_texture_path(texture_path: str) -> str:
 
     utils_mod = _import_first_available_module(
         (
-            "bl_ext.user_default.Arma3ObjectBuilder.utilities.generic",
             "NH_bundle.utilities.generic",
+            "bl_ext.user_default.Arma3ObjectBuilder.utilities.generic",
         )
     )
     restore_absolute = getattr(utils_mod, "restore_absolute", None) if utils_mod is not None else None
@@ -2901,11 +2933,27 @@ def _resolve_p3d_texture_path(texture_path: str) -> str:
 
     raw_is_abs = os.path.isabs(raw) or re.match(r"^[A-Za-z]:[\\/]", raw) is not None
     if not raw_is_abs:
-        for root in _iter_texture_resolution_roots():
+        roots = []
+        seen_roots = set()
+        for root in list(extra_roots or ()) + list(_iter_texture_resolution_roots()):
             if not root:
                 continue
+            try:
+                root = os.path.abspath(os.path.normpath(_normalize_drive_relative_path(root)))
+            except Exception:
+                continue
+            root_key = os.path.normcase(root)
+            if root_key in seen_roots:
+                continue
+            seen_roots.add(root_key)
+            roots.append(root)
+
+        for root in roots:
             for rel in _texture_path_rel_variants(raw):
                 _add_texture_resolution_candidate(candidates, os.path.join(root, rel))
+                rel_parts = [part for part in re.split(r"[\\/]", rel) if part]
+                if rel_parts and os.path.basename(root).lower() == rel_parts[0].lower():
+                    _add_texture_resolution_candidate(candidates, os.path.join(root, *rel_parts[1:]))
 
     try:
         blender_abs = os.path.abspath(bpy.path.abspath(raw))
@@ -2944,6 +2992,49 @@ def _resolve_p3d_texture_path(texture_path: str) -> str:
             return resolved
 
     return ""
+
+
+def _texture_resolution_roots_from_imported_objects(imported_objs):
+    """Infer project roots from the P3D source paths tagged on imported data."""
+    roots = []
+    seen = set()
+
+    for obj in imported_objs or ():
+        if obj is None:
+            continue
+        source_paths = []
+        try:
+            source_paths.append(str(obj.get(_IE_SOURCE_PATH_KEY, "") or "").strip())
+        except Exception:
+            pass
+        for collection in getattr(obj, "users_collection", ()):
+            try:
+                source_paths.append(str(collection.get(_IE_SOURCE_PATH_KEY, "") or "").strip())
+            except Exception:
+                pass
+
+        for source_path in source_paths:
+            if not source_path:
+                continue
+            try:
+                current = os.path.abspath(os.path.dirname(_normalize_drive_relative_path(source_path)))
+            except Exception:
+                continue
+
+            # P3D texture paths are project-relative.  Walking from the model's
+            # directory to the volume/share root covers both a classic P: drive
+            # and projects stored below an ordinary workspace directory.
+            while current:
+                key = os.path.normcase(current)
+                if key not in seen:
+                    seen.add(key)
+                    roots.append(current)
+                parent = os.path.dirname(current)
+                if not parent or os.path.normcase(parent) == key:
+                    break
+                current = parent
+
+    return roots
 
 def _nh_blender_shared_cache_base(create=False) -> str:
     base_dir = os.environ.get("LOCALAPPDATA") or ""
@@ -3461,10 +3552,11 @@ def _load_material_preview_image(
     color_space: str = "SRGB",
     force_rebuild_cache: bool = False,
     cache_missing_textures: bool = True,
+    search_roots=None,
 ):
     from .nh_base import (_fmt_exc)
     from .nh_snap import (_import_first_available_module)
-    resolved_path = _resolve_p3d_texture_path(texture_path)
+    resolved_path = _resolve_p3d_texture_path(texture_path, extra_roots=search_roots)
     if not resolved_path:
         return None, False, "", "missing", ""
 
@@ -3480,8 +3572,8 @@ def _load_material_preview_image(
 
     import_paa_mod = _import_first_available_module(
         (
-            "bl_ext.user_default.Arma3ObjectBuilder.io.import_paa",
             "NH_bundle.io.import_paa",
+            "bl_ext.user_default.Arma3ObjectBuilder.io.import_paa",
         )
     )
     if import_paa_mod is None:
@@ -3588,6 +3680,55 @@ def _setup_import_preview_nodes(material: bpy.types.Material, image, texture_lab
 
     return True
 
+
+def _enable_material_preview_in_viewports(context) -> int:
+    """Make successfully built texture previews visible in the current window."""
+    spaces = []
+    seen = set()
+
+    space = getattr(context, "space_data", None)
+    if getattr(space, "type", None) == "VIEW_3D":
+        spaces.append(space)
+
+    screens = []
+    screen = getattr(context, "screen", None)
+    if screen is not None:
+        screens.append(screen)
+    window = getattr(context, "window", None)
+    window_screen = getattr(window, "screen", None) if window is not None else None
+    if window_screen is not None and window_screen not in screens:
+        screens.append(window_screen)
+
+    for item_screen in screens:
+        for area in getattr(item_screen, "areas", ()):
+            if getattr(area, "type", None) != "VIEW_3D":
+                continue
+            for area_space in getattr(area, "spaces", ()):
+                if getattr(area_space, "type", None) == "VIEW_3D":
+                    spaces.append(area_space)
+
+    changed = 0
+    for view_space in spaces:
+        try:
+            ptr = view_space.as_pointer()
+        except Exception:
+            ptr = id(view_space)
+        if ptr in seen:
+            continue
+        seen.add(ptr)
+
+        shading = getattr(view_space, "shading", None)
+        if shading is None:
+            continue
+        try:
+            shading.type = "MATERIAL"
+            shading.color_type = "MATERIAL"
+            changed += 1
+        except Exception:
+            pass
+
+    return changed
+
 def _postprocess_imported_material_previews(
     context,
     imported_objs,
@@ -3614,10 +3755,12 @@ def _postprocess_imported_material_previews(
     if not show_materials:
         return result
 
+    imported_objs = list(imported_objs or ())
     _repair_existing_preview_image_paths()
 
     materials = _iter_unique_materials_from_objects(imported_objs)
     result["materials_total"] = len(materials)
+    search_roots = _texture_resolution_roots_from_imported_objects(imported_objs)
 
     for mat in materials:
         paa_path, _ = _get_p3d_material_paths(mat)
@@ -3637,6 +3780,7 @@ def _postprocess_imported_material_previews(
             color_space="SRGB",
             force_rebuild_cache=force_rebuild_cache,
             cache_missing_textures=cache_missing_textures,
+            search_roots=search_roots,
         )
         if image is None:
             result["missing"] += 1
@@ -3667,6 +3811,9 @@ def _postprocess_imported_material_previews(
                         result["errors"].append(f"{mat.name}: pack preview image: {_fmt_exc(e)}")
         except Exception as e:
             result["errors"].append(f"{mat.name}: {_fmt_exc(e)}")
+
+    if result["previewed"] > 0:
+        result["viewports_material_preview"] = _enable_material_preview_in_viewports(context)
 
     scene = getattr(context, "scene", None)
     tex_settings = getattr(scene, "cray_texreplace_settings", None) if scene is not None else None
@@ -3774,14 +3921,14 @@ class CRAY_PG_TexReplaceSettings(PropertyGroup):
         name="Texture Cache Source",
         subtype="DIR_PATH",
         default=_nh_texture_export_output_root(create=False),
-        description="РљРѕСЂРЅРµРІР°СЏ РїР°РїРєР° СЃ .paa С‚РµРєСЃС‚СѓСЂР°РјРё РґР»СЏ РѕР±С‰РµРіРѕ PNG-РєРµС€Р° Blender",
+        description="Корневая папка с .paa текстурами для общего PNG-кеша Blender",
     )
     texture_cache_workers: IntProperty(
         name="Cache Workers",
         default=4,
         min=1,
         max=8,
-        description="РљРѕР»РёС‡РµСЃС‚РІРѕ С„РѕРЅРѕРІС‹С… Blender worker-РїСЂРѕС†РµСЃСЃРѕРІ РґР»СЏ РїР°СЂР°Р»Р»РµР»СЊРЅРѕР№ СЃР±РѕСЂРєРё PNG-РєРµС€Р° С‚РµРєСЃС‚СѓСЂ",
+        description="Количество фоновых Blender worker-процессов для параллельной сборки PNG-кеша текстур",
     )
     texture_cache_last_summary: StringProperty(
         default="",
@@ -4095,10 +4242,14 @@ class CRAY_OT_TexSourceRootRemove(Operator):
 
 class CRAY_OT_UpdateObjectPreview(Operator):
     bl_idname = "cray.update_object_preview"
-    bl_label = "Update Object Preview"
+    bl_label = "Restore Material Preview"
+    bl_description = (
+        "Rebuild texture preview nodes for the selected P3D model and switch the current 3D view to Material Preview"
+    )
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
+        from .nh_base import (_fmt_exc)
         ts = context.scene.cray_texreplace_settings
         obj, src = _resolve_tex_target_object(context, ts.picked_object)
         if obj is None:
@@ -4107,12 +4258,44 @@ class CRAY_OT_UpdateObjectPreview(Operator):
             return {"CANCELLED"}
         ts.picked_object = obj
 
-        n = _collect_object_image_materials(obj, ts.obj_preview_items)
-        if n == 0:
-            self.report({"WARNING"}, f"Object '{obj.name}' has no materials with Image Texture nodes")
+        root_collection = _find_p3d_root_collection_for_object(context, obj)
+        scope_objects = _collect_collection_objects_recursive(root_collection) if root_collection is not None else [obj]
+
+        try:
+            preview_stats = _postprocess_imported_material_previews(
+                context,
+                scope_objects,
+                show_materials=True,
+                keep_converted_textures=True,
+                pack_runtime_images=False,
+            )
+        except Exception as e:
+            self.report({"ERROR"}, f"Material preview failed: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+
+        _log_import_preview_summary(getattr(root_collection, "name", obj.name), preview_stats)
+        image_materials = _collect_object_image_materials(obj, ts.obj_preview_items)
+        previewed = int(preview_stats.get("previewed", 0) or 0)
+        missing = int(preview_stats.get("missing", 0) or 0)
+        errors = len(preview_stats.get("errors", ()) or ())
+        viewports = int(preview_stats.get("viewports_material_preview", 0) or 0)
+
+        if previewed == 0 and image_materials > 0:
+            viewports = _enable_material_preview_in_viewports(context)
+
+        suffix = "" if src == "picked" else f" (auto: {src})"
+        if previewed > 0 or image_materials > 0:
+            self.report(
+                {"INFO"},
+                f"Material Preview restored: {max(previewed, image_materials)} material(s), {viewports} viewport(s){suffix}",
+            )
+        elif missing or errors:
+            self.report(
+                {"WARNING"},
+                f"No preview loaded: missing textures {missing}, errors {errors} (see System Console)",
+            )
         else:
-            suffix = "" if src == "picked" else f" (auto: {src})"
-            self.report({"INFO"}, f"Object '{obj.name}': {n} materials with Image Texture nodes{suffix}")
+            self.report({"WARNING"}, f"Object '{obj.name}' has no P3D texture paths")
         return {"FINISHED"}
 
 class CRAY_OT_FixMeshHierarchy(Operator):
@@ -5241,13 +5424,13 @@ class CRAY_OT_CleanTextureConverterTestOutputs(Operator):
 class CRAY_OT_TextureCacheBuild(Operator):
     bl_idname = "cray.texture_cache_build"
     bl_label = "Build Texture PNG Cache"
-    bl_description = "РЎРєР°РЅРёСЂСѓРµС‚ РІС‹Р±СЂР°РЅРЅСѓСЋ РїР°РїРєСѓ С‚РµРєСЃС‚СѓСЂ. Update РґРѕР±Р°РІР»СЏРµС‚ С‚РѕР»СЊРєРѕ РѕС‚СЃСѓС‚СЃС‚РІСѓСЋС‰РёРµ РёР»Рё СѓСЃС‚Р°СЂРµРІС€РёРµ PNG, Rebuild All РїРµСЂРµСЃРѕР·РґР°РµС‚ РІРµСЃСЊ РєРµС€"
+    bl_description = "Сканирует выбранную папку текстур. Update добавляет только отсутствующие или устаревшие PNG, Rebuild All пересоздает весь кеш"
     bl_options = {"REGISTER", "UNDO"}
 
     missing_only: BoolProperty(
-        name="РўРѕР»СЊРєРѕ РЅРѕРІС‹Рµ/СѓСЃС‚Р°СЂРµРІС€РёРµ",
+        name="Только новые/устаревшие",
         default=False,
-        description="РџСЂРѕРїСѓСЃРєР°С‚СЊ СѓР¶Рµ РІР°Р»РёРґРЅС‹Рµ PNG Рё РєРѕРЅРІРµСЂС‚РёСЂРѕРІР°С‚СЊ С‚РѕР»СЊРєРѕ РѕС‚СЃСѓС‚СЃС‚РІСѓСЋС‰РёРµ РёР»Рё СѓСЃС‚Р°СЂРµРІС€РёРµ .paa",
+        description="Пропускать уже валидные PNG и конвертировать только отсутствующие или устаревшие .paa",
     )
 
     def execute(self, context):
@@ -5403,7 +5586,7 @@ def _cache_nh_library_used_textures(op, context, *, force_rebuild: bool = False)
     settings = context.scene.cray_asset_library_settings
     ts = context.scene.cray_texreplace_settings
     if not _has_any_p3d_import_ops():
-        op.report({"ERROR"}, "Arma 3 Object Builder import operators not found")
+        op.report({"ERROR"}, "NH internal P3D import backend is unavailable")
         return {"CANCELLED"}
 
     configured_roots = [
@@ -5537,9 +5720,9 @@ class CRAY_OT_TextureCacheBuildNHLibraryUsed(Operator):
     bl_options = {"REGISTER", "UNDO"}
 
     force_rebuild: BoolProperty(
-        name="РџРµСЂРµСЃРѕР·РґР°С‚СЊ СЃСѓС‰РµСЃС‚РІСѓСЋС‰РёРµ PNG",
+        name="Пересоздать существующие PNG",
         default=False,
-        description="РџРµСЂРµСЃРѕР·РґР°С‚СЊ PNG РґР»СЏ РёСЃРїРѕР»СЊР·СѓРµРјС‹С… С‚РµРєСЃС‚СѓСЂ NH Р±РёР±Р»РёРѕС‚РµРєРё РІРјРµСЃС‚Рѕ РёСЃРїРѕР»СЊР·РѕРІР°РЅРёСЏ РІР°Р»РёРґРЅРѕРіРѕ РєРµС€Р°",
+        description="Пересоздать PNG для используемых текстур NH библиотеки вместо использования валидного кеша",
     )
 
     def execute(self, context):
@@ -5549,7 +5732,7 @@ class CRAY_OT_TextureCacheBuildNHLibraryUsed(Operator):
 class CRAY_OT_OpenTexturePreviewCacheFolder(Operator):
     bl_idname = "cray.open_texture_preview_cache_folder"
     bl_label = "Open Texture PNG Cache"
-    bl_description = "РћС‚РєСЂС‹РІР°РµС‚ РїР°РїРєСѓ РѕР±С‰РµРіРѕ PNG-РєРµС€Р°, РєСѓРґР° СЃРєР»Р°РґС‹РІР°СЋС‚СЃСЏ РїСЂРµРІСЊСЋ РґР»СЏ .paa С‚РµРєСЃС‚СѓСЂ"
+    bl_description = "Открывает папку общего PNG-кеша, куда складываются превью для .paa текстур"
     bl_options = {"REGISTER"}
 
     def execute(self, context):
@@ -5566,7 +5749,7 @@ class CRAY_OT_OpenTexturePreviewCacheFolder(Operator):
 class CRAY_OT_OpenTextureCacheLastReport(Operator):
     bl_idname = "cray.open_texture_cache_last_report"
     bl_label = "Open Texture Cache Report"
-    bl_description = "РћС‚РєСЂС‹РІР°РµС‚ РїРѕСЃР»РµРґРЅРёР№ РѕС‚С‡РµС‚ РїРѕ СЃР±РѕСЂРєРµ PNG-РєРµС€Р° С‚РµРєСЃС‚СѓСЂ"
+    bl_description = "Открывает последний отчет по сборке PNG-кеша текстур"
     bl_options = {"REGISTER"}
 
     def execute(self, context):
@@ -5588,7 +5771,7 @@ class CRAY_OT_OpenTextureCacheLastReport(Operator):
 class CRAY_OT_OpenNHAssetCacheFolder(Operator):
     bl_idname = "cray.open_nh_asset_cache_folder"
     bl_label = "Open NH Library Cache"
-    bl_description = "РћС‚РєСЂС‹РІР°РµС‚ РїР°РїРєСѓ, РіРґРµ Р»РµР¶Р°С‚ РєРµС€РёСЂРѕРІР°РЅРЅС‹Рµ .blend asset libraries Рё РёС… РїСЂРµРІСЊСЋ"
+    bl_description = "Открывает папку, где лежат кешированные .blend asset libraries и их превью"
     bl_options = {"REGISTER"}
 
     def execute(self, context):
@@ -5606,7 +5789,7 @@ class CRAY_OT_OpenNHAssetCacheFolder(Operator):
 class CRAY_OT_AssetLibraryRebuildIconCache(Operator):
     bl_idname = "cray.asset_library_rebuild_icon_cache"
     bl_label = "Rebuild Library Icons"
-    bl_description = "РџРµСЂРµСЃРѕР±РёСЂР°РµС‚ NH asset libraries Рё Р·Р°РЅРѕРІРѕ СЃРѕР·РґР°РµС‚ РёРєРѕРЅРєРё Р°СЃСЃРµС‚РѕРІ СЃ С‚РµРєСѓС‰РёРјРё РЅР°СЃС‚СЂРѕР№РєР°РјРё РїСЂРµРІСЊСЋ"
+    bl_description = "Пересобирает NH asset libraries и заново создает иконки ассетов с текущими настройками превью"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -5711,7 +5894,7 @@ class CRAY_OT_AssetLibraryForceRebuildIconsTextures(Operator):
 class CRAY_OT_TextureCacheRebuildNHLibraryUsed(Operator):
     bl_idname = "cray.texture_cache_rebuild_nh_library_used"
     bl_label = "Rebuild NH Library Texture Cache"
-    bl_description = "РџРµСЂРµСЃРѕР·РґР°РµС‚ PNG-РєРµС€ С‚РѕР»СЊРєРѕ РґР»СЏ С‚РµРєСЃС‚СѓСЂ, РєРѕС‚РѕСЂС‹Рµ РёСЃРїРѕР»СЊР·СѓСЋС‚СЃСЏ Р°СЃСЃРµС‚Р°РјРё NH Р±РёР±Р»РёРѕС‚РµРє"
+    bl_description = "Пересоздает PNG-кеш только для текстур, которые используются ассетами NH библиотек"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -5791,7 +5974,22 @@ def _find_collection_path(root_collection, target_ptr):
             return [root_collection] + path
     return None
 
-def _ensure_collection_visible_in_view_layer(context, target_collection):
+def _ensure_collection_visible_in_view_layer(context, target_collection, preserve_world_objects=None):
+    preserved_world = []
+    seen_objects = set()
+    for obj in preserve_world_objects or ():
+        if obj is None:
+            continue
+        try:
+            obj_key = obj.as_pointer()
+            desired_world = obj.matrix_world.copy()
+        except Exception:
+            continue
+        if obj_key in seen_objects:
+            continue
+        seen_objects.add(obj_key)
+        preserved_world.append((obj, desired_world))
+
     root = context.scene.collection
     path = _find_collection_path(root, target_collection.as_pointer())
     if not path:
@@ -5826,6 +6024,20 @@ def _ensure_collection_visible_in_view_layer(context, target_collection):
             pass
         try:
             col.hide_render = False
+        except Exception:
+            pass
+
+    if preserved_world:
+        try:
+            context.view_layer.update()
+        except Exception:
+            pass
+        for obj, desired_world in sorted(preserved_world, key=lambda item: _obj_depth(item[0])):
+            if bpy.data.objects.get(getattr(obj, "name", "")) is not obj:
+                continue
+            _set_object_world_matrix_stable(obj, desired_world)
+        try:
+            context.view_layer.update()
         except Exception:
             pass
 
@@ -5976,10 +6188,11 @@ def _import_p3d_paths_now(operator, context, paths):
         operator.report({"ERROR"}, "No .p3d files to import")
         return {"CANCELLED"}
     if not _has_any_p3d_import_ops():
-        operator.report({"ERROR"}, "Arma 3 Object Builder import operators not found")
+        operator.report({"ERROR"}, "NH internal P3D import backend is unavailable")
         return {"CANCELLED"}
 
     imported = 0
+    repaired_lods = 0
     skipped_existing = []
     failed = []
     used_op = None
@@ -6014,12 +6227,13 @@ def _import_p3d_paths_now(operator, context, paths):
 
         imported += 1
         imported_objs = [o for o in bpy.data.objects if o.as_pointer() not in pre_obj_ptrs]
-        _tag_import_source_on_imported_data(
+        tag_stats = _tag_import_source_on_imported_data(
             context=context,
             filepath=fp,
             imported_objs=imported_objs,
             pre_collection_ptrs=pre_col_ptrs,
         )
+        repaired_lods += int(tag_stats.get("repaired_lods", 0) or 0)
         stats = _postprocess_imported_material_previews(
             context,
             imported_objs,
@@ -6042,14 +6256,15 @@ def _import_p3d_paths_now(operator, context, paths):
             print(item)
         operator.report(
             {"WARNING"},
-            f"Imported {imported}, skipped existing {len(skipped_existing)}, failed {len(failed)} (see System Console)",
+            f"Imported {imported}, skipped existing {len(skipped_existing)}, failed {len(failed)}, "
+            f"realigned {repaired_lods} displaced LOD(s) (see System Console)",
         )
         return {"FINISHED"}
 
-    operator.report(
-        {"INFO"},
-        f"Imported {imported} file(s), skipped existing {len(skipped_existing)}" + (f" via {used_op}" if used_op else ""),
-    )
+    message = f"Imported {imported} file(s), skipped existing {len(skipped_existing)}"
+    if repaired_lods:
+        message += f", realigned {repaired_lods} displaced LOD(s)"
+    operator.report({"INFO"}, message + (f" via {used_op}" if used_op else ""))
     return {"FINISHED"}
 
 
@@ -6272,6 +6487,54 @@ def _iter_plain_axis_constraints(obj, helper_ptrs=None):
         if getattr(con, "name", "") == _PLAIN_AXIS_CONSTRAINT_NAME and target is not None and _is_plain_axis_helper(target):
             yield con
 
+
+def _store_plain_axis_original_world_matrix(constraint, world_matrix):
+    from .nh_base import (_PLAIN_AXIS_ORIGINAL_MATRIX_PROP)
+    if constraint is None or world_matrix is None:
+        return
+    try:
+        constraint[_PLAIN_AXIS_ORIGINAL_MATRIX_PROP] = [
+            float(world_matrix[row][column])
+            for row in range(4)
+            for column in range(4)
+        ]
+    except Exception:
+        pass
+
+
+def _read_plain_axis_original_world_matrix(constraint):
+    from .nh_base import (_PLAIN_AXIS_ORIGINAL_MATRIX_PROP)
+    if constraint is None:
+        return None
+    try:
+        values = list(constraint.get(_PLAIN_AXIS_ORIGINAL_MATRIX_PROP, ()))
+    except Exception:
+        return None
+    if len(values) != 16:
+        return None
+    try:
+        return Matrix(tuple(tuple(float(values[row * 4 + column]) for column in range(4)) for row in range(4)))
+    except Exception:
+        return None
+
+
+def _plain_axis_original_world_matrix(obj, constraints):
+    for constraint in constraints or ():
+        stored_matrix = _read_plain_axis_original_world_matrix(constraint)
+        if stored_matrix is not None:
+            return stored_matrix
+
+    constraint = next(iter(constraints or ()), None)
+    target = getattr(constraint, "target", None) if constraint is not None else None
+    if obj is None or target is None:
+        return None
+    try:
+        helper_delta = target.matrix_world @ constraint.inverse_matrix
+        return helper_delta.inverted_safe() @ obj.matrix_world.copy()
+    except Exception:
+        return None
+
+
 def _remove_plain_axis_constraints_from_objects(objects, helper_ptrs=None, *, context=None, keep_world_transform=False):
     entries = []
     seen = set()
@@ -6290,17 +6553,19 @@ def _remove_plain_axis_constraints_from_objects(objects, helper_ptrs=None, *, co
         if not constraints:
             continue
 
-        world_matrix = None
+        restore_matrix = None
         if keep_world_transform:
             try:
-                world_matrix = obj.matrix_world.copy()
+                restore_matrix = obj.matrix_world.copy()
             except Exception:
-                world_matrix = None
+                restore_matrix = None
+        else:
+            restore_matrix = _plain_axis_original_world_matrix(obj, constraints)
 
-        entries.append((obj, constraints, world_matrix))
+        entries.append((obj, constraints, restore_matrix))
 
     removed = 0
-    for obj, constraints, _world_matrix in entries:
+    for obj, constraints, _restore_matrix in entries:
         if obj is None or bpy.data.objects.get(obj.name) is not obj:
             continue
         for con in constraints:
@@ -6310,26 +6575,22 @@ def _remove_plain_axis_constraints_from_objects(objects, helper_ptrs=None, *, co
             except Exception:
                 pass
 
-    if keep_world_transform:
-        try:
-            if context is not None:
-                context.view_layer.update()
-        except Exception:
-            pass
+    try:
+        if context is not None:
+            context.view_layer.update()
+    except Exception:
+        pass
 
-        for obj, _constraints, world_matrix in sorted(entries, key=lambda item: _obj_depth(item[0])):
-            if world_matrix is None or obj is None or bpy.data.objects.get(obj.name) is not obj:
-                continue
-            try:
-                obj.matrix_world = world_matrix
-            except Exception:
-                pass
+    for obj, _constraints, restore_matrix in sorted(entries, key=lambda item: _obj_depth(item[0])):
+        if restore_matrix is None or obj is None or bpy.data.objects.get(obj.name) is not obj:
+            continue
+        _set_object_world_matrix_stable(obj, restore_matrix)
 
-        try:
-            if context is not None:
-                context.view_layer.update()
-        except Exception:
-            pass
+    try:
+        if context is not None:
+            context.view_layer.update()
+    except Exception:
+        pass
 
     return removed
 
@@ -6364,10 +6625,11 @@ def _remove_plain_axis_constraints_from_objects_keep_world_z(objects, helper_ptr
         except Exception:
             world_z = None
 
-        entries.append((obj, constraints, world_z))
+        original_matrix = _plain_axis_original_world_matrix(obj, constraints)
+        entries.append((obj, constraints, original_matrix, world_z))
 
     removed = 0
-    for obj, constraints, _world_z in entries:
+    for obj, constraints, _original_matrix, _world_z in entries:
         if obj is None or bpy.data.objects.get(obj.name) is not obj:
             continue
         for con in constraints:
@@ -6383,13 +6645,13 @@ def _remove_plain_axis_constraints_from_objects_keep_world_z(objects, helper_ptr
     except Exception:
         pass
 
-    for obj, _constraints, world_z in sorted(entries, key=lambda item: _obj_depth(item[0])):
+    for obj, _constraints, original_matrix, world_z in sorted(entries, key=lambda item: _obj_depth(item[0])):
         if world_z is None or obj is None or bpy.data.objects.get(obj.name) is not obj:
             continue
         try:
-            matrix = obj.matrix_world.copy()
+            matrix = original_matrix.copy() if original_matrix is not None else obj.matrix_world.copy()
             matrix.translation.z = world_z
-            obj.matrix_world = matrix
+            _set_object_world_matrix_stable(obj, matrix)
         except Exception:
             pass
 
@@ -6631,6 +6893,19 @@ def _find_plain_axis_helper_in_collection(root_collection):
 
 def _plain_axis_reference_priority(obj):
     from .nh_snap import (_is_memory_lod_mesh_object)
+    props = getattr(obj, "a3ob_properties_object", None)
+    if props is not None:
+        try:
+            if bool(getattr(props, "is_a3_lod", False)) and int(str(getattr(props, "lod", "")).strip()) == 0:
+                resolution = float(
+                    getattr(props, "resolution", getattr(props, "resolution_float", 0.0)) or 0.0
+                )
+                if abs(resolution) <= 1e-6:
+                    return 0
+                return 2
+        except Exception:
+            pass
+
     name = _strip_blender_numeric_suffix(getattr(obj, "name", "") or "").strip().lower()
     if name == "resolution 0":
         return 0
@@ -6641,6 +6916,67 @@ def _plain_axis_reference_priority(obj):
     if not _is_memory_lod_mesh_object(obj):
         return 3
     return 4
+
+
+def _is_plain_axis_p3d_lod_object(obj) -> bool:
+    if obj is None or getattr(obj, "type", None) != "MESH":
+        return False
+    props = getattr(obj, "a3ob_properties_object", None)
+    if props is None:
+        return False
+    try:
+        return bool(getattr(props, "is_a3_lod", False))
+    except Exception:
+        return False
+
+
+def _sync_plain_axis_p3d_lod_world_z(context, helper_objects):
+    """Use Resolution 0 as the saved-Z anchor for Memory and every other P3D LOD."""
+    synced = 0
+    processed_roots = set()
+
+    for helper_obj in helper_objects:
+        for root_collection in _plain_axis_helper_root_collections(context, helper_obj):
+            try:
+                root_ptr = root_collection.as_pointer()
+            except Exception:
+                root_ptr = id(root_collection)
+            if root_ptr in processed_roots:
+                continue
+            processed_roots.add(root_ptr)
+
+            lod_objects = [
+                obj for obj in _collect_collection_objects_recursive(root_collection)
+                if _is_plain_axis_p3d_lod_object(obj)
+            ]
+            if not lod_objects:
+                continue
+
+            lod_objects.sort(key=lambda obj: (_plain_axis_reference_priority(obj), getattr(obj, "name", "")))
+            reference_obj = lod_objects[0]
+
+            try:
+                saved_world_z = float(reference_obj.matrix_world.translation.z)
+            except Exception:
+                continue
+
+            for obj in sorted(lod_objects, key=_obj_depth):
+                if obj == reference_obj or bpy.data.objects.get(obj.name) is not obj:
+                    continue
+                try:
+                    matrix = obj.matrix_world.copy()
+                    matrix.translation.z = saved_world_z
+                    _set_object_world_matrix_stable(obj, matrix)
+                    synced += 1
+                except Exception:
+                    pass
+
+    if synced:
+        try:
+            context.view_layer.update()
+        except Exception:
+            pass
+    return synced
 
 
 def _find_plain_axis_reference_constraint(helper_obj, exclude_obj=None, reference_obj=None, root_collection=None):
@@ -6705,6 +7041,7 @@ def _ensure_plain_axis_constraint_for_new_object(context, obj, root_collection, 
 
     try:
         desired_world = obj.matrix_world.copy()
+        original_world = _plain_axis_original_world_matrix(obj, existing_constraints)
         for existing_constraint in existing_constraints:
             try:
                 obj.constraints.remove(existing_constraint)
@@ -6713,12 +7050,17 @@ def _ensure_plain_axis_constraint_for_new_object(context, obj, root_collection, 
         context.view_layer.update()
 
         helper_delta = helper_obj.matrix_world @ reference_constraint.inverse_matrix
-        obj.matrix_world = helper_delta.inverted_safe() @ desired_world
+        base_world = helper_delta.inverted_safe() @ desired_world
+        _set_object_world_matrix_stable(obj, base_world)
         con = obj.constraints.new(type="CHILD_OF")
         con.name = _PLAIN_AXIS_CONSTRAINT_NAME
         con.target = helper_obj
         _set_plain_axis_constraint_axes(con)
         con.inverse_matrix = reference_constraint.inverse_matrix.copy()
+        _store_plain_axis_original_world_matrix(
+            con,
+            original_world if original_world is not None else base_world,
+        )
         context.view_layer.update()
         return True
     except Exception as e:
@@ -6831,6 +7173,7 @@ def _clear_plain_axis_helpers_keep_world_z(context, helper_objects):
         context=context,
     )
     restored_memory = _restore_unconstrained_plain_axis_memory_objects(context, memory_restore_states)
+    synced_lods = _sync_plain_axis_p3d_lod_world_z(context, live_helpers)
 
     removed_helpers = 0
     for obj in live_helpers:
@@ -6844,6 +7187,8 @@ def _clear_plain_axis_helpers_keep_world_z(context, helper_objects):
         print(f"[NH Plugin] Repaired {repaired_memory} Memory LOD Plain Axis constraint(s) before deleting Plain Axes with saved Z")
     if restored_memory:
         print(f"[NH Plugin] Restored {restored_memory} unconstrained Memory LOD object(s) after deleting Plain Axes with saved Z")
+    if synced_lods:
+        print(f"[NH Plugin] Synced saved world Z to {synced_lods} additional P3D LOD object(s)")
     return removed_helpers, removed_constraints
 
 def _clear_plain_axis_helpers_in_collection(context, root_collection):
@@ -8652,11 +8997,189 @@ def _proxy_target_collection_for_lod(lod_obj, fallback_collection):
     return fallback_collection
 
 
+def _p3d_lod_world_bounds(obj):
+    if obj is None or getattr(obj, "type", None) != "MESH":
+        return None
+    try:
+        points = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+    except Exception:
+        return None
+    if not points:
+        return None
+    minimum = Vector(tuple(min(point[axis] for point in points) for axis in range(3)))
+    maximum = Vector(tuple(max(point[axis] for point in points) for axis in range(3)))
+    return (minimum + maximum) * 0.5, maximum - minimum
+
+
+def _p3d_lod_bounds_dimension_error(reference_dimensions, candidate_dimensions) -> float:
+    errors = []
+    for axis in range(3):
+        reference_value = abs(float(reference_dimensions[axis]))
+        candidate_value = abs(float(candidate_dimensions[axis]))
+        scale = max(reference_value, candidate_value, 0.001)
+        errors.append(abs(reference_value - candidate_value) / scale)
+    return max(errors) if errors else 1.0
+
+
+def _imported_p3d_lod_roots(root_collection):
+    lod_objects = [
+        obj for obj in _collect_collection_objects_recursive(root_collection)
+        if _is_plain_axis_p3d_lod_object(obj)
+    ]
+    lod_ptrs = {obj.as_pointer() for obj in lod_objects}
+    roots = []
+    seen_roots = set()
+    for obj in lod_objects:
+        obj_ptr = obj.as_pointer()
+        parent = getattr(obj, "parent", None)
+        nested = False
+        while parent is not None:
+            if parent.as_pointer() in lod_ptrs:
+                nested = True
+                break
+            parent = getattr(parent, "parent", None)
+        if not nested and obj_ptr not in seen_roots:
+            seen_roots.add(obj_ptr)
+            roots.append(obj)
+    return roots
+
+
+def _imported_p3d_resolution_index(obj):
+    props = getattr(obj, "a3ob_properties_object", None)
+    if props is None:
+        return 999999.0
+    try:
+        if str(getattr(props, "lod", "") or "").strip() != "0":
+            return 999999.0
+        return float(getattr(props, "resolution", 0.0) or 0.0)
+    except Exception:
+        return 999999.0
+
+
+def _repair_imported_p3d_lod_alignment(context, root_collection, filepath=""):
+    """Repair an old export where Resolution 0 was recentered but other LODs were not."""
+    from .nh_snap import (_is_p3d_resolution_lod_object, _is_resolution0_visual_lod_object)
+
+    lod_roots = _imported_p3d_lod_roots(root_collection)
+    reference_candidates = [obj for obj in lod_roots if _is_resolution0_visual_lod_object(obj)]
+    if not reference_candidates:
+        return {"moved": 0, "correction": None, "reference": None, "guide": None}
+
+    reference_candidates.sort(key=lambda obj: (getattr(obj, "name", "").lower(), obj.as_pointer()))
+    reference_obj = reference_candidates[0]
+    reference_bounds = _p3d_lod_world_bounds(reference_obj)
+    if reference_bounds is None:
+        return {"moved": 0, "correction": None, "reference": reference_obj, "guide": None}
+    reference_center, reference_dimensions = reference_bounds
+
+    guide_candidates = []
+    for obj in lod_roots:
+        if obj == reference_obj or not _is_p3d_resolution_lod_object(obj):
+            continue
+        bounds = _p3d_lod_world_bounds(obj)
+        if bounds is None:
+            continue
+        center, dimensions = bounds
+        dimension_error = _p3d_lod_bounds_dimension_error(reference_dimensions, dimensions)
+        if dimension_error > 0.05:
+            continue
+        guide_candidates.append((dimension_error, _imported_p3d_resolution_index(obj), obj, center))
+
+    if not guide_candidates:
+        return {"moved": 0, "correction": None, "reference": reference_obj, "guide": None}
+
+    guide_candidates.sort(key=lambda item: (item[0], item[1], getattr(item[2], "name", "").lower()))
+    _dimension_error, _resolution_index, guide_obj, guide_center = guide_candidates[0]
+    correction = reference_center - guide_center
+    reference_diagonal = max(float(reference_dimensions.length), 0.001)
+    detection_threshold = max(0.25, reference_diagonal * 0.15)
+    if correction.length <= detection_threshold:
+        return {"moved": 0, "correction": correction, "reference": reference_obj, "guide": guide_obj}
+
+    improvement_threshold = max(0.05, reference_diagonal * 0.01)
+    correction_length_squared = float(correction.length_squared)
+    moved = []
+    applied_multipliers = {}
+    skipped_point_clouds = []
+    for obj in lod_roots:
+        if obj == reference_obj:
+            continue
+        if _model_split_category_for_object(obj) == "POINT_CLOUDS":
+            skipped_point_clouds.append(obj.name)
+            continue
+        bounds = _p3d_lod_world_bounds(obj)
+        if bounds is None:
+            continue
+        center, _dimensions = bounds
+        distance_before = (center - reference_center).length
+        if distance_before <= detection_threshold:
+            continue
+
+        # A file can be exported more than once after only Resolution LODs were
+        # corrected. In that case Geometry/Roadway data contains the same legacy
+        # displacement twice (or more), while the visual LODs contain it once.
+        # Project the required correction onto the guide displacement and apply
+        # the closest positive whole multiple. This preserves each LOD's intended
+        # small centre difference instead of forcing every bounding box to the
+        # exact Resolution 0 centre.
+        required_correction = reference_center - center
+        if correction_length_squared <= 1e-12:
+            continue
+        multiplier = int(round(float(required_correction.dot(correction)) / correction_length_squared))
+        if multiplier < 1 or multiplier > 32:
+            continue
+        object_correction = correction * multiplier
+        distance_after = (center + object_correction - reference_center).length
+        if distance_after + improvement_threshold >= distance_before:
+            continue
+        try:
+            desired_world = obj.matrix_world.copy()
+            desired_world.translation += object_correction
+            if _set_object_world_matrix_stable(obj, desired_world):
+                moved.append(obj.name)
+                applied_multipliers[obj.name] = multiplier
+        except Exception:
+            continue
+
+    if moved:
+        try:
+            context.view_layer.update()
+        except Exception:
+            pass
+        source_label = filepath or getattr(root_collection, "name", "<P3D>")
+        print("=== NH P3D Import: repaired displaced LODs ===")
+        print(f"Source: {source_label}")
+        print(f"Root: {getattr(root_collection, 'name', '<collection>')}")
+        print(f"Reference: {reference_obj.name} | displacement guide: {guide_obj.name}")
+        print(
+            "Applied correction: "
+            f"X={correction.x:.6f}, Y={correction.y:.6f}, Z={correction.z:.6f}"
+        )
+        moved_labels = [
+            f"{name} (x{applied_multipliers.get(name, 1)})"
+            for name in moved
+        ]
+        print(f"Moved {len(moved)} LOD object(s): {', '.join(moved_labels)}")
+        if skipped_point_clouds:
+            print(
+                "Point-cloud LODs kept unchanged for snap-point safety: "
+                f"{', '.join(skipped_point_clouds)}"
+            )
+        print("=== End NH P3D Import LOD repair ===")
+
+    return {
+        "moved": len(moved),
+        "correction": correction,
+        "reference": reference_obj,
+        "guide": guide_obj,
+    }
+
+
 def _tag_import_source_on_imported_data(context, filepath, imported_objs, pre_collection_ptrs):
     from .nh_collider_exp import (_norm_path)
     src = _norm_path(bpy.path.abspath(filepath))
     if not src:
-        return
+        return {"roots": 0, "repaired_lods": 0}
 
     imported_ptrs = set()
     for obj in imported_objs:
@@ -8669,7 +9192,7 @@ def _tag_import_source_on_imported_data(context, filepath, imported_objs, pre_co
             pass
 
     if not imported_ptrs:
-        return
+        return {"roots": 0, "repaired_lods": 0}
 
     scene_root = context.scene.collection
     root_children = list(scene_root.children)
@@ -8683,14 +9206,31 @@ def _tag_import_source_on_imported_data(context, filepath, imported_objs, pre_co
         except Exception:
             pass
 
+    imported_roots = []
     for col in new_collections:
         if not any(ch == col for ch in root_children):
             continue
         if not _collection_has_any_object_ptr(col, imported_ptrs):
             continue
+        imported_roots.append(col)
         for nested in _iter_collection_tree(col):
             try:
                 nested[_IE_SOURCE_PATH_KEY] = src
             except Exception:
                 pass
 
+    repaired_lods = 0
+    for root_collection in imported_roots:
+        try:
+            repair_stats = _repair_imported_p3d_lod_alignment(
+                context,
+                root_collection,
+                filepath=src,
+            )
+            repaired_lods += int(repair_stats.get("moved", 0) or 0)
+        except Exception as e:
+            from .nh_base import (_fmt_exc)
+            print("=== NH P3D Import: LOD alignment repair failed ===")
+            print(f"{getattr(root_collection, 'name', '<collection>')}: {_fmt_exc(e)}")
+
+    return {"roots": len(imported_roots), "repaired_lods": repaired_lods}

@@ -2,8 +2,9 @@ Embedded Arma 3 Object Builder bundle
 ========================================
 
 The `Arma3ObjectBuilder` package in this directory is a trimmed copy of the
-"Arma 3 Object Builder" Blender add-on, used by the NH Blender plugin as a
-fallback codec when the original add-on is not installed.
+"Arma 3 Object Builder" Blender add-on, integrated into the NH Blender plugin
+as its primary internal P3D codec. An external installation remains an optional
+compatibility fallback.
 
 - Upstream: https://github.com/MrClock8163/Arma3ObjectBuilder
 - License: GNU GPL v3 (see LICENSE in this directory)

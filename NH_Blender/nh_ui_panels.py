@@ -282,11 +282,18 @@ class CRAY_PT_ColliderExpPanel(Panel):
             es,
             prop_names=_collider_exp_operator_props_exp(("convex_detail", "convex_max_triangles")),
         )
-        op = create.operator("cray.reconvex_selected_components_exp", text="Re-Convex Selected Components", icon="MESH_ICOSPHERE")
+        row = create.row(align=True)
+        op = row.operator("cray.reconvex_selected_components_exp", text="Re-Convex", icon="MESH_ICOSPHERE")
         _assign_collider_exp_operator_props_exp(
             op,
             es,
             prop_names=("merge_distance", "recalc_normals", "convex_detail", "convex_max_triangles"),
+        )
+        op = row.operator("cray.hull_selected_vertices_exp", text="Hull", icon="MESH_ICOSPHERE")
+        _assign_collider_exp_operator_props_exp(
+            op,
+            es,
+            prop_names=("recalc_normals",),
         )
         row = create.row(align=True)
         row.operator("cray.select_connected_shell_from_selection_exp", text="Select Shell", icon="GROUP_VERTEX")
@@ -428,7 +435,7 @@ from .nh_base import (_UI_PANEL_DEFAULT_ORDER)
 
 class CRAY_PT_FixesPanel(Panel):
     bl_idname = "VIEW3D_PT_cray_fixes"
-    bl_label = "Fixes"
+    bl_label = "P3D Tools & Checks"
     bl_category = "NH Plugin"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -501,6 +508,16 @@ class CRAY_PT_FixesPanel(Panel):
             op = actions.operator("cray.geometry_audit_select", text="Select Nested", icon="GROUP_VERTEX")
             op.issue = "NESTED"
             actions.operator("cray.geometry_audit_clean_safe", text="Clean Safe Garbage", icon="TRASH")
+
+        snap_box = layout.box()
+        snap_box.label(text="Snap Magnet Check", icon="SNAP_ON")
+        snap_box.label(text="Pairs are found automatically by ID", icon="SORTTIME")
+        snap_box.operator(
+            "cray.validate_assemble_snap_points",
+            text="Check & Assemble Visual LODs",
+            icon="SNAP_ON",
+        )
+        snap_box.label(text="Moves visual Resolution LODs only", icon="INFO")
 
         check_box = layout.box()
         check_box.label(text="Export checks", icon="ERROR")
@@ -581,7 +598,7 @@ class CRAY_PT_ImportExportPlannerPanel(Panel):
         st = context.scene.cray_ie_settings
 
         ibox = layout.box()
-        ibox.label(text="Batch Import (Arma 3 Object Builder)", icon="IMPORT")
+        ibox.label(text="Batch Import (NH Internal P3D)", icon="IMPORT")
         ibox.operator("cray.import_tb_txt", text="Import Terrain Builder (.txt)", icon="IMPORT")
         ibox.separator()
         ibox.label(text="Quick Add From NH_Objects", icon="VIEWZOOM")
@@ -612,7 +629,7 @@ class CRAY_PT_ImportExportPlannerPanel(Panel):
         row2.prop(st, "disable_mode", text="")
 
         ebox = layout.box()
-        ebox.label(text="Batch Export Collections (Arma 3 Object Builder)", icon="EXPORT")
+        ebox.label(text="Batch Export Collections (NH Internal P3D)", icon="EXPORT")
         ebox.prop(st, "export_mode")
         row3 = ebox.row()
         row3.enabled = (st.export_mode == "CUSTOM_DIR")
@@ -776,6 +793,7 @@ class CRAY_PT_TextureReplacePanel(Panel):
         rbox.label(text="Replace Texture from DB", icon="FILE_TICK")
         rbox.prop(ts, "picked_object", text="Select Object")
         rbox.operator("cray.replace_textures_from_db", icon="FILE_TICK")
+        rbox.operator("cray.update_object_preview", text="Restore Material Preview", icon="MATERIAL")
         rbox.prop(ts, "write_expected_missing_paths")
 
         layout.separator()

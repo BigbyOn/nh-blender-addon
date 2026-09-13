@@ -118,7 +118,7 @@ def set_p3d_proxy_properties(proxy_obj, model_path: str, proxy_index: int):
     if not hasattr(proxy_obj, "a3ob_properties_object_proxy"):
         raise RuntimeError(
             "Object has no 'a3ob_properties_object_proxy'. "
-            "Ensure addon 'Arma 3 Object Builder' is installed and enabled."
+            "Re-enable the NH internal P3D backend."
         )
 
     pg = proxy_obj.a3ob_properties_object_proxy
@@ -344,7 +344,29 @@ class CRAY_PG_SnapSettings(PropertyGroup):
         default="SampleName",
         update=_on_snap_p3d_name_changed,
     )
-    snap_pair_code: StringProperty(name="ID", default="01", maxlen=3)
+    snap_pair_code: StringProperty(
+        name="Automatic ID",
+        description="Internal next snap pair ID; selected automatically from existing Memory LOD point names",
+        default="01",
+        maxlen=3,
+        options={"HIDDEN"},
+    )
+    snap_include_axis: BoolProperty(
+        name="Include Axis in Name",
+        description="Append the selected X/Y/Z axis to the snap group name; the axis still controls 0/1 ordering when this is disabled",
+        default=False,
+    )
+    snap_target_vertex_tolerance: FloatProperty(
+        name="Target Match Distance",
+        description="Maximum distance in metres from each selected snap position to a vertex in both A and V targets",
+        default=0.01,
+        min=0.000001,
+        soft_min=0.0001,
+        soft_max=0.1,
+        precision=4,
+        subtype="DISTANCE",
+        unit="LENGTH",
+    )
     snap_side: EnumProperty(
         name="Side",
         items=(
@@ -1953,17 +1975,17 @@ class CRAY_PG_UIPanelSettings(PropertyGroup):
     order_texture_replace: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["texture_replace"], min=1, update=_on_ui_panel_layout_setting_changed)
     order_cache_manager: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["cache_manager"], min=1, update=_on_ui_panel_layout_setting_changed)
     order_object_builder: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["object_builder"], min=1, update=_on_ui_panel_layout_setting_changed)
-    show_snap_points: BoolProperty(name="Show", description="РџРѕРєР°Р·С‹РІР°С‚СЊ РёР»Рё СЃРєСЂС‹РІР°С‚СЊ СЌС‚Рѕ РјРµРЅСЋ РІ РїР°РЅРµР»Рё NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
-    show_asset_library: BoolProperty(name="Show", description="РџРѕРєР°Р·С‹РІР°С‚СЊ РёР»Рё СЃРєСЂС‹РІР°С‚СЊ СЌС‚Рѕ РјРµРЅСЋ РІ РїР°РЅРµР»Рё NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
-    show_fixes: BoolProperty(name="Show", description="РџРѕРєР°Р·С‹РІР°С‚СЊ РёР»Рё СЃРєСЂС‹РІР°С‚СЊ СЌС‚Рѕ РјРµРЅСЋ РІ РїР°РЅРµР»Рё NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
-    show_import_export: BoolProperty(name="Show", description="РџРѕРєР°Р·С‹РІР°С‚СЊ РёР»Рё СЃРєСЂС‹РІР°С‚СЊ СЌС‚Рѕ РјРµРЅСЋ РІ РїР°РЅРµР»Рё NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
-    show_model_split: BoolProperty(name="Show", description="РџРѕРєР°Р·С‹РІР°С‚СЊ РёР»Рё СЃРєСЂС‹РІР°С‚СЊ СЌС‚Рѕ РјРµРЅСЋ РІ РїР°РЅРµР»Рё NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
-    show_texture_replace: BoolProperty(name="Show", description="РџРѕРєР°Р·С‹РІР°С‚СЊ РёР»Рё СЃРєСЂС‹РІР°С‚СЊ СЌС‚Рѕ РјРµРЅСЋ РІ РїР°РЅРµР»Рё NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
-    show_collider: BoolProperty(name="Show", description="РџРѕРєР°Р·С‹РІР°С‚СЊ РёР»Рё СЃРєСЂС‹РІР°С‚СЊ СЌС‚Рѕ РјРµРЅСЋ РІ РїР°РЅРµР»Рё NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
-    show_geometry_lods: BoolProperty(name="Show", description="РџРѕРєР°Р·С‹РІР°С‚СЊ РёР»Рё СЃРєСЂС‹РІР°С‚СЊ СЌС‚Рѕ РјРµРЅСЋ РІ РїР°РЅРµР»Рё NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
-    show_object_builder: BoolProperty(name="Show", description="РџРѕРєР°Р·С‹РІР°С‚СЊ РёР»Рё СЃРєСЂС‹РІР°С‚СЊ СЌС‚Рѕ РјРµРЅСЋ РІ РїР°РЅРµР»Рё NH Plugin", default=False, update=_on_ui_panel_layout_setting_changed)
-    show_cache_manager: BoolProperty(name="Show", description="РџРѕРєР°Р·С‹РІР°С‚СЊ РёР»Рё СЃРєСЂС‹РІР°С‚СЊ СЌС‚Рѕ РјРµРЅСЋ РІ РїР°РЅРµР»Рё NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
-    show_custom_keybinds: BoolProperty(name="Custom Keybinds", description="РџРѕРєР°Р·С‹РІР°С‚СЊ СЃРїРёСЃРѕРє РєР°СЃС‚РѕРјРЅС‹С… С…РѕС‚РєРµРµРІ Р°РґРґРѕРЅР°", default=False, update=_on_ui_panel_layout_setting_changed)
+    show_snap_points: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_asset_library: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_fixes: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_import_export: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_model_split: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_texture_replace: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_collider: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_geometry_lods: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_object_builder: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=False, update=_on_ui_panel_layout_setting_changed)
+    show_cache_manager: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_custom_keybinds: BoolProperty(name="Custom Keybinds", description="Показывать список кастомных хоткеев аддона", default=False, update=_on_ui_panel_layout_setting_changed)
 
 
 class CRAY_OT_MoveUIPanelLayoutItem(Operator):
@@ -2080,7 +2102,7 @@ class CRAY_OT_ScatterProxies(Operator):
             self.report({"ERROR"}, "Surface is not selected")
             return {"CANCELLED"}
         if not hasattr(obj, "a3ob_properties_object_proxy"):
-            self.report({"ERROR"}, "Missing 'a3ob_properties_object_proxy' (check Arma 3 Object Builder).")
+            self.report({"ERROR"}, "Missing 'a3ob_properties_object_proxy' (check NH internal P3D backend).")
             return {"CANCELLED"}
 
         config_abs = bpy.path.abspath(s.config_path)

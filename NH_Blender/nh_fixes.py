@@ -287,14 +287,14 @@ class CRAY_OT_CreatePlainAxisPivot(Operator):
     bl_idname = "cray.create_plain_axis_pivot"
     bl_label = "Create Plain Axis Pivot"
     bl_description = (
-        "Р’ Edit Mode Р±РµСЂС‘С‚ РѕРґРЅСѓ РІС‹РґРµР»РµРЅРЅСѓСЋ РІРµСЂС€РёРЅСѓ РєР°Рє pivot, СЃРѕР·РґР°С‘С‚ Plain Axes helper Рё РґРѕР±Р°РІР»СЏРµС‚ Child Of constraints, С‡С‚РѕР±С‹ helper РґРІРёРіР°Р» РІСЃСЋ РёРјРїРѕСЂС‚РёСЂРѕРІР°РЅРЅСѓСЋ РјРѕРґРµР»СЊ"
+        "В Edit Mode берёт одну выделенную вершину как pivot, создаёт Plain Axes helper и добавляет Child Of constraints, чтобы helper двигал всю импортированную модель"
     )
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
         from .nh_base import (_PLAIN_AXIS_CONSTRAINT_NAME, _fmt_exc)
         from .nh_collider import (_collect_single_selected_vertex_world_point, _try_restore_edit_mode)
-        from .nh_textures import (_apply_child_of_inverse_with_fallback, _clear_plain_axis_helpers, _clear_plain_axis_helpers_in_collection, _collect_plain_axis_target_objects, _create_plain_axis_helper, _pick_plain_axis_root_collection, _set_plain_axis_constraint_axes)
+        from .nh_textures import (_apply_child_of_inverse_with_fallback, _clear_plain_axis_helpers, _clear_plain_axis_helpers_in_collection, _collect_plain_axis_target_objects, _create_plain_axis_helper, _pick_plain_axis_root_collection, _set_plain_axis_constraint_axes, _store_plain_axis_original_world_matrix)
         source_obj = context.view_layer.objects.active
         if source_obj is None or source_obj.type != "MESH" or context.mode != "EDIT_MESH" or source_obj.mode != "EDIT":
             self.report({"ERROR"}, "Active object must be a mesh in Edit Mode")
@@ -334,12 +334,14 @@ class CRAY_OT_CreatePlainAxisPivot(Operator):
 
             for obj in target_objects:
                 try:
+                    original_world = obj.matrix_world.copy()
                     con = obj.constraints.new(type="CHILD_OF")
                     con.name = _PLAIN_AXIS_CONSTRAINT_NAME
                     con.target = helper_obj
                     _set_plain_axis_constraint_axes(con)
                     context.view_layer.update()
                     _apply_child_of_inverse_with_fallback(context, obj, con)
+                    _store_plain_axis_original_world_matrix(con, original_world)
                     constrained += 1
                 except Exception as e:
                     failed.append(f"{obj.name}: {_fmt_exc(e)}")
@@ -382,7 +384,7 @@ class CRAY_OT_CreatePlainAxisPivot(Operator):
 class CRAY_OT_ClearPlainAxisPivots(Operator):
     bl_idname = "cray.clear_plain_axis_pivots"
     bl_label = "Delete All Plain Axes"
-    bl_description = "РЈРґР°Р»СЏРµС‚ РІСЃРµ Plain Axes helper-С‹, СЃРѕР·РґР°РЅРЅС‹Рµ СЌС‚РѕР№ РєРЅРѕРїРєРѕР№, Рё СЃРЅРёРјР°РµС‚ РёС… Child Of constraints"
+    bl_description = "Удаляет все Plain Axes helper-ы, созданные этой кнопкой, и снимает их Child Of constraints"
     bl_options = {"REGISTER", "UNDO"}
 
     def execute(self, context):
@@ -426,8 +428,8 @@ class CRAY_OT_ClearPlainAxisPivotsKeepZ(Operator):
     bl_idname = "cray.clear_plain_axis_pivots_keep_z"
     bl_label = "Delete All Plain Axes + Save Z"
     bl_description = (
-        "РЈРґР°Р»СЏРµС‚ РІСЃРµ Plain Axes helper-С‹, РІРѕР·РІСЂР°С‰Р°РµС‚ РјРѕРґРµР»Рё РїРѕ X/Y РєР°Рє РїСЂРё РѕР±С‹С‡РЅРѕРј СѓРґР°Р»РµРЅРёРё, "
-        "РЅРѕ СЃРѕС…СЂР°РЅСЏРµС‚ С‚РµРєСѓС‰СѓСЋ РјРёСЂРѕРІСѓСЋ РІС‹СЃРѕС‚Сѓ Z РґР»СЏ РѕР±СЉРµРєС‚РѕРІ РєРѕР»Р»РµРєС†РёР№"
+        "Удаляет все Plain Axes helper-ы, возвращает модели по X/Y как при обычном удалении, "
+        "но сохраняет текущую мировую высоту Z для объектов коллекций"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -471,6 +473,107 @@ class CRAY_OT_ClearPlainAxisPivotsKeepZ(Operator):
         return {"FINISHED"}
 
 
+def _snapshot_batch_export_visibility(context, objects):
+    """Capture every visibility flag temporarily changed by batch export."""
+    from .nh_textures import (_iter_layer_collections)
+
+    layer_state = []
+    for layer_collection in _iter_layer_collections(context.view_layer.layer_collection):
+        layer_state.append(
+            (
+                layer_collection,
+                bool(layer_collection.exclude),
+                bool(layer_collection.hide_viewport),
+            )
+        )
+
+    collection_state = [
+        (collection, bool(collection.hide_viewport), bool(collection.hide_render))
+        for collection in bpy.data.collections
+    ]
+
+    object_state = []
+    seen = set()
+    for obj in objects:
+        if obj is None:
+            continue
+        try:
+            key = obj.as_pointer()
+        except Exception:
+            key = id(obj)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            hidden = bool(obj.hide_get(view_layer=context.view_layer))
+        except TypeError:
+            hidden = bool(obj.hide_get())
+        except Exception:
+            hidden = False
+        object_state.append(
+            (obj, hidden, bool(obj.hide_viewport), bool(obj.hide_render))
+        )
+
+    return layer_state, collection_state, object_state
+
+
+def _restore_batch_export_visibility(context, snapshot):
+    """Undo the temporary reveal without altering object transforms."""
+    layer_state, collection_state, object_state = snapshot
+
+    # Objects are still reachable here because the export reveal has not yet
+    # been undone. Restore per-object state before excluding LayerCollections.
+    for obj, hidden, hide_viewport, hide_render in object_state:
+        if obj is None or bpy.data.objects.get(getattr(obj, "name", "")) is not obj:
+            continue
+        try:
+            obj.hide_viewport = hide_viewport
+        except Exception:
+            pass
+        try:
+            obj.hide_render = hide_render
+        except Exception:
+            pass
+        try:
+            obj.hide_set(hidden, view_layer=context.view_layer)
+        except TypeError:
+            try:
+                obj.hide_set(hidden)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    for collection, hide_viewport, hide_render in collection_state:
+        if collection is None or bpy.data.collections.get(getattr(collection, "name", "")) is not collection:
+            continue
+        try:
+            collection.hide_viewport = hide_viewport
+        except Exception:
+            pass
+        try:
+            collection.hide_render = hide_render
+        except Exception:
+            pass
+
+    # Children first prevents an excluded parent from making a child RNA state
+    # temporarily inaccessible while it is being restored.
+    for layer_collection, excluded, hide_viewport in reversed(layer_state):
+        try:
+            layer_collection.hide_viewport = hide_viewport
+        except Exception:
+            pass
+        try:
+            layer_collection.exclude = excluded
+        except Exception:
+            pass
+
+    try:
+        context.view_layer.update()
+    except Exception:
+        pass
+
+
 class CRAY_OT_IE_ExportCollectionsBatch(Operator):
     bl_idname = "cray.ie_export_collections_batch"
     bl_label = "Batch Export Collections (P3D)"
@@ -478,14 +581,13 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
 
     def execute(self, context):
         from .nh_base import (_fmt_exc)
-        from .nh_snap import (_P3D_EXPORT_CANDIDATES, _call_export_with_optional_relaxed_validation, _collect_expected_lod_entries, _collect_export_loose_vertex_warnings, _collect_export_ngon_issues, _collect_resolution_lod_index_conflicts, _deselect_all_in_view_layer, _discard_pending_export_backup, _finalize_export_backup, _iter_p3d_root_collections, _op_handle, _read_exported_lod_entries, _report_export_backup_preserved_in_console, _report_export_backup_skipped_in_console, _report_export_backup_updated_in_console, _report_export_loose_vertex_warnings_in_console, _report_export_ngon_issues_in_console, _report_missing_lod_diagnostics_in_console, _report_missing_lods_in_console, _report_resolution_lod_index_conflicts_in_console, _restore_p3d_named_properties_after_export, _restore_collision_lod_materials_after_export, _stage_export_backup, _strip_p3d_named_properties_for_export, _strip_collision_lod_materials_for_export)
-        from .nh_textures import (_build_ie_import_basename_map, _collect_collection_objects_recursive, _collection_has_any_mesh, _ensure_collection_visible_in_view_layer, _export_filename_for_collection, _looks_like_p3d_collection_name, _looks_like_split_part_collection_name, _resolve_collection_source_path)
+        from .nh_snap import (_call_export_with_optional_relaxed_validation, _collect_expected_lod_entries, _collect_export_loose_vertex_warnings, _collect_export_ngon_issues, _collect_resolution_lod_index_conflicts, _deselect_all_in_view_layer, _discard_pending_export_backup, _finalize_export_backup, _has_any_p3d_export_ops, _iter_p3d_root_collections, _read_exported_lod_entries, _report_export_backup_preserved_in_console, _report_export_backup_skipped_in_console, _report_export_backup_updated_in_console, _report_export_loose_vertex_warnings_in_console, _report_export_ngon_issues_in_console, _report_missing_lod_diagnostics_in_console, _report_missing_lods_in_console, _report_resolution_lod_index_conflicts_in_console, _restore_p3d_named_properties_after_export, _restore_collision_lod_materials_after_export, _stage_export_backup, _strip_p3d_named_properties_for_export, _strip_collision_lod_materials_for_export)
+        from .nh_textures import (_build_ie_import_basename_map, _collect_collection_objects_recursive, _collection_has_any_mesh, _ensure_collection_visible_in_view_layer, _export_filename_for_collection, _looks_like_p3d_collection_name, _looks_like_split_part_collection_name, _obj_depth, _repair_imported_p3d_lod_alignment, _resolve_collection_source_path, _set_object_world_matrix_stable)
         st = context.scene.cray_ie_settings
         tex_settings = context.scene.cray_texreplace_settings
         warn_loose_vertices = bool(getattr(tex_settings, "export_warn_loose_vertices", True))
-        has_export = any(_op_handle(op) is not None for op, _ in _P3D_EXPORT_CANDIDATES)
-        if not has_export:
-            self.report({"ERROR"}, "Arma 3 Object Builder export operators not found")
+        if not _has_any_p3d_export_ops():
+            self.report({"ERROR"}, "NH internal P3D export backend is unavailable")
             return {"CANCELLED"}
 
         export_dir = ""
@@ -551,6 +653,11 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
         backup_preserved = []
         used_op = None
         used_targets = set()
+        preexport_repaired_lods = 0
+        visibility_objects = []
+        for candidate_collection, _candidate_source in candidates:
+            visibility_objects.extend(_collect_collection_objects_recursive(candidate_collection))
+        visibility_snapshot = _snapshot_batch_export_visibility(context, visibility_objects)
 
         for col, source_hint in candidates:
             objects = _collect_collection_objects_recursive(col)
@@ -610,7 +717,27 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
                         idx += 1
             used_targets.add(target_key)
 
-            _ensure_collection_visible_in_view_layer(context, col)
+            _ensure_collection_visible_in_view_layer(context, col, preserve_world_objects=objects)
+            try:
+                repair_stats = _repair_imported_p3d_lod_alignment(
+                    context,
+                    col,
+                    filepath=source_path or filepath,
+                )
+                preexport_repaired_lods += int((repair_stats or {}).get("moved", 0) or 0)
+            except Exception as e:
+                failed.append(f"{col.name} -> LOD alignment safety check failed: {_fmt_exc(e)}")
+                continue
+
+            # The repair can update LOD matrices in old .blend scenes. Snapshot
+            # the resulting desired state so the exporter can never leak a
+            # transform change back from its temporary preprocessing.
+            export_world_matrices = []
+            for obj in objects:
+                try:
+                    export_world_matrices.append((obj, obj.matrix_world.copy()))
+                except Exception:
+                    pass
             _deselect_all_in_view_layer(context)
 
             selectable = []
@@ -697,6 +824,13 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
             finally:
                 _restore_p3d_named_properties_after_export(named_property_restore)
                 _restore_collision_lod_materials_after_export(material_restore)
+                for obj, desired_world in sorted(export_world_matrices, key=lambda item: _obj_depth(item[0])):
+                    if bpy.data.objects.get(getattr(obj, "name", "")) is obj:
+                        _set_object_world_matrix_stable(obj, desired_world)
+                try:
+                    context.view_layer.update()
+                except Exception:
+                    pass
             export_missing_keys = []
             lod_post_check_failed = False
             if op_id:
@@ -791,6 +925,8 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
                 except Exception:
                     pass
 
+        _restore_batch_export_visibility(context, visibility_snapshot)
+
         if failed:
             print("=== Batch Export Collections: Failures ===")
             for f in failed:
@@ -816,6 +952,8 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
             msg += f", backups skipped {len(backup_skipped)}"
         if backup_preserved:
             msg += f", backups preserved {len(backup_preserved)}"
+        if preexport_repaired_lods:
+            msg += f", realigned {preexport_repaired_lods} legacy LOD(s) before export"
 
         if failed or partial_lod_exports or loose_vertex_warnings or backup_skipped:
             self.report({"WARNING"}, msg + " (see System Console)")
@@ -933,11 +1071,20 @@ class CRAY_PT_SnapPointsPanel(Panel):
         col = layout.column(align=True)
         col.label(text="Name Pattern")
         col.prop(ss, "snap_p3d_name")
-        col.prop(ss, "snap_pair_code")
-        col.label(text="Snap Axis")
+        col.label(text="ID: automatic from Memory vertex groups", icon="SORTTIME")
+        col.label(text="A/V targets stay exactly as selected")
+        col.label(text="0/1 Sort Axis")
         axis_row = col.row(align=True)
         axis_row.prop(ss, "edge_axis", expand=True)
-        col.label(text=f".sp_{preview_pattern.preview_base}_a_0 / .sp_{preview_pattern.preview_base}_v_1", icon="INFO")
+        col.prop(ss, "snap_include_axis")
+        col.prop(ss, "snap_target_vertex_tolerance")
+        preview_axis = preview_pattern.axis_token.lower() if preview_pattern.include_axis else ""
+        preview_box = col.box()
+        preview_box.label(text="Selection name preview", icon="INFO")
+        preview_box.label(text=f"Base: .sp_{preview_pattern.p3d_name}")
+        preview_box.label(text=f"ID: first free ## from .sp_ groups{preview_axis}")
+        preview_box.label(text="A points: _A_0  /  _A_1")
+        preview_box.label(text="V points: _V_0  /  _V_1")
         col.prop(ss, "replace_existing")
 
         layout.separator()

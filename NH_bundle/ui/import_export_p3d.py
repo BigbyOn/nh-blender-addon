@@ -498,8 +498,8 @@ classes = (
 
 if bpy.app.version >= (4, 1, 0):
     class NH_FH_import_p3d(bpy.types.FileHandler):
-        bl_label = "File handler for P3D import"
-        bl_import_operator = "nh.import_p3d"
+        bl_label = "Add P3D files to NH Import/Export planner"
+        bl_import_operator = "cray.p3d_drop_menu"
         bl_file_extensions = ".p3d"
     
         @classmethod
@@ -510,11 +510,11 @@ if bpy.app.version >= (4, 1, 0):
 
 
 def menu_func_import(self, context):
-    self.layout.operator(NH_OP_import_p3d.bl_idname, text="Arma 3 model (.p3d)")
+    self.layout.operator(NH_OP_import_p3d.bl_idname, text="NH Internal P3D (.p3d)")
 
 
 def menu_func_export(self, context):
-    self.layout.operator(NH_OP_export_p3d.bl_idname, text="Arma 3 model (.p3d)")
+    self.layout.operator(NH_OP_export_p3d.bl_idname, text="NH Internal P3D (.p3d)")
 
 
 def register():

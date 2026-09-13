@@ -31,8 +31,8 @@ def _patch_p3d_import_read_file():
         return
 
     module_names = (
-        "bl_ext.user_default.Arma3ObjectBuilder.io.import_p3d",
         "NH_bundle.io.import_p3d",
+        "bl_ext.user_default.Arma3ObjectBuilder.io.import_p3d",
     )
 
     for module_name in module_names:
@@ -291,8 +291,8 @@ class CRAY_OT_IE_AddFiles(Operator):
 
 class CRAY_OT_P3DDropMenu(Operator):
     bl_idname = "cray.p3d_drop_menu"
-    bl_label = "P3D Drop"
-    bl_description = "Add dropped .p3d files to the Import/Export planner"
+    bl_label = "Add Dropped P3D To Planner"
+    bl_description = "Immediately add dropped .p3d files to the Import/Export planner queue"
     bl_options = {"REGISTER", "UNDO"}
 
     directory: StringProperty(subtype="DIR_PATH", options={"SKIP_SAVE", "HIDDEN"})
@@ -304,6 +304,7 @@ class CRAY_OT_P3DDropMenu(Operator):
         return self.execute(context)
 
     def execute(self, context):
+        from .nh_snap import (_tag_redraw_all_areas)
         from .nh_textures import (_collect_p3d_filepaths_from_operator, _planner_add_import_file, _set_pending_p3d_drop_paths)
         paths = _collect_p3d_filepaths_from_operator(
             directory=getattr(self, "directory", ""),
@@ -327,7 +328,14 @@ class CRAY_OT_P3DDropMenu(Operator):
             else:
                 skipped += 1
         _set_pending_p3d_drop_paths([])
-        self.report({"INFO"}, f"Added {added} dropped .p3d file(s), skipped {skipped} duplicate(s)")
+        _tag_redraw_all_areas(context)
+        if added:
+            self.report(
+                {"INFO"},
+                f"Added {added} dropped .p3d file(s) to planner, skipped {skipped} duplicate(s)",
+            )
+        else:
+            self.report({"WARNING"}, f"Dropped .p3d file(s) are already in planner: {skipped}")
         return {"FINISHED"}
 
 
@@ -739,10 +747,11 @@ class CRAY_OT_IE_ImportBatch(Operator):
             self.report({"ERROR"}, "Import list is empty")
             return {"CANCELLED"}
         if not _has_any_p3d_import_ops():
-            self.report({"ERROR"}, "Arma 3 Object Builder import operators not found")
+            self.report({"ERROR"}, "NH internal P3D import backend is unavailable")
             return {"CANCELLED"}
 
         imported = 0
+        repaired_lods = 0
         skipped_existing = []
         failed = []
         used_op = None
@@ -772,12 +781,13 @@ class CRAY_OT_IE_ImportBatch(Operator):
             else:
                 imported += 1
                 imported_objs = [o for o in bpy.data.objects if o.as_pointer() not in pre_obj_ptrs]
-                _tag_import_source_on_imported_data(
+                tag_stats = _tag_import_source_on_imported_data(
                     context=context,
                     filepath=fp,
                     imported_objs=imported_objs,
                     pre_collection_ptrs=pre_col_ptrs,
                 )
+                repaired_lods += int(tag_stats.get("repaired_lods", 0) or 0)
                 stats = _postprocess_imported_material_previews(
                     context,
                     imported_objs,
@@ -799,9 +809,13 @@ class CRAY_OT_IE_ImportBatch(Operator):
             for f in failed:
                 print(f)
             msg = f"Imported {imported}, skipped existing {len(skipped_existing)}, failed {len(failed)}"
+            if repaired_lods:
+                msg += f", realigned {repaired_lods} displaced LOD(s)"
             self.report({"WARNING"}, msg + " (see System Console)")
         else:
             msg = f"Imported {imported} file(s), skipped existing {len(skipped_existing)}"
+            if repaired_lods:
+                msg += f", realigned {repaired_lods} displaced LOD(s)"
             self.report({"INFO"}, msg + (f" via {used_op}" if used_op else ""))
         return {"FINISHED"}
 
@@ -1148,4 +1162,3 @@ def _model_split_grid_create_cube_mesh(name: str):
     mesh.from_pydata(verts, (), faces)
     mesh.update()
     return mesh
-

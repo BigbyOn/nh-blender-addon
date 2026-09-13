@@ -280,6 +280,21 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "      $req=$req.Replace('\\','/');" ^
     "      if($entries -notcontains $req){ throw ('Archive validation failed. Missing entry: ' + $req); }" ^
     "    }" ^
+    "    if($sourceMode -eq 'package'){" ^
+    "      $symbolChecks=@(" ^
+    "        @('NH_Blender/__init__.py','CRAY_OT_HullSelectedVerticesExp')," ^
+    "        @('NH_Blender/nh_collider_exp.py','class CRAY_OT_HullSelectedVerticesExp')," ^
+    "        @('NH_Blender/__init__.py','CRAY_OT_ValidateAssembleSnapPoints')," ^
+    "        @('NH_Blender/nh_snap.py','class CRAY_OT_ValidateAssembleSnapPoints')" ^
+    "      );" ^
+    "      foreach($check in $symbolChecks){" ^
+    "        $entry=$archive.GetEntry($check[0]);" ^
+    "        if($entry -eq $null){ throw ('Archive validation failed. Missing entry: ' + $check[0]); }" ^
+    "        $reader=New-Object System.IO.StreamReader($entry.Open());" ^
+    "        try { $entryText=$reader.ReadToEnd() } finally { $reader.Dispose() }" ^
+    "        if(-not $entryText.Contains($check[1])){ throw ('Archive validation failed. Missing symbol ' + $check[1] + ' in ' + $check[0]); }" ^
+    "      }" ^
+    "    }" ^
     "    $bad=@($entries | Where-Object { $_ -match '(^|/)__pycache__/' -or $_ -match '\.pyc$' -or $_ -match '\.pyo$' });" ^
     "    if($bad.Count -gt 0){ throw ('Archive validation failed. Forbidden entries: ' + ($bad -join ', ')); }" ^
     "  } finally {" ^

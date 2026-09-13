@@ -72,6 +72,7 @@ _PLAIN_AXIS_HELPER_PROP = "cray_plain_axis_helper"
 _PLAIN_AXIS_ROOT_PROP = "cray_plain_axis_root"
 _PLAIN_AXIS_SOURCE_OBJECT_PROP = "cray_plain_axis_source_object"
 _PLAIN_AXIS_CONSTRAINT_NAME = "NH Plain Axis"
+_PLAIN_AXIS_ORIGINAL_MATRIX_PROP = "cray_plain_axis_original_matrix"
 _PLAIN_AXIS_CONSTRAINT_AXES = (
     "use_location_x",
     "use_location_y",
@@ -137,6 +138,8 @@ _PERSISTED_UI_SETTINGS = {
         "snap_group",
         "snap_p3d_name",
         "snap_pair_code",
+        "snap_include_axis",
+        "snap_target_vertex_tolerance",
         "snap_side",
         "show_auto_edge_fallback",
         "edge_axis",
@@ -939,7 +942,7 @@ _UI_PANEL_LAYOUT_DEFINITIONS = (
     ("asset_library", "P3D Asset Library", "CRAY_PT_AssetProxyPanel"),
     ("snap_points", "Snap Points (Memory LOD)", "CRAY_PT_SnapPointsPanel"),
     ("import_export", "Import/Export planner", "CRAY_PT_ImportExportPlannerPanel"),
-    ("fixes", "Fixes", "CRAY_PT_FixesPanel"),
+    ("fixes", "P3D Tools & Checks", "CRAY_PT_FixesPanel"),
     ("model_split", "Model Split / Merge", "CRAY_PT_ModelSplitPanel"),
     ("texture_replace", "Texture Replace", "CRAY_PT_TextureReplacePanel"),
     ("cache_manager", "Cache Manager", "CRAY_PT_CacheManagerPanel"),
