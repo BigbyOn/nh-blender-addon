@@ -53,4 +53,5 @@ class CoreTests(unittest.TestCase):
         mlod.lods.pop()
         self.assertFalse(core.has_autocenter_zero(mlod))
 
-unittest.main()
+if __name__ == '__main__':
+    unittest.main()

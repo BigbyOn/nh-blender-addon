@@ -30,3 +30,18 @@ release_local.bat
 
 # Build artifacts
 dist/
+
+# Test/lint caches
+.pytest_cache/
+.ruff_cache/
+
+# Local diagnostic scripts and validation reports (kept only on workstation)
+tests/blender_geometry_*.py
+tests/blender_pipe_editor_*.py
+tests/blender_terrain_validation.py
+reports/
+
+# Local test artifacts and draft documents
+fake_terrain.blend
+fake_terrain.p3d
+NH_Blender_Geometry_Analysis.docx

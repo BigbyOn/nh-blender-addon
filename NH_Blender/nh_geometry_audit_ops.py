@@ -336,12 +336,14 @@ def _run_geometry_audit(context, settings, resolved_scope=None):
     for lod_root, lod_token in lods:
         objects = _geometry_audit_lod_meshes(lod_root)
         snapshot = _geometry_audit_snapshot(objects)
+        from .nh_collision_quality import make_bvh_inside
         result = audit_mesh_geometry(
             snapshot["vertices"],
             edges=snapshot["edges"],
             faces=snapshot["faces"],
             triangles=snapshot["triangles"],
             inside_threshold=settings.inside_threshold,
+            ray_test_factory=make_bvh_inside,
         )
         entries.append(
             {
@@ -496,6 +498,8 @@ def _clean_geometry_audit_safe_vertices(context, vertex_map):
         obj = bpy.data.objects.get(object_name)
         if obj is None or obj.type != "MESH" or obj.data is None:
             continue
+        if obj.data.users > 1:
+            obj.data = obj.data.copy()
         try:
             key = obj.data.as_pointer()
         except Exception:

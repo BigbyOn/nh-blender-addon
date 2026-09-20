@@ -843,78 +843,28 @@ def _select_only_faces_in_bmesh(bm, faces):
 
 
 def _build_clean_hull_data_from_local_points(local_points, merge_distance=0.0, recalc_normals=True):
-    unique_points = []
-    seen = set()
-    for point in local_points:
-        key = _vector_quantized_key(point)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique_points.append(point.copy())
-
-    if len(unique_points) < 4:
-        raise RuntimeError("Selected vertices collapse below 4 unique points")
-
+    points = list(dict.fromkeys(tuple(float(x) for x in p) for p in local_points))
+    if len(points) < 4:
+        raise RuntimeError("Need at least four distinct points for a solid hull")
     bm = bmesh.new()
     try:
-        seed_verts = [bm.verts.new(point) for point in unique_points]
-        bm.verts.ensure_lookup_table()
-        bm.edges.ensure_lookup_table()
-        bm.faces.ensure_lookup_table()
-
-        if merge_distance > 0.0 and seed_verts:
-            bmesh.ops.remove_doubles(bm, verts=seed_verts, dist=merge_distance)
-            bm.verts.ensure_lookup_table()
-            bm.edges.ensure_lookup_table()
-            bm.faces.ensure_lookup_table()
-            seed_verts = [vert for vert in seed_verts if vert.is_valid]
-
-        unique_point_keys = {_vector_quantized_key(vert.co) for vert in seed_verts if vert.is_valid}
-        if len(unique_point_keys) < 4:
-            raise RuntimeError("Selected vertices collapse below 4 unique points")
-
-        hull = bmesh.ops.convex_hull(bm, input=seed_verts, use_existing_faces=False)
-        final_faces = _finalize_convex_hull_geometry(
-            bm,
-            hull,
-            seed_verts,
-            recalc_normals=recalc_normals,
-        )
-
-        used_verts = []
-        used_vert_ids = set()
-        for face in final_faces:
-            if face is None or not face.is_valid:
-                continue
-            for vert in face.verts:
-                if vert is None or not vert.is_valid:
-                    continue
-                key = id(vert)
-                if key in used_vert_ids:
-                    continue
-                used_vert_ids.add(key)
-                used_verts.append(vert)
-
-        if len(used_verts) < 4:
-            raise RuntimeError("Convex hull did not keep enough vertices to build a clean result")
-
-        vert_index_by_id = {id(vert): idx for idx, vert in enumerate(used_verts)}
-        face_indices = []
-        for face in final_faces:
-            if face is None or not face.is_valid or len(face.verts) < 3:
-                continue
-            indices = [vert_index_by_id[id(vert)] for vert in face.verts if vert is not None and vert.is_valid]
-            if len(indices) >= 3:
-                face_indices.append(indices)
-
-        if not face_indices:
-            raise RuntimeError("Convex hull did not create faces (selection may be too flat or degenerate)")
-
-        return {
-            "verts": [vert.co.copy() for vert in used_verts],
-            "faces": face_indices,
-            "used_verts": len(unique_point_keys),
-        }
+        verts = [bm.verts.new(p) for p in points]
+        if merge_distance > 0:
+            bmesh.ops.remove_doubles(bm, verts=verts, dist=merge_distance)
+        verts = list(bm.verts)
+        if len(verts) < 4:
+            raise RuntimeError("Merge Distance collapsed the hull")
+        bmesh.ops.convex_hull(bm, input=verts, use_existing_faces=False)
+        unused = [v for v in bm.verts if not v.link_faces]
+        if unused:
+            bmesh.ops.delete(bm, geom=unused, context='VERTS')
+        if len(bm.faces) < 4 or abs(bm.calc_volume()) <= 1e-15:
+            raise RuntimeError("Convex hull has zero volume; select a three-dimensional shape")
+        if recalc_normals:
+            bmesh.ops.recalc_face_normals(bm, faces=list(bm.faces))
+        bm.verts.index_update()
+        return dict(verts=[v.co.copy() for v in bm.verts],
+                    faces=[[v.index for v in f.verts] for f in bm.faces], used_verts=len(points))
     finally:
         bm.free()
 
@@ -1757,41 +1707,21 @@ def _fake_terrain_selected_face_indices_if_edit(source_obj):
 
 
 def _collect_fake_terrain_source_triangles(source_obj, selected_face_indices):
-    if source_obj is None or getattr(source_obj, "type", None) != "MESH":
-        raise RuntimeError("Source Visual must be a mesh")
-
+    if source_obj is None or source_obj.type != 'MESH':
+        raise RuntimeError('Source Visual must be a mesh')
+    selected = set(selected_face_indices or [])
+    if not selected: raise RuntimeError('Select terrain faces on Source Visual in Edit Mode')
     mesh = source_obj.data
-    matrix_world = source_obj.matrix_world.copy()
-    selected_face_indices = set(selected_face_indices or [])
-    if not selected_face_indices:
-        raise RuntimeError("Select terrain faces on Source Visual in Edit Mode")
-
+    mesh.calc_loop_triangles()
+    matrix = source_obj.matrix_world
     triangles = []
-    matched_faces = 0
-
-    for poly in mesh.polygons:
-        if int(poly.index) not in selected_face_indices:
-            continue
-
-        verts = [matrix_world @ mesh.vertices[idx].co for idx in poly.vertices]
-        if len(verts) < 3:
-            continue
-
-        matched_faces += 1
-        material_index = int(getattr(poly, "material_index", 0) or 0)
-        for idx in range(1, len(verts) - 1):
-            tri = (verts[0].copy(), verts[idx].copy(), verts[idx + 1].copy())
-            if (tri[1] - tri[0]).cross(tri[2] - tri[0]).length_squared <= 1e-12:
-                continue
-            center = (tri[0] + tri[1] + tri[2]) / 3.0
-            triangles.append({
-                "points": tri,
-                "center": center,
-                "source_obj": source_obj,
-                "material_index": material_index,
-            })
-
-    return triangles, matched_faces
+    for triangle in mesh.loop_triangles:
+        if triangle.polygon_index not in selected: continue
+        points = tuple(matrix @ mesh.vertices[i].co for i in triangle.vertices)
+        if (points[1]-points[0]).cross(points[2]-points[0]).length_squared <= 1e-20: continue
+        triangles.append(dict(points=points, center=sum(points, Vector())/3,
+                              source_obj=source_obj, material_index=mesh.polygons[triangle.polygon_index].material_index))
+    return triangles, len(selected.intersection(range(len(mesh.polygons))))
 
 
 def _fake_terrain_source_candidates(context, primary_source_obj, target_obj=None):
@@ -2240,149 +2170,11 @@ def _append_fake_terrain_component(world_vertices, faces, hull_xy, plane, thickn
 
 
 
-def _build_fake_terrain_mesh_from_triangles(
-    triangles,
-    *,
-    patch_size,
-    min_patch_size,
-    depression_error,
-    hill_error,
-    thickness,
-):
-    if not triangles:
-        raise RuntimeError("No matching source faces found for fake terrain")
-
-    patch_size = max(float(patch_size), 0.25)
-    min_patch_size = max(0.05, min(float(min_patch_size), patch_size))
-    depression_error = max(0.0, float(depression_error))
-    hill_error = max(0.0, float(hill_error))
-    thickness = max(0.05, float(thickness))
-
-    all_points = [point for tri in triangles for point in tri["points"]]
-    min_x = min(point.x for point in all_points)
-    min_y = min(point.y for point in all_points)
-
-    tiles = {}
-    for tri in triangles:
-        bbox = _fake_terrain_bbox_from_points_xy(tri["points"])
-        if bbox is None:
-            continue
-        tri["bbox_xy"] = bbox
-        ix0 = int(math.floor((bbox[0] - min_x) / patch_size))
-        ix1 = int(math.floor((bbox[1] - min_x) / patch_size))
-        iy0 = int(math.floor((bbox[2] - min_y) / patch_size))
-        iy1 = int(math.floor((bbox[3] - min_y) / patch_size))
-        for ix in range(ix0, ix1 + 1):
-            x0 = min_x + ix * patch_size
-            x1 = x0 + patch_size
-            for iy in range(iy0, iy1 + 1):
-                y0 = min_y + iy * patch_size
-                y1 = y0 + patch_size
-                if _fake_terrain_bbox_overlaps_rect_xy(bbox, x0, x1, y0, y1):
-                    tiles.setdefault((ix, iy), []).append(tri)
-
-    world_vertices = []
-    faces = []
-    occupied_bboxes = []
-    stats = {
-        "components": 0,
-        "source_tris": len(triangles),
-        "split_cells": 0,
-        "max_depth": 0,
-        "skipped_existing": 0,
-        "build_mode": "GRID_PATCHES",
-    }
-
-    def build_cell(cell_tris, x0, x1, y0, y1, depth):
-        if not cell_tris:
-            return
-
-        points = _fake_terrain_clipped_cell_points(cell_tris, x0, x1, y0, y1)
-        unique_xy = _fake_terrain_unique_xy(points)
-        if len(unique_xy) < 3:
-            return
-        z_values_by_xy = {}
-        for point in points:
-            key = (round(float(point.x), 5), round(float(point.y), 5))
-            z_values_by_xy.setdefault(key, []).append(float(point.z))
-        z_by_xy = {
-            key: sum(values) / len(values)
-            for key, values in z_values_by_xy.items()
-            if values
-        }
-
-        plane = _fake_terrain_fit_plane(points)
-        max_depression = 0.0
-        max_hill = 0.0
-        for point in points:
-            patch_z = _fake_terrain_plane_z(plane, point.x, point.y)
-            max_depression = max(max_depression, patch_z - point.z)
-            max_hill = max(max_hill, point.z - patch_z)
-
-        size_x = max(0.0, x1 - x0)
-        size_y = max(0.0, y1 - y0)
-        size = max(size_x, size_y)
-        should_split = (
-            len(cell_tris) > 1
-            and size > min_patch_size * 1.01
-            and (max_depression > depression_error or max_hill > hill_error)
-            and depth < 16
-        )
-
-        if should_split:
-            mx = (x0 + x1) * 0.5
-            my = (y0 + y1) * 0.5
-            children = [[], [], [], []]
-            child_bounds = (
-                (x0, mx, y0, my),
-                (mx, x1, y0, my),
-                (x0, mx, my, y1),
-                (mx, x1, my, y1),
-            )
-            for tri in cell_tris:
-                bbox = tri.get("bbox_xy") or _fake_terrain_bbox_from_points_xy(tri["points"])
-                for child_idx, bounds in enumerate(child_bounds):
-                    if _fake_terrain_bbox_overlaps_rect_xy(bbox, bounds[0], bounds[1], bounds[2], bounds[3]):
-                        children[child_idx].append(tri)
-
-            stats["split_cells"] += 1
-            for child_tris, bounds in zip(children, child_bounds):
-                if child_tris:
-                    build_cell(child_tris, bounds[0], bounds[1], bounds[2], bounds[3], depth + 1)
-            return
-
-        hull_xy = _fake_terrain_convex_hull_xy(unique_xy)
-        if _fake_terrain_hull_overlaps_occupied_bboxes(hull_xy, occupied_bboxes):
-            stats["skipped_existing"] += 1
-            return
-        if _append_fake_terrain_component(world_vertices, faces, hull_xy, plane, thickness, z_by_xy=z_by_xy):
-            stats["components"] += 1
-            stats["max_depth"] = max(stats["max_depth"], depth)
-            bbox = _fake_terrain_bbox_from_xy(hull_xy)
-            if bbox is not None:
-                occupied_bboxes.append({"bbox": bbox, "poly": list(hull_xy)})
-
-    for (ix, iy), tile_tris in tiles.items():
-        x0 = min_x + ix * patch_size
-        y0 = min_y + iy * patch_size
-        build_cell(tile_tris, x0, x0 + patch_size, y0, y0 + patch_size, 0)
-
-    if not world_vertices or not faces or stats["components"] <= 0:
-        if stats["skipped_existing"] > 0:
-            stats["verts"] = 0
-            stats["faces"] = 0
-            return [], [], stats
-        raise RuntimeError("Could not build fake terrain components from the matched faces")
-
-    # Keep slab vertices separate across patch boundaries. Sharing identical
-    # coordinates here would weld adjacent fake terrain slabs into one connected
-    # component in Blender.
-    if not world_vertices or not faces:
-        raise RuntimeError("Could not build valid fake terrain faces")
-
-    stats["verts"] = len(world_vertices)
-    stats["faces"] = len(faces)
-    return world_vertices, faces, stats
+def _build_fake_terrain_mesh_from_triangles(triangles, *, patch_size, min_patch_size, depression_error, hill_error, thickness, max_triangles=32):
+    from .nh_terrain_geometry import build_terrain
+    return build_terrain(triangles, patch_size=patch_size, min_patch_size=min_patch_size,
+                         depression_error=depression_error, hill_error=hill_error,
+                         thickness=thickness, max_triangles=max_triangles)
 
 
 class CRAY_OT_GenerateFakeTerrainGeometry(Operator):
@@ -2437,6 +2229,15 @@ class CRAY_OT_GenerateFakeTerrainGeometry(Operator):
                 source_obj,
                 target_obj=preferred_target,
             )
+            world_vertices, faces, build_stats = _build_fake_terrain_mesh_from_triangles(
+                source_tris,
+                patch_size=cs.fake_terrain_patch_size,
+                min_patch_size=cs.fake_terrain_min_patch_size,
+                depression_error=cs.fake_terrain_depression_error,
+                hill_error=cs.fake_terrain_hill_error,
+                thickness=cs.fake_terrain_thickness,
+                max_triangles=cs.fake_terrain_max_triangles,
+            )
             if context.mode != "OBJECT":
                 bpy.ops.object.mode_set(mode="OBJECT")
             target_obj = _ensure_collider_lod_object(
@@ -2466,64 +2267,63 @@ class CRAY_OT_GenerateFakeTerrainGeometry(Operator):
                 except Exception:
                     pass
 
-            material_index, material_name = _ensure_collider_placeholder_material(
-                target_obj,
-                source_obj,
-                source_objects=source_objects,
-                data_items=source_tris,
-            )
-            world_vertices, faces, build_stats = _build_fake_terrain_mesh_from_triangles(
-                source_tris,
-                patch_size=cs.fake_terrain_patch_size,
-                min_patch_size=cs.fake_terrain_min_patch_size,
-                depression_error=cs.fake_terrain_depression_error,
-                hill_error=cs.fake_terrain_hill_error,
-                thickness=cs.fake_terrain_thickness,
-            )
-            if not world_vertices or not faces:
-                self.report(
-                    {"INFO"},
-                    (
-                        f"No new fake terrain added to {target_obj.name}: "
-                        f"{build_stats.get('skipped_existing', 0)} patch(es) already overlap target geometry"
-                    ),
+            from .nh_collider_exp import _collider_exp_mesh_transaction_exp
+            with _collider_exp_mesh_transaction_exp(target_obj):
+                material_index, material_name = _ensure_collider_placeholder_material(
+                    target_obj,
+                    source_obj,
+                    source_objects=source_objects,
+                    data_items=source_tris,
                 )
-                _restore_collider_exp_source_context_exp(context, source_obj, restore_edit_mode=source_was_edit)
-                return {"FINISHED"}
-            append_stats = _append_collider_exp_mesh_to_object_exp(
-                target_obj,
-                world_vertices,
-                faces,
-                merge_distance=0.0,
-                recalc_normals=True,
-                material_index=material_index,
-            )
-            source_obj_for_props = source_objects[0] if source_objects else source_obj
-            _set_collider_exp_custom_props_exp(
-                target_obj,
-                "FAKE_TERRAIN",
-                source_obj_for_props,
-                {
-                    "vertex_indices": append_stats.get("vertex_indices", []),
-                    "face_indices": append_stats.get("face_indices", []),
-                    "source_object": source_obj_for_props.name,
-                    "source_objects": [obj.name for obj in source_objects],
-                    "source_mode": "SELECTED_FACES",
-                    "build_mode": build_stats.get("build_mode", "GRID_PATCHES"),
-                    "selected_faces": matched_faces,
-                    "target_lod": actual_target_lod,
-                    "material_name": material_name,
-                    "components": build_stats.get("components", 0),
-                    "skipped_existing": build_stats.get("skipped_existing", 0),
-                    "matched_faces": matched_faces,
-                    "source_tris": build_stats.get("source_tris", 0),
-                    "patch_size": float(cs.fake_terrain_patch_size),
-                    "min_patch_size": float(cs.fake_terrain_min_patch_size),
-                    "depression_error": float(cs.fake_terrain_depression_error),
-                    "hill_error": float(cs.fake_terrain_hill_error),
-                    "thickness": float(cs.fake_terrain_thickness),
-                },
-            )
+
+                if not world_vertices or not faces:
+                    self.report(
+                        {"INFO"},
+                        (
+                            f"No new fake terrain added to {target_obj.name}: "
+                            f"{build_stats.get('skipped_existing', 0)} patch(es) already overlap target geometry"
+                        ),
+                    )
+                    _restore_collider_exp_source_context_exp(context, source_obj, restore_edit_mode=source_was_edit)
+                    return {"FINISHED"}
+                append_stats = _append_collider_exp_mesh_to_object_exp(
+                    target_obj,
+                    world_vertices,
+                    faces,
+                    merge_distance=0.0,
+                    recalc_normals=True,
+                    material_index=material_index,
+                )
+                source_obj_for_props = source_objects[0] if source_objects else source_obj
+                _set_collider_exp_custom_props_exp(
+                    target_obj,
+                    "FAKE_TERRAIN",
+                    source_obj_for_props,
+                    {
+                        "vertex_indices": append_stats.get("vertex_indices", []),
+                        "face_indices": append_stats.get("face_indices", []),
+                        "source_object": source_obj_for_props.name,
+                        "source_objects": [obj.name for obj in source_objects],
+                        "source_mode": "SELECTED_FACES",
+                        "build_mode": build_stats.get("build_mode", "ADAPTIVE_CONVEX"),
+                        "selected_faces": matched_faces,
+                        "target_lod": actual_target_lod,
+                        "material_name": material_name,
+                        "components": build_stats.get("components", 0),
+                        "skipped_existing": build_stats.get("skipped_existing", 0),
+                        "matched_faces": matched_faces,
+                        "source_tris": build_stats.get("source_tris", 0),
+                        "patch_size": float(cs.fake_terrain_patch_size),
+                        "min_patch_size": float(cs.fake_terrain_min_patch_size),
+                        "depression_error": float(cs.fake_terrain_depression_error),
+                        "hill_error": float(cs.fake_terrain_hill_error),
+                        "thickness": float(cs.fake_terrain_thickness),
+                        "max_triangles": int(cs.fake_terrain_max_triangles),
+                        "max_above": build_stats["max_above"],
+                        "max_below": build_stats["max_below"],
+                        "seam_step_bound": build_stats["seam_step_bound"],
+                    },
+                )
 
             _restore_collider_exp_source_context_exp(context, source_obj, restore_edit_mode=source_was_edit)
         except Exception as e:
@@ -2541,7 +2341,7 @@ class CRAY_OT_GenerateFakeTerrainGeometry(Operator):
                 f"{build_stats.get('components', 0)} components, "
                 f"+{append_stats.get('verts_added', 0)} verts, +{append_stats.get('faces_added', 0)} faces, "
                 f"from {matched_faces} selected face(s), "
-                f"skipped {build_stats.get('skipped_existing', 0)} occupied patch(es)"
+                f"error +{build_stats['max_above']:.3f}/-{build_stats['max_below']:.3f} m"
             ),
         )
         return {"FINISHED"}
@@ -4201,6 +4001,7 @@ _COLLIDER_EXP_HISTORY_LIMIT = 30
 _COLLIDER_EXP_GUIDE_PROP = "nh_collider_exp_guide_type"
 _COLLIDER_EXP_GUIDE_SOURCE_PROP = "nh_collider_exp_guide_source"
 _COLLIDER_EXP_COMMON_PROPS = (
+    "round_axis",
     "target_lod",
     "scale_x",
     "scale_y",
@@ -4216,6 +4017,8 @@ _COLLIDER_EXP_COMMON_PROPS = (
     "recalc_normals",
 )
 _COLLIDER_EXP_PERSISTENT_OPERATOR_PROPS = {
+    "convex_shape_error",
+    "round_axis",
     "target_lod",
     "minimum_size",
     "normal_minimum_size",

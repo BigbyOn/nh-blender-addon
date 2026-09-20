@@ -399,6 +399,14 @@ def _model_split_grid_remove_collection_tree(collection):
 def _model_split_grid_point_inside_cutter(cutter, world_point, epsilon: float = 1.0e-6) -> bool:
     if cutter is None:
         return False
+    domain = cutter.get("nh_grid_point_domain") if hasattr(cutter, "get") else None
+    if domain:
+        x0,x1,y0,y1,z0,z1,last_x,last_y = domain
+        x,y,z = world_point
+        # Assign a narrow shared-boundary band to the cell on its positive side.
+        return (x >= x0-epsilon and (x <= x1+epsilon if last_x else x < x1-epsilon)
+                and y >= y0-epsilon and (y <= y1+epsilon if last_y else y < y1-epsilon)
+                and z0-epsilon <= z <= z1+epsilon)
     try:
         local = cutter.matrix_world.inverted_safe() @ world_point
     except Exception:
@@ -913,6 +921,11 @@ class CRAY_OT_ModelSplitGridSplitSource(Operator):
                     error_count += 1
                     failures.append(f"{grid_id} -> failed to create temporary split cell: {_fmt_exc(e)}")
                     continue
+
+                world_corners = [cell_cutter.matrix_world @ Vector(p) for p in cell_cutter.bound_box]
+                cell_cutter["nh_grid_point_domain"] = [x0, x1, y0, y1,
+                    min(p.z for p in world_corners), max(p.z for p in world_corners),
+                    float(_ix == cell_count_x-1), float(_iy == cell_count_y-1)]
 
                 root_name = _model_split_grid_output_root_name(prefix, grid_id)
                 target_root = _model_split_grid_create_output_root(context, output_container, source_root, root_name)

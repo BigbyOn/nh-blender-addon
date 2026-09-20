@@ -179,7 +179,7 @@ class CRAY_PT_ColliderPanel(Panel):
             row.operator("cray.set_fake_terrain_target_from_active", text="", icon="EYEDROPPER")
             row = fake.row(align=True)
             row.prop(cs, "fake_terrain_patch_size")
-            row.prop(cs, "fake_terrain_min_patch_size")
+            row.prop(cs, "fake_terrain_max_triangles")
             row = fake.row(align=True)
             row.prop(cs, "fake_terrain_depression_error")
             row.prop(cs, "fake_terrain_hill_error")
@@ -274,13 +274,13 @@ class CRAY_PT_ColliderExpPanel(Panel):
         _assign_collider_exp_operator_props_exp(
             op,
             es,
-            prop_names=_collider_exp_operator_props_exp(("convex_detail", "convex_max_triangles")),
+            prop_names=_collider_exp_operator_props_exp(("convex_detail", "convex_max_triangles", "convex_shape_error")),
         )
         op = row.operator("cray.rebuild_convex_hull_collider_exp", text="Simplify Hull", icon="MOD_DECIM")
         _assign_collider_exp_operator_props_exp(
             op,
             es,
-            prop_names=_collider_exp_operator_props_exp(("convex_detail", "convex_max_triangles")),
+            prop_names=_collider_exp_operator_props_exp(("convex_detail", "convex_max_triangles", "convex_shape_error")),
         )
         row = create.row(align=True)
         op = row.operator("cray.reconvex_selected_components_exp", text="Re-Convex", icon="MESH_ICOSPHERE")
@@ -322,6 +322,7 @@ class CRAY_PT_ColliderExpPanel(Panel):
         round_box = layout.box()
         round_box.operator_context = "INVOKE_DEFAULT"
         round_box.label(text="Round Box Collision", icon="MESH_CYLINDER")
+        round_box.prop(es, "round_axis")
 
         row = round_box.row(align=True)
         op = row.operator("cray.create_cylinder_guide_collider_exp", text="Create Cylinder", icon="MESH_CYLINDER")
@@ -336,31 +337,15 @@ class CRAY_PT_ColliderExpPanel(Panel):
             es,
             prop_names=_collider_exp_operator_props_exp(("cylinder_segments",)),
         )
+        from .nh_pipe_editor import draw_editor, is_pipe_editor
         row = round_box.row(align=True)
         op = row.operator("cray.create_pipe_guide_collider_exp", text="Create Pipe", icon="MESH_TORUS")
-        _assign_collider_exp_operator_props_exp(
-            op,
-            es,
-            prop_names=_collider_exp_operator_props_exp((
-                "pipe_segments",
-                "pipe_inner_radius",
-                "pipe_outer_radius",
-                "pipe_depth",
-                "pipe_thickness",
-            )),
-        )
-        op = row.operator("cray.generate_pipe_boxes_collider_exp", text="Pipe Boxes", icon="MESH_CUBE")
-        _assign_collider_exp_operator_props_exp(
-            op,
-            es,
-            prop_names=_collider_exp_operator_props_exp((
-                "pipe_segments",
-                "pipe_inner_radius",
-                "pipe_outer_radius",
-                "pipe_depth",
-                "pipe_thickness",
-            )),
-        )
+        op.round_axis = es.round_axis
+        conversion = row.row(align=True)
+        conversion.enabled = any(is_pipe_editor(obj) for obj in context.selected_objects)
+        op = conversion.operator("cray.generate_pipe_boxes_collider_exp", text="Pipe to Boxes", icon="MESH_CUBE")
+        op.target_lod = es.target_lod
+        draw_editor(round_box, context)
 
         validate = layout.box()
         validate.operator_context = "INVOKE_DEFAULT"

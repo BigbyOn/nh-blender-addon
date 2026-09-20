@@ -365,7 +365,7 @@ def _nested_order(left, right, epsilon):
     return (left, right) if left_key <= right_key else (right, left)
 
 
-def audit_mesh_geometry(vertices, edges=(), faces=(), triangles=None, inside_threshold=0.80, epsilon=None):
+def audit_mesh_geometry(vertices, edges=(), faces=(), triangles=None, inside_threshold=0.80, epsilon=None, ray_test_factory=None):
     """Audit one logical LOD represented in one consistent coordinate space.
 
     ``triangles`` may contain Blender's loop triangles for reliable concave-face
@@ -456,6 +456,7 @@ def audit_mesh_geometry(vertices, edges=(), faces=(), triangles=None, inside_thr
         and component.vertices_count > 3
         and not set(component.vertex_indices).issubset(safe_vertices)
     ]
+    ray_queries = {}
     best_nested_by_inner = {}
     not_testable_pairs = 0
 
@@ -489,13 +490,16 @@ def audit_mesh_geometry(vertices, edges=(), faces=(), triangles=None, inside_thr
                 )
                 triangles_by_component[outer.index] = outer_triangles
 
+            if ray_test_factory is not None and outer.index not in ray_queries:
+                ray_queries[outer.index] = ray_test_factory(outer_triangles, numeric_epsilon)
             inside_count = 0
             determinate_count = 0
             for point in samples:
                 if not _point_in_aabb(point, outer, numeric_epsilon):
                     determinate_count += 1
                     continue
-                inside = _point_inside_closed_triangles(point, outer_triangles, numeric_epsilon)
+                inside = (ray_queries[outer.index](point) if ray_test_factory is not None
+                          else _point_inside_closed_triangles(point, outer_triangles, numeric_epsilon))
                 if inside is None:
                     continue
                 determinate_count += 1

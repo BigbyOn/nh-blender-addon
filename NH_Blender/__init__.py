@@ -1,7 +1,7 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Enisam",
-    "version": (0, 6, 2, 22),
+    "version": (0, 6, 2, 25),
     "blender": (5, 1, 1),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "All-in-one Blender toolkit for porting and preparing DayZ/Arma assets: fixes, textures, colliders, proxies, snap points, and P3D workflow helpers.",    
@@ -54,6 +54,9 @@ _PACKAGE_SUBMODULE_RELOAD_ORDER = (
     "utilities.tb_txt",
     "nh_base",
     "nh_scatter",
+    "nh_round_geometry",
+    "nh_pipe_editor",
+    "nh_terrain_geometry",
     "nh_collider",
     "nh_collider_exp",
     "nh_textures",
@@ -63,6 +66,7 @@ _PACKAGE_SUBMODULE_RELOAD_ORDER = (
     "nh_planner",
     "nh_fixes",
     "nh_geometry_audit",
+    "nh_collision_quality",
     "nh_geometry_audit_ops",
     "nh_tb_import",
     "nh_statistics",
@@ -114,7 +118,10 @@ from .nh_tb_import import CRAY_OT_ImportTerrainBuilderTXT, menu_import as _tb_me
 from . import nh_statistics as _stats
 from . import nh_ui_icons as _nh_icons
 
+from .nh_pipe_editor import CRAY_PG_PipeEditor
+
 classes = (
+    CRAY_PG_PipeEditor,
     CRAY_OT_ImportTerrainBuilderTXT,
     CRAY_PG_Settings,
     CRAY_PG_SnapSettings,
@@ -337,6 +344,9 @@ def _unregister_stale_nh_classes_before_hot_reload():
     if not stale:
         return 0
 
+    if hasattr(bpy.types.Object, "nh_pipe_editor"):
+        del bpy.types.Object.nh_pipe_editor
+
     # Old PointerProperty descriptors keep the previous PropertyGroup classes
     # alive and must be released before those classes can be unregistered.
     for attr_name in _NH_SCENE_POINTER_ATTRS:
@@ -383,6 +393,7 @@ def register():
             except Exception:
                 pass
         raise
+    bpy.types.Object.nh_pipe_editor = PointerProperty(type=CRAY_PG_PipeEditor)
     bpy.types.Scene.cray_settings = PointerProperty(type=CRAY_PG_Settings)
     bpy.types.Scene.cray_snap_settings = PointerProperty(type=CRAY_PG_SnapSettings)
     bpy.types.Scene.cray_collider_settings = PointerProperty(type=CRAY_PG_ColliderSettings)
@@ -418,6 +429,8 @@ def register():
         bpy.app.timers.register(_ensure_p3d_panel_icon_patch_timer, first_interval=1.0)
 
 def unregister():
+    if hasattr(bpy.types.Object, "nh_pipe_editor"):
+        del bpy.types.Object.nh_pipe_editor
     bpy.types.TOPBAR_MT_file_import.remove(_tb_menu_import)
     _clear_geometry_audit_cache()
     _nh_icons.dispose()

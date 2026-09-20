@@ -14,6 +14,7 @@ import uuid
 import hashlib
 import tempfile
 from mathutils import Vector, Matrix
+from .nh_round_geometry import ROUND_AXIS_ITEMS
 from bpy.props import PointerProperty, StringProperty, FloatProperty, IntProperty, BoolProperty, EnumProperty, CollectionProperty
 from bpy.types import Operator, Panel, PropertyGroup, UIList, OperatorFileListElement, Menu
 from bpy.app.handlers import persistent
@@ -1633,21 +1634,22 @@ class CRAY_PG_ColliderSettings(PropertyGroup):
         unit="LENGTH",
     )
     fake_terrain_depression_error: FloatProperty(
-        name="Pit Error",
-        description="Maximum allowed vertical bridge over lower source points before a patch is split",
-        default=0.15,
+        name="Above Visual",
+        description="Maximum vertical height of the finished convex collision above the visual surface",
+        default=0.10,
         min=0.0,
         precision=3,
         unit="LENGTH",
     )
     fake_terrain_hill_error: FloatProperty(
-        name="Hill Error",
-        description="Maximum allowed source height above the fitted patch before a patch is split",
-        default=0.35,
+        name="Below Visual",
+        description="Maximum vertical depth of the finished convex collision below the visual surface",
+        default=0.10,
         min=0.0,
         precision=3,
         unit="LENGTH",
     )
+    fake_terrain_max_triangles: IntProperty(name="Triangles per Hull", description="Maximum triangles in each simple convex terrain component", default=32, min=12, max=128)
     fake_terrain_thickness: FloatProperty(
         name="Thickness",
         description="Vertical thickness of each closed fake terrain component",
@@ -1752,6 +1754,11 @@ class CRAY_PG_ColliderExpSettings(PropertyGroup):
         description="For flat box sources, add missing Minimum Size thickness opposite to the averaged face normal instead of centering it",
         default=False,
     )
+    convex_shape_error: FloatProperty(
+        name="Max Shape Error", description="Maximum distance in meters from source hull to simplified hull",
+        default=0.05, min=0.0, unit='LENGTH', precision=3,
+    )
+
     convex_detail: IntProperty(
         name="Hull Detail",
         description="Simplification/detail level for experimental convex hull",
@@ -1761,9 +1768,9 @@ class CRAY_PG_ColliderExpSettings(PropertyGroup):
     )
     convex_max_triangles: IntProperty(
         name="Max Hull Triangles",
-        description="Triangle budget used when simplifying experimental convex hulls",
-        default=64,
-        min=4,
+        description="Maximum triangles; 0 builds the exact hull without simplification",
+        default=0,
+        min=0,
         max=2048,
     )
     cylinder_segments: IntProperty(
@@ -1779,18 +1786,11 @@ class CRAY_PG_ColliderExpSettings(PropertyGroup):
         max=128,
     )
     pipe_inner_radius: FloatProperty(
-        name="Pipe Inner Radius",
-        default=0.5,
-        min=0.0,
-        precision=4,
-        unit="LENGTH",
+        name="Inner Radius Factor", description="Hole radius as a fraction of the outer radius",
+        default=0.5, min=0.0, max=0.98, precision=3,
     )
     pipe_outer_radius: FloatProperty(
-        name="Pipe Outer Radius",
-        default=1.0,
-        min=0.001,
-        precision=4,
-        unit="LENGTH",
+        name="Outer Radius Scale", default=1.0, min=0.001, precision=3,
     )
     pipe_depth: FloatProperty(
         name="Pipe Depth",
@@ -1853,6 +1853,8 @@ class CRAY_PG_ColliderExpSettings(PropertyGroup):
         precision=5,
         unit="LENGTH",
     )
+
+    round_axis: EnumProperty(name='Round Axis', items=ROUND_AXIS_ITEMS, default='AUTO')
 
 
 
