@@ -1,7 +1,7 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Enisam",
-    "version": (0, 6, 2, 25),
+    "version": (0, 6, 3),
     "blender": (5, 1, 1),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "All-in-one Blender toolkit for porting and preparing DayZ/Arma assets: fixes, textures, colliders, proxies, snap points, and P3D workflow helpers.",    
@@ -61,6 +61,7 @@ _PACKAGE_SUBMODULE_RELOAD_ORDER = (
     "nh_collider_exp",
     "nh_textures",
     "nh_snap",
+    "nh_ladder",
     "nh_assets",
     "nh_model_split",
     "nh_planner",
@@ -106,6 +107,7 @@ from .nh_textures import (CRAY_OT_AssetLibraryForceRebuildIconsTextures, CRAY_OT
 from .nh_ui_panels import (CRAY_PT_AssetProxyPanel, CRAY_PT_CacheManagerPanel, CRAY_PT_ColliderExpPanel, CRAY_PT_ColliderPanel, CRAY_PT_FixesPanel, CRAY_PT_ImportExportPlannerPanel, CRAY_PT_MenuSettingsPanel, CRAY_PT_ModelSplitPanel, CRAY_PT_TextureReplacePanel, _ensure_p3d_panel_icon_patch_timer)
 
 # --- public/debug surface of the split package (ops candidates + bridge) ---
+from .nh_snap import CRAY_OT_ToggleSnapNameAxis
 from .nh_snap import (_P3D_BUNDLE_REGISTRY, _P3D_IMPORT_CANDIDATES, _P3D_EXPORT_CANDIDATES,
     _call_first_available, _op_handle, _has_any_p3d_export_ops, _has_any_p3d_io_ops, _has_any_p3d_import_ops)
 
@@ -119,12 +121,18 @@ from . import nh_statistics as _stats
 from . import nh_ui_icons as _nh_icons
 
 from .nh_pipe_editor import CRAY_PG_PipeEditor
+from .nh_ladder import (CRAY_PG_LadderSettings, CRAY_OT_LadderCapture,
+                        CRAY_OT_CreateLadderMemory, CRAY_OT_NewLadder, CRAY_PT_LadderPointsPanel)
 
 classes = (
     CRAY_PG_PipeEditor,
     CRAY_OT_ImportTerrainBuilderTXT,
     CRAY_PG_Settings,
     CRAY_PG_SnapSettings,
+    CRAY_PG_LadderSettings,
+    CRAY_OT_LadderCapture,
+    CRAY_OT_CreateLadderMemory,
+    CRAY_OT_NewLadder,
     CRAY_PG_ColliderSettings,
     CRAY_PG_ColliderExpSettings,
     CRAY_PG_UIPanelSettings,
@@ -136,6 +144,7 @@ classes = (
     CRAY_OT_LoadConfig,
     CRAY_OT_ScatterProxies,
     CRAY_OT_EnsureMemoryLOD,
+    CRAY_OT_ToggleSnapNameAxis,
     CRAY_OT_SnapSetP3DVisualsOnly,
     CRAY_OT_SnapShowAllP3DCollections,
     CRAY_OT_CreateSnapPairFromModelEdge,
@@ -270,6 +279,7 @@ classes = (
     CRAY_PT_ColliderExpPanel,
     CRAY_PT_ClutterProxiesPanel,
     CRAY_PT_SnapPointsPanel,
+    CRAY_PT_LadderPointsPanel,
     CRAY_PT_AssetProxyPanel,
     CRAY_PT_FixesPanel,
     CRAY_PT_ImportExportPlannerPanel,
@@ -291,6 +301,7 @@ _NH_SCENE_POINTER_ATTRS = (
     "cray_collider_exp_settings",
     "cray_collider_settings",
     "cray_snap_settings",
+    "cray_ladder_settings",
     "cray_settings",
 )
 
@@ -396,6 +407,7 @@ def register():
     bpy.types.Object.nh_pipe_editor = PointerProperty(type=CRAY_PG_PipeEditor)
     bpy.types.Scene.cray_settings = PointerProperty(type=CRAY_PG_Settings)
     bpy.types.Scene.cray_snap_settings = PointerProperty(type=CRAY_PG_SnapSettings)
+    bpy.types.Scene.cray_ladder_settings = PointerProperty(type=CRAY_PG_LadderSettings)
     bpy.types.Scene.cray_collider_settings = PointerProperty(type=CRAY_PG_ColliderSettings)
     bpy.types.Scene.cray_collider_exp_settings = PointerProperty(type=CRAY_PG_ColliderExpSettings)
     bpy.types.Scene.cray_geometry_audit_settings = PointerProperty(type=CRAY_PG_GeometryAuditSettings)

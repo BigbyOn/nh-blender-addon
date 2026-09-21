@@ -1034,7 +1034,8 @@ class CRAY_PT_SnapPointsPanel(Panel):
 
     def draw(self, context):
         from .nh_base import (_PLAIN_AXIS_HOTKEY_REGISTERED)
-        from .nh_snap import (_SnapPointNamePattern, _get_snap_target_object, _snap_target_memory_scope_key)
+        from .nh_snap import (_SnapPointNamePattern, _get_snap_target_object, _snap_target_memory_scope_key,
+                              _next_available_snap_naming, _snap_scene_memory_pairs)
         layout = self.layout
         ss = context.scene.cray_snap_settings
         preview_pattern = _SnapPointNamePattern.from_preview_settings(ss)
@@ -1071,20 +1072,24 @@ class CRAY_PT_SnapPointsPanel(Panel):
         col = layout.column(align=True)
         col.label(text="Name Pattern")
         col.prop(ss, "snap_p3d_name")
-        col.label(text="ID: automatic from Memory vertex groups", icon="SORTTIME")
-        col.label(text="A/V targets stay exactly as selected")
         col.label(text="0/1 Sort Axis")
         axis_row = col.row(align=True)
-        axis_row.prop(ss, "edge_axis", expand=True)
-        col.prop(ss, "snap_include_axis")
+        for axis in ("X", "Y", "Z"):
+            button = axis_row.operator(
+                "cray.toggle_snap_name_axis", text=axis,
+                depress=bool(ss.snap_include_axis and ss.edge_axis == axis),
+            )
+            button.axis = axis
         col.prop(ss, "snap_target_vertex_tolerance")
-        preview_axis = preview_pattern.axis_token.lower() if preview_pattern.include_axis else ""
         preview_box = col.box()
-        preview_box.label(text="Selection name preview", icon="INFO")
-        preview_box.label(text=f"Base: .sp_{preview_pattern.p3d_name}")
-        preview_box.label(text=f"ID: first free ## from .sp_ groups{preview_axis}")
-        preview_box.label(text="A points: _A_0  /  _A_1")
-        preview_box.label(text="V points: _V_0  /  _V_1")
+        try:
+            preview_pattern = _next_available_snap_naming(preview_pattern, _snap_scene_memory_pairs(context))
+        except RuntimeError:
+            preview_box.label(text="No free snap ID", icon="ERROR")
+        else:
+            for side in ("a", "v"):
+                for name in preview_pattern.build_pair_names(side):
+                    preview_box.label(text=name)
         col.prop(ss, "replace_existing")
 
         layout.separator()

@@ -320,7 +320,7 @@ from .nh_base import (_on_snap_p3d_name_changed)
 class CRAY_PG_SnapSettings(PropertyGroup):
     source_object: PointerProperty(
         name="Resolution LOD (A)",
-        description="Resolution/source LOD for the first A target",
+        description="Resolution/source LOD for the first A target; A/V targets stay exactly as selected",
         type=bpy.types.Object,
     )
     memory_object: PointerProperty(
@@ -330,7 +330,7 @@ class CRAY_PG_SnapSettings(PropertyGroup):
     )
     paired_object: PointerProperty(
         name="Resolution LOD (V)",
-        description="Resolution/source LOD for the second V target",
+        description="Resolution/source LOD for the second V target; A/V targets stay exactly as selected",
         type=bpy.types.Object,
     )
     paired_memory_object: PointerProperty(
@@ -341,7 +341,7 @@ class CRAY_PG_SnapSettings(PropertyGroup):
     snap_group: StringProperty(name="Snap Group", default="SampleName")
     snap_p3d_name: StringProperty(
         name="P3D Name",
-        description="Only letters and digits are kept; spaces, underscores, .p3d and other symbols are removed automatically",
+        description="Name used in .sp_ groups; the first free ID is selected automatically from Memory vertex groups. Only letters and digits are kept; spaces, underscores, .p3d and other symbols are removed automatically",
         default="SampleName",
         update=_on_snap_p3d_name_changed,
     )
@@ -1971,6 +1971,7 @@ class CRAY_PG_UIPanelSettings(PropertyGroup):
     order_geometry_lods: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["geometry_lods"], min=1, update=_on_ui_panel_layout_setting_changed)
     order_asset_library: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["asset_library"], min=1, update=_on_ui_panel_layout_setting_changed)
     order_snap_points: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["snap_points"], min=1, update=_on_ui_panel_layout_setting_changed)
+    order_ladder_points: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["ladder_points"], min=1, update=_on_ui_panel_layout_setting_changed)
     order_import_export: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["import_export"], min=1, update=_on_ui_panel_layout_setting_changed)
     order_fixes: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["fixes"], min=1, update=_on_ui_panel_layout_setting_changed)
     order_model_split: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["model_split"], min=1, update=_on_ui_panel_layout_setting_changed)
@@ -1978,6 +1979,7 @@ class CRAY_PG_UIPanelSettings(PropertyGroup):
     order_cache_manager: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["cache_manager"], min=1, update=_on_ui_panel_layout_setting_changed)
     order_object_builder: IntProperty(name="Order", default=_UI_PANEL_DEFAULT_ORDER["object_builder"], min=1, update=_on_ui_panel_layout_setting_changed)
     show_snap_points: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
+    show_ladder_points: BoolProperty(name="Show", description="Show ladder Memory point tools", default=True, update=_on_ui_panel_layout_setting_changed)
     show_asset_library: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
     show_fixes: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)
     show_import_export: BoolProperty(name="Show", description="Показывать или скрывать это меню в панели NH Plugin", default=True, update=_on_ui_panel_layout_setting_changed)

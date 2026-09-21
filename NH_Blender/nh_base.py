@@ -290,6 +290,7 @@ _PERSISTED_UI_SETTINGS = {
         "order_geometry_lods",
         "order_asset_library",
         "order_snap_points",
+        "order_ladder_points",
         "order_import_export",
         "order_fixes",
         "order_model_split",
@@ -297,6 +298,7 @@ _PERSISTED_UI_SETTINGS = {
         "order_cache_manager",
         "order_object_builder",
         "show_snap_points",
+        "show_ladder_points",
         "show_asset_library",
         "show_fixes",
         "show_import_export",
@@ -948,6 +950,7 @@ _UI_PANEL_LAYOUT_DEFINITIONS = (
     ("geometry_lods", "Geometry LODs", "CRAY_PT_ColliderPanel"),
     ("asset_library", "P3D Asset Library", "CRAY_PT_AssetProxyPanel"),
     ("snap_points", "Snap Points (Memory LOD)", "CRAY_PT_SnapPointsPanel"),
+    ("ladder_points", "Ladder Points (Memory LOD)", "CRAY_PT_LadderPointsPanel"),
     ("import_export", "Import/Export planner", "CRAY_PT_ImportExportPlannerPanel"),
     ("fixes", "P3D Tools & Checks", "CRAY_PT_FixesPanel"),
     ("model_split", "Model Split / Merge", "CRAY_PT_ModelSplitPanel"),
@@ -957,8 +960,10 @@ _UI_PANEL_LAYOUT_DEFINITIONS = (
 )
 _UI_PANEL_DEFAULT_ORDER = {
     key: (idx + 1) * _UI_PANEL_LAYOUT_ORDER_STEP
-    for idx, (key, _label, _class_name) in enumerate(_UI_PANEL_LAYOUT_DEFINITIONS)
+    for idx, (key, _label, _class_name) in enumerate(
+        definition for definition in _UI_PANEL_LAYOUT_DEFINITIONS if definition[0] != "ladder_points")
 }
+_UI_PANEL_DEFAULT_ORDER["ladder_points"] = _UI_PANEL_DEFAULT_ORDER["snap_points"] + 5
 _TEX_EXPORT_DDS_BACKEND_ITEMS = (
     ("BUILTIN_PYTHON", "Built-in Python", "Use dependency-free Python DDS converter"),
 )

@@ -3860,6 +3860,25 @@ def _set_p3d_visual_collection_visibility(context, *, visuals_only: bool):
     return len(roots), changed
 
 
+class CRAY_OT_ToggleSnapNameAxis(Operator):
+    bl_idname = "cray.toggle_snap_name_axis"
+    bl_label = "Toggle Snap Axis"
+    bl_description = "Select the 0/1 sort axis and include it in names (blue); click again to omit it from names (gray). The last axis is kept for 0/1 ordering"
+    bl_options = {"UNDO"}
+
+    axis: EnumProperty(
+        items=(("X", "X", "X axis"), ("Y", "Y", "Y axis"), ("Z", "Z", "Z axis")),
+        default="X",
+    )
+
+    def execute(self, context):
+        settings = context.scene.cray_snap_settings
+        include_axis = not (settings.snap_include_axis and settings.edge_axis == self.axis)
+        settings.edge_axis = self.axis
+        settings.snap_include_axis = include_axis
+        return {"FINISHED"}
+
+
 class CRAY_OT_SnapSetP3DVisualsOnly(Operator):
     bl_idname = "cray.snap_set_p3d_visuals_only"
     bl_label = "Visual 0 Only"
