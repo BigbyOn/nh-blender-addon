@@ -161,6 +161,11 @@ class CRAY_PG_IEPlannerSettings(PropertyGroup):
         subtype="DIR_PATH",
         description="Root folder where the addon searches for .p3d files by name",
     )
+    disable_drop_to_planner: BoolProperty(
+        name="Disable adding dropped files to planner",
+        default=False,
+        description="When enabled, dropped .p3d files are imported directly into Blender instead of being added to the Import/Export planner",
+    )
     import_show_materials: BoolProperty(
         name="Show material textures after import",
         default=True,
@@ -300,8 +305,36 @@ class CRAY_OT_P3DDropMenu(Operator):
     filepath: StringProperty(subtype="FILE_PATH", options={"SKIP_SAVE", "HIDDEN"})
 
     def invoke(self, context, event):
-        del event
-        return self.execute(context)
+        # Blender FileHandler may enter through invoke(). Handle the setting here
+        # as well as in execute(), so the popup is never opened when direct import
+        # is enabled.
+        from .nh_snap import _tag_redraw_all_areas
+        from .nh_textures import (_collect_p3d_filepaths_from_operator, _import_p3d_paths_now, _planner_add_import_file, _set_pending_p3d_drop_paths)
+
+        paths = _collect_p3d_filepaths_from_operator(
+            directory=getattr(self, "directory", ""),
+            files=getattr(self, "files", ()),
+            filepath=getattr(self, "filepath", ""),
+        )
+        if not paths:
+            self.report({"WARNING"}, "No .p3d files dropped")
+            return {"CANCELLED"}
+
+        st = getattr(context.scene, "cray_ie_settings", None)
+        if st is None:
+            self.report({"ERROR"}, "Import/Export planner settings are not available")
+            return {"CANCELLED"}
+
+        if bool(getattr(st, "disable_drop_to_planner", False)):
+            _set_pending_p3d_drop_paths([])
+            result = _import_p3d_paths_now(self, context, paths)
+            _tag_redraw_all_areas(context)
+            return result
+
+        # Normal mode: preserve the existing popup workflow.
+        _set_pending_p3d_drop_paths(paths)
+        bpy.ops.wm.call_menu(name=CRAY_MT_P3DDropMenu.bl_idname)
+        return {"FINISHED"}
 
     def execute(self, context):
         from .nh_snap import (_tag_redraw_all_areas)
@@ -319,6 +352,14 @@ class CRAY_OT_P3DDropMenu(Operator):
         if st is None:
             self.report({"ERROR"}, "Import/Export planner settings are not available")
             return {"CANCELLED"}
+
+        # When enabled, drag-and-drop bypasses the planner and imports P3D files directly.
+        if bool(getattr(st, "disable_drop_to_planner", False)):
+            from .nh_textures import _import_p3d_paths_now
+            _set_pending_p3d_drop_paths([])
+            result = _import_p3d_paths_now(self, context, paths)
+            _tag_redraw_all_areas(context)
+            return result
 
         added = 0
         skipped = 0
@@ -342,6 +383,11 @@ class CRAY_OT_P3DDropMenu(Operator):
 class CRAY_MT_P3DDropMenu(Menu):
     bl_idname = "CRAY_MT_p3d_drop_menu"
     bl_label = "P3D Drop"
+
+    @classmethod
+    def poll(cls, context):
+        st = getattr(getattr(context, "scene", None), "cray_ie_settings", None)
+        return not bool(getattr(st, "disable_drop_to_planner", False))
 
     def draw(self, context):
         from .nh_textures import (_pending_p3d_drop_label)
