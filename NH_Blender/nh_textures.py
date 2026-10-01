@@ -3644,6 +3644,11 @@ def _load_material_preview_image(
     return image, has_alpha, resolved_path, "paa_runtime", cache_path
 
 def _setup_import_preview_nodes(material: bpy.types.Material, image, texture_label: str, has_alpha: bool):
+    from .nh_material_shader import build as build_super
+    _, rvmat_path = _get_p3d_material_paths(material)
+    if rvmat_path and build_super(material, rvmat_path, texture_label, base_image=image, has_alpha=has_alpha):
+        return True
+
     if material is None or image is None:
         return False
 
@@ -3811,6 +3816,11 @@ def _postprocess_imported_material_previews(
                         result["errors"].append(f"{mat.name}: pack preview image: {_fmt_exc(e)}")
         except Exception as e:
             result["errors"].append(f"{mat.name}: {_fmt_exc(e)}")
+
+    from .nh_material_shader import prepare_uvs
+    for obj in imported_objs:
+        if any(mat and mat.get("nh_super_rvmat") for mat in getattr(obj.data, "materials", ())):
+            prepare_uvs(obj)
 
     if result["previewed"] > 0:
         result["viewports_material_preview"] = _enable_material_preview_in_viewports(context)
@@ -4238,64 +4248,6 @@ class CRAY_OT_TexSourceRootRemove(Operator):
             pass
         _save_texreplace_settings_now(context)
         self.report({"INFO"}, "Removed texture source root")
-        return {"FINISHED"}
-
-class CRAY_OT_UpdateObjectPreview(Operator):
-    bl_idname = "cray.update_object_preview"
-    bl_label = "Restore Material Preview"
-    bl_description = (
-        "Rebuild texture preview nodes for the selected P3D model and switch the current 3D view to Material Preview"
-    )
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        from .nh_base import (_fmt_exc)
-        ts = context.scene.cray_texreplace_settings
-        obj, src = _resolve_tex_target_object(context, ts.picked_object)
-        if obj is None:
-            ts.obj_preview_items.clear()
-            self.report({"ERROR"}, "No mesh object found (pick one or select one)")
-            return {"CANCELLED"}
-        ts.picked_object = obj
-
-        root_collection = _find_p3d_root_collection_for_object(context, obj)
-        scope_objects = _collect_collection_objects_recursive(root_collection) if root_collection is not None else [obj]
-
-        try:
-            preview_stats = _postprocess_imported_material_previews(
-                context,
-                scope_objects,
-                show_materials=True,
-                keep_converted_textures=True,
-                pack_runtime_images=False,
-            )
-        except Exception as e:
-            self.report({"ERROR"}, f"Material preview failed: {_fmt_exc(e)}")
-            return {"CANCELLED"}
-
-        _log_import_preview_summary(getattr(root_collection, "name", obj.name), preview_stats)
-        image_materials = _collect_object_image_materials(obj, ts.obj_preview_items)
-        previewed = int(preview_stats.get("previewed", 0) or 0)
-        missing = int(preview_stats.get("missing", 0) or 0)
-        errors = len(preview_stats.get("errors", ()) or ())
-        viewports = int(preview_stats.get("viewports_material_preview", 0) or 0)
-
-        if previewed == 0 and image_materials > 0:
-            viewports = _enable_material_preview_in_viewports(context)
-
-        suffix = "" if src == "picked" else f" (auto: {src})"
-        if previewed > 0 or image_materials > 0:
-            self.report(
-                {"INFO"},
-                f"Material Preview restored: {max(previewed, image_materials)} material(s), {viewports} viewport(s){suffix}",
-            )
-        elif missing or errors:
-            self.report(
-                {"WARNING"},
-                f"No preview loaded: missing textures {missing}, errors {errors} (see System Console)",
-            )
-        else:
-            self.report({"WARNING"}, f"Object '{obj.name}' has no P3D texture paths")
         return {"FINISHED"}
 
 class CRAY_OT_FixMeshHierarchy(Operator):
