@@ -28,12 +28,8 @@ def _set_collider_settings_object(context, attr_name, obj):
     if cs is None or not hasattr(cs, attr_name):
         return
 
-    current = getattr(cs, attr_name, None)
     try:
-        if current == obj:
-            setattr(cs, attr_name, None)
-        else:
-            setattr(cs, attr_name, obj)
+        setattr(cs, attr_name, obj)
     except Exception:
         pass
 
@@ -98,6 +94,7 @@ def _force_edit_mesh_view_refresh_exp(context, obj):
 
 
 def _sync_material_selection(context, material_attr: str, items_fn, none_value: str, preferred_name=""):
+    from . import nh_scatter as _scatter_module
     from .nh_scatter import (_MATERIAL_ADD_NEW)
     from .nh_snap import (_tag_redraw_all_areas)
     global _COLLIDER_MATERIAL_SELECTION_SYNCING
@@ -124,7 +121,9 @@ def _sync_material_selection(context, material_attr: str, items_fn, none_value: 
     else:
         chosen = none_value
 
+    previous_syncing = bool(getattr(_scatter_module, "_COLLIDER_MATERIAL_SELECTION_SYNCING", False))
     _COLLIDER_MATERIAL_SELECTION_SYNCING = True
+    _scatter_module._COLLIDER_MATERIAL_SELECTION_SYNCING = True
     try:
         try:
             setattr(cs, material_attr, chosen)
@@ -132,6 +131,7 @@ def _sync_material_selection(context, material_attr: str, items_fn, none_value: 
             pass
     finally:
         _COLLIDER_MATERIAL_SELECTION_SYNCING = False
+        _scatter_module._COLLIDER_MATERIAL_SELECTION_SYNCING = previous_syncing
 
     _tag_redraw_all_areas(context)
 
@@ -156,6 +156,17 @@ def _sync_fire_geometry_material_selection(context, preferred_name=""):
         _FIRE_GEOMETRY_MATERIAL_NONE,
         preferred_name,
     )
+
+
+@persistent
+def _refresh_collider_material_selections_on_load(_dummy):
+    """Drop stale material names saved before a hash rename so Blender does not warn."""
+    try:
+        context = bpy.context
+        _sync_fire_geometry_material_selection(context)
+        _sync_roadway_material_selection(context)
+    except Exception:
+        pass
 
 
 def _get_selected_material_from_object(obj, selected_name: str, *, create_name: str = ""):
@@ -259,13 +270,14 @@ def _material_slot_indices_for_material(obj, material):
     return indices
 
 
-def _select_material_faces_in_objects(context, objects, material):
+def _select_materials_faces_in_objects(context, objects, materials):
     from .nh_snap import (_deselect_all_in_view_layer, _ensure_object_selectable_in_view_layer, _select_object_in_view_layer, _tag_redraw_all_areas)
+    materials = [mat for mat in (materials or []) if mat is not None]
     objects = [
         obj for obj in objects or []
         if obj is not None and getattr(obj, "type", None) == "MESH" and getattr(obj, "data", None) is not None
     ]
-    if not objects or material is None:
+    if not objects or not materials:
         return {"objects": 0, "faces": 0}
 
     objects = [
@@ -283,7 +295,9 @@ def _select_material_faces_in_objects(context, objects, material):
     selected_faces = 0
     slot_indices_by_object = {}
     for obj in objects:
-        slot_indices = _material_slot_indices_for_material(obj, material)
+        slot_indices = set()
+        for material in materials:
+            slot_indices.update(_material_slot_indices_for_material(obj, material))
         if not slot_indices:
             continue
         object_selected_faces = 0
@@ -339,6 +353,77 @@ def _select_material_faces_in_objects(context, objects, material):
                 pass
     _tag_redraw_all_areas(context)
     return {"objects": len(selected_objects), "faces": selected_faces}
+
+
+def _select_material_faces_in_objects(context, objects, material):
+    return _select_materials_faces_in_objects(
+        context,
+        objects,
+        [material] if material is not None else [],
+    )
+
+
+_MATERIAL_FACE_AUTO_SELECT_PENDING = set()
+
+
+def _select_faces_for_current_collider_material(context, *, target_attr: str = "FIRE"):
+    from .nh_scatter import (_collider_material_selection_objects, _resolve_fire_geometry_object_for_material)
+    if context is None:
+        return
+
+    cs = getattr(getattr(context, "scene", None), "cray_collider_settings", None)
+    if cs is None:
+        return
+
+    if str(target_attr or "FIRE").upper() == "ROADWAY":
+        target_obj = getattr(cs, "roadway_object", None)
+        material = _get_selected_roadway_material(context)
+        object_attr = "roadway_object"
+    else:
+        target_obj = _resolve_fire_geometry_object_for_material(context)
+        material = _get_selected_fire_geometry_material(context)
+        object_attr = "fire_geometry_object"
+
+    if target_obj is None or getattr(target_obj, "type", None) != "MESH":
+        return
+    if material is None:
+        return
+
+    objects = _collider_material_selection_objects(context, object_attr, target_obj)
+    if not objects:
+        return
+    try:
+        _select_material_faces_in_objects(context, objects, material)
+    except Exception:
+        pass
+
+
+def _run_pending_collider_material_face_selection():
+    for key in list(_MATERIAL_FACE_AUTO_SELECT_PENDING):
+        _MATERIAL_FACE_AUTO_SELECT_PENDING.discard(key)
+        try:
+            _select_faces_for_current_collider_material(bpy.context, target_attr=key)
+        except Exception:
+            pass
+    return None
+
+
+def _auto_select_collider_material_faces(context, *, target_attr: str = "FIRE"):
+    """Select the faces using the material currently chosen in the collider dropdown.
+
+    Used by the material enum update callbacks so picking a material immediately
+    selects the matching meshes, mirroring the FACESEL button. Deferred to a timer
+    so the selection runs after the dropdown popup finishes its event.
+    """
+    key = str(target_attr or "FIRE").upper()
+    if key in _MATERIAL_FACE_AUTO_SELECT_PENDING:
+        return
+    _MATERIAL_FACE_AUTO_SELECT_PENDING.add(key)
+    try:
+        bpy.app.timers.register(_run_pending_collider_material_face_selection, first_interval=0.0)
+    except Exception:
+        _MATERIAL_FACE_AUTO_SELECT_PENDING.discard(key)
+        _select_faces_for_current_collider_material(context, target_attr=key)
 
 
 def _apply_collider_visual_style(target_obj):
@@ -2823,7 +2908,7 @@ class CRAY_OT_OpenRoadwayMaterialFolder(Operator):
     def execute(self, context):
         from .nh_base import (_fmt_exc)
         from .nh_collider_exp import (_basename_no_ext, _norm_path)
-        from .nh_textures import (_set_p3d_material_paths)
+        from .nh_textures import (_material_hash_snapshot, _prefer_ext_texture_path, _record_material_hash_mapping, _set_p3d_material_paths)
         mat = _get_selected_roadway_material(context)
         if mat is None:
             self.report({"ERROR"}, "Roadway material not found on the selected Roadway object")
@@ -2838,6 +2923,9 @@ class CRAY_OT_OpenRoadwayMaterialFolder(Operator):
         if not filepath or not os.path.isfile(filepath):
             self.report({"ERROR"}, "Choose an existing .paa or .dds texture file")
             return {"CANCELLED"}
+
+        filepath = _prefer_ext_texture_path(filepath)
+        old_snapshot = _material_hash_snapshot(mat)
 
         ext = os.path.splitext(filepath)[1].lower()
         try:
@@ -2858,6 +2946,11 @@ class CRAY_OT_OpenRoadwayMaterialFolder(Operator):
                 pass
 
         _sync_roadway_material_selection(context, mat.name)
+        try:
+            _record_material_hash_mapping("roadway", old_snapshot, _material_hash_snapshot(mat))
+        except Exception:
+            pass
+        _auto_select_collider_material_faces(context, target_attr="ROADWAY")
         self.report({"INFO"}, f"Assigned texture to Roadway material: {mat.name}")
         return {"FINISHED"}
 
@@ -2901,7 +2994,7 @@ class CRAY_OT_OpenFireGeometryRvmatFolder(Operator):
         from .nh_base import (_fmt_exc)
         from .nh_collider_exp import (_basename_no_ext, _norm_path)
         from .nh_scatter import (_resolve_fire_geometry_object_for_material)
-        from .nh_textures import (_set_p3d_material_paths)
+        from .nh_textures import (_material_hash_snapshot, _record_material_hash_mapping, _set_p3d_material_paths)
         fire_obj = _resolve_fire_geometry_object_for_material(context)
         if fire_obj is None or getattr(fire_obj, "type", None) != "MESH":
             self.report({"ERROR"}, "Fire Geometry Object must be a mesh")
@@ -2919,6 +3012,9 @@ class CRAY_OT_OpenFireGeometryRvmatFolder(Operator):
         if os.path.splitext(filepath)[1].lower() != ".rvmat":
             self.report({"ERROR"}, "Unsupported file type. Choose .rvmat")
             return {"CANCELLED"}
+
+        current_mat = _get_selected_fire_geometry_material(context)
+        old_snapshot = _material_hash_snapshot(current_mat) if current_mat is not None else None
 
         material_name = _basename_no_ext(filepath) or "FireGeometryMaterial"
         mat = _get_selected_fire_geometry_material(context, create_name=material_name)
@@ -2938,6 +3034,12 @@ class CRAY_OT_OpenFireGeometryRvmatFolder(Operator):
             pass
 
         _sync_fire_geometry_material_selection(context, mat.name)
+        if old_snapshot:
+            try:
+                _record_material_hash_mapping("fire", old_snapshot, _material_hash_snapshot(mat))
+            except Exception:
+                pass
+        _auto_select_collider_material_faces(context, target_attr="FIRE")
         self.report({"INFO"}, f"Assigned Fire Geometry .rvmat: {mat.name}")
         return {"FINISHED"}
 
@@ -2996,6 +3098,353 @@ class CRAY_OT_SelectColliderMaterialFaces(Operator):
             {"INFO"},
             f"Selected {stats['faces']} face(s) using '{material.name}' on {stats['objects']} object(s)",
         )
+        return {"FINISHED"}
+
+
+def _collider_material_scope_objects(context, channel):
+    from .nh_scatter import (_collider_material_selection_objects, _poll_fire_geometry_object, _poll_roadway_object, _resolve_fire_geometry_object_for_material)
+    cs = getattr(getattr(context, "scene", None), "cray_collider_settings", None)
+    if channel == "roadway":
+        target_obj = getattr(cs, "roadway_object", None) if cs is not None else None
+        predicate = _poll_roadway_object
+        object_attr = "roadway_object"
+    else:
+        target_obj = _resolve_fire_geometry_object_for_material(context)
+        predicate = _poll_fire_geometry_object
+        object_attr = "fire_geometry_object"
+    if target_obj is None or getattr(target_obj, "type", None) != "MESH":
+        return None, []
+    objects = [
+        obj for obj in _collider_material_selection_objects(context, object_attr, target_obj)
+        if obj is not None and getattr(obj, "type", None) == "MESH" and predicate(None, obj)
+    ]
+    if target_obj not in objects:
+        objects.append(target_obj)
+    return target_obj, objects
+
+
+class CRAY_OT_ResetColliderMaterialSelection(Operator):
+    """Clear the automatic material face selection"""
+
+    bl_idname = "cray.reset_collider_material_selection"
+    bl_label = "Reset Selection"
+    bl_description = "Clear the automatic face selection made for the current collider material"
+    bl_options = {"REGISTER", "UNDO"}
+
+    target_attr: EnumProperty(
+        name="Target",
+        items=(
+            ("FIRE", "Fire Geometry", "Clear the Fire Geometry material selection"),
+            ("ROADWAY", "Roadway", "Clear the Roadway material selection"),
+        ),
+        default="FIRE",
+    )
+
+    def execute(self, context):
+        from .nh_snap import (_tag_redraw_all_areas)
+        channel = "roadway" if str(getattr(self, "target_attr", "FIRE")).upper() == "ROADWAY" else "fire"
+        target_obj, objects = _collider_material_scope_objects(context, channel)
+        if target_obj is None:
+            self.report({"ERROR"}, "Target LOD object must be a mesh")
+            return {"CANCELLED"}
+
+        cleared = 0
+        for obj in objects:
+            try:
+                if obj.mode == "EDIT":
+                    bm = bmesh.from_edit_mesh(obj.data)
+                    bm.faces.ensure_lookup_table()
+                    for vert in bm.verts:
+                        vert.select_set(False)
+                    for edge in bm.edges:
+                        edge.select_set(False)
+                    for face in bm.faces:
+                        face.select_set(False)
+                    bm.select_flush_mode()
+                    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+                    cleared += 1
+                else:
+                    for poly in getattr(obj.data, "polygons", []) or []:
+                        poly.select = False
+                    try:
+                        obj.data.update()
+                    except Exception:
+                        pass
+                    cleared += 1
+            except Exception:
+                continue
+        _tag_redraw_all_areas(context)
+        if cleared <= 0:
+            self.report({"WARNING"}, "Nothing to reset on the current collider selection")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Cleared material selection on {cleared} mesh object(s)")
+        return {"FINISHED"}
+
+
+class CRAY_OT_ApplySavedMaterialHash(Operator):
+    """Apply every saved material replacement to the current LOD"""
+
+    bl_idname = "cray.apply_saved_material_hash"
+    bl_label = "Apply Saved Materials"
+    bl_description = (
+        "Apply all previously saved texture/material replacements to the current LOD "
+        "and select the updated faces"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    channel: EnumProperty(
+        name="Channel",
+        items=(
+            ("FIRE", "Fire Geometry", "Apply the saved Fire Geometry .rvmat replacements"),
+            ("ROADWAY", "Roadway", "Apply the saved Roadway texture replacements"),
+        ),
+        default="FIRE",
+    )
+
+    def execute(self, context):
+        from .nh_base import (_fmt_exc)
+        from .nh_textures import (apply_saved_material_hash, material_hash_counts)
+        channel = "roadway" if str(getattr(self, "channel", "FIRE")).upper() == "ROADWAY" else "fire"
+        label = "Roadway" if channel == "roadway" else "Fire Geometry"
+
+        counts = material_hash_counts()
+        if int(counts.get(channel, 0) or 0) <= 0:
+            self.report({"WARNING"}, f"No saved {label} material replacements yet")
+            return {"CANCELLED"}
+
+        target_obj, objects = _collider_material_scope_objects(context, channel)
+        if target_obj is None:
+            self.report({"ERROR"}, f"{label} object must be a mesh")
+            return {"CANCELLED"}
+
+        try:
+            stats = apply_saved_material_hash(channel, objects)
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        if channel == "roadway":
+            _sync_roadway_material_selection(context)
+        else:
+            _sync_fire_geometry_material_selection(context)
+
+        changed = list(stats.get("changed_materials") or [])
+        if changed:
+            try:
+                _select_materials_faces_in_objects(context, objects, changed)
+            except Exception:
+                pass
+
+        self.report(
+            {"INFO"},
+            f"{label}: applied {stats['applied']} replacement(s), {stats['skipped']} already up to date",
+        )
+        return {"FINISHED"}
+
+
+class CRAY_OT_SwitchRoadwayExtInt(Operator):
+    """Switch selected Roadway faces between _ext and _int materials"""
+
+    bl_idname = "cray.switch_roadway_ext_int"
+    bl_label = "Switch Roadway Ext/Int"
+    bl_description = "Change the material of the selected Roadway faces between its _ext and _int variants"
+    bl_options = {"REGISTER", "UNDO"}
+
+    direction: EnumProperty(
+        name="Direction",
+        items=(
+            ("TO_INT", "Ext > Int", "Switch selected faces from _ext to _int textures"),
+            ("TO_EXT", "Int > Ext", "Switch selected faces from _int to _ext textures"),
+        ),
+        default="TO_INT",
+    )
+
+    def execute(self, context):
+        from .nh_base import (_fmt_exc)
+        from .nh_textures import (resolve_ext_int_material)
+        direction = str(getattr(self, "direction", "TO_INT") or "TO_INT").upper()
+        cs = getattr(getattr(context, "scene", None), "cray_collider_settings", None)
+        target_obj = getattr(cs, "roadway_object", None) if cs is not None else None
+        if target_obj is None or getattr(target_obj, "type", None) != "MESH":
+            self.report({"ERROR"}, "Roadway Object must be a mesh")
+            return {"CANCELLED"}
+        if (
+            context.mode != "EDIT_MESH"
+            or target_obj.mode != "EDIT"
+            or context.view_layer.objects.active != target_obj
+        ):
+            self.report({"ERROR"}, "Select Roadway faces in Edit Mode")
+            return {"CANCELLED"}
+
+        try:
+            bm = bmesh.from_edit_mesh(target_obj.data)
+            bm.faces.ensure_lookup_table()
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+
+        selected_faces = [face for face in bm.faces if face.is_valid and face.select]
+        if not selected_faces:
+            self.report({"ERROR"}, "Select at least one Roadway face")
+            return {"CANCELLED"}
+
+        index_map = {}
+        created_materials = 0
+        for src_idx in sorted({int(face.material_index) for face in selected_faces}):
+            materials = target_obj.data.materials
+            if src_idx < 0 or src_idx >= len(materials):
+                continue
+            src_mat = materials[src_idx]
+            if src_mat is None:
+                continue
+            try:
+                tgt_mat = resolve_ext_int_material(src_mat, direction)
+            except Exception:
+                tgt_mat = None
+            if tgt_mat is None:
+                continue
+            slot_idx = None
+            for existing_idx, existing_mat in enumerate(target_obj.data.materials):
+                if existing_mat == tgt_mat:
+                    slot_idx = existing_idx
+                    break
+            if slot_idx is None:
+                target_obj.data.materials.append(tgt_mat)
+                slot_idx = len(target_obj.data.materials) - 1
+                created_materials += 1
+            index_map[src_idx] = slot_idx
+
+        switched = 0
+        for face in selected_faces:
+            new_idx = index_map.get(int(face.material_index))
+            if new_idx is None:
+                continue
+            face.material_index = new_idx
+            switched += 1
+
+        if switched <= 0:
+            self.report({"WARNING"}, "No _ext/_int Roadway materials found in the selection")
+            return {"CANCELLED"}
+
+        try:
+            bmesh.update_edit_mesh(target_obj.data, loop_triangles=False, destructive=False)
+        except Exception:
+            pass
+
+        direction_label = "ext > int" if direction == "TO_INT" else "int > ext"
+        self.report(
+            {"INFO"},
+            f"Switched {switched} Roadway face(s) ({direction_label}), new materials: {created_materials}",
+        )
+        return {"FINISHED"}
+
+
+class CRAY_OT_ExportMaterialHash(Operator):
+    """Export the saved material replacement hash to a JSON file"""
+
+    bl_idname = "cray.export_material_hash"
+    bl_label = "Export Material Hash"
+    bl_options = {"REGISTER"}
+
+    filepath: StringProperty(
+        name="Hash File",
+        description="JSON file that receives the saved material replacements",
+        subtype="FILE_PATH",
+    )
+    filter_glob: StringProperty(default="*.json", options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        from .nh_textures import (_nh_blender_shared_cache_base)
+        del event
+        default_dir = _nh_blender_shared_cache_base(create=True)
+        self.filepath = os.path.join(default_dir, "nh_material_hash.json")
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        from .nh_base import (_fmt_exc)
+        from .nh_textures import (export_material_hash)
+        try:
+            filepath = os.path.abspath(bpy.path.abspath(self.filepath or ""))
+        except Exception as e:
+            self.report({"ERROR"}, f"Could not resolve export path: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+        if not filepath:
+            self.report({"ERROR"}, "Choose an export file")
+            return {"CANCELLED"}
+        if not filepath.lower().endswith(".json"):
+            filepath += ".json"
+        try:
+            counts = export_material_hash(filepath)
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+        self.report(
+            {"INFO"},
+            f"Hash exported (roadway {counts.get('roadway', 0)}, fire {counts.get('fire', 0)}): {filepath}",
+        )
+        return {"FINISHED"}
+
+
+class CRAY_OT_ImportMaterialHash(Operator):
+    """Import a material replacement hash from a JSON file and merge it into the saved hash"""
+
+    bl_idname = "cray.import_material_hash"
+    bl_label = "Import Material Hash"
+    bl_options = {"REGISTER"}
+
+    filepath: StringProperty(
+        name="Hash File",
+        description="JSON file with saved material replacements",
+        subtype="FILE_PATH",
+    )
+    filter_glob: StringProperty(default="*.json", options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        from .nh_textures import (_nh_blender_shared_cache_base)
+        del event
+        default_dir = _nh_blender_shared_cache_base(create=True)
+        self.filepath = os.path.join(default_dir, "")
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        from .nh_base import (_fmt_exc)
+        from .nh_textures import (import_material_hash)
+        try:
+            filepath = os.path.abspath(bpy.path.abspath(self.filepath or ""))
+        except Exception as e:
+            self.report({"ERROR"}, f"Could not resolve hash file: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+        if not filepath or not os.path.isfile(filepath):
+            self.report({"ERROR"}, "Choose an existing hash .json file")
+            return {"CANCELLED"}
+        try:
+            imported, counts = import_material_hash(filepath)
+        except Exception as e:
+            self.report({"ERROR"}, _fmt_exc(e))
+            return {"CANCELLED"}
+        self.report(
+            {"INFO"},
+            f"Imported {imported} replacement(s); total roadway {counts.get('roadway', 0)}, fire {counts.get('fire', 0)}",
+        )
+        return {"FINISHED"}
+
+
+class CRAY_OT_ResetMaterialHash(Operator):
+    """Delete all saved material replacements"""
+
+    bl_idname = "cray.reset_material_hash"
+    bl_label = "Reset Material Hash"
+    bl_options = {"REGISTER"}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        from .nh_textures import (reset_material_hash)
+        reset_material_hash()
+        self.report({"INFO"}, "Material replacement hash reset")
         return {"FINISHED"}
 
 
@@ -3165,6 +3614,407 @@ class CRAY_OT_ReportNgonMeshes(Operator):
             {"WARNING"},
             f"Found {total_ngons} n-gon face(s) in {len(records)} mesh object(s); first: {first_path} has n-gons (see System Console)",
         )
+        return {"FINISHED"}
+
+
+def _triangulate_all_ngons_in_mesh_data(mesh):
+    from .nh_base import (_fmt_exc)
+    if mesh is None:
+        raise RuntimeError("Mesh data is not available")
+
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh)
+        ngons = _ngon_faces_from_bmesh(bm)
+        if not ngons:
+            return 0, 0
+
+        try:
+            result = bmesh.ops.triangulate(
+                bm,
+                faces=ngons,
+                quad_method="BEAUTY",
+                ngon_method="BEAUTY",
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to triangulate n-gons: {_fmt_exc(e)}") from e
+
+        created_faces = [face for face in (result.get("faces") or []) if face.is_valid]
+        created_count = len(created_faces)
+        ngon_count = len(ngons)
+        bm.normal_update()
+        bm.to_mesh(mesh)
+    finally:
+        bm.free()
+
+    mesh.update()
+    return ngon_count, created_count
+
+
+def _report_ngon_autofix_in_console(context, fixed_records, skipped_records, ngon_total, triangle_total):
+    scene = getattr(context, "scene", None)
+    scene_name = getattr(scene, "name", "<unknown>")
+
+    print("")
+    print("=== N-gon Auto-Fix ===")
+    print(f"Scene: {scene_name}")
+
+    fixed_meshes = sum(1 for rec in fixed_records if not rec.get("shared_with"))
+    print(
+        f"Triangulated {ngon_total} n-gon face(s) in {fixed_meshes} mesh object(s); "
+        f"created {triangle_total} triangle(s)."
+    )
+
+    for rec in fixed_records:
+        display_path = rec.get("display_path") or rec.get("object_name", "<unknown>")
+        object_name = rec.get("object_name", "<unknown>")
+        if rec.get("shared_with"):
+            print(f" - {display_path} | object: {object_name} | shares fixed mesh data with: {rec['shared_with']}")
+            continue
+        remaining = int(rec.get("remaining_ngons", 0) or 0)
+        remaining_note = f" | remaining n-gons: {remaining}" if remaining else ""
+        print(
+            f" - {display_path} | object: {object_name} | "
+            f"n-gons: {int(rec.get('ngon_count', 0) or 0)} | "
+            f"triangle(s): {int(rec.get('triangles', 0) or 0)}{remaining_note}"
+        )
+
+    if skipped_records:
+        print(f"Skipped {len(skipped_records)} mesh object(s):")
+        for rec in skipped_records:
+            display_path = rec.get("display_path") or rec.get("object_name", "<unknown>")
+            print(
+                f" - {display_path} | object: {rec.get('object_name', '<unknown>')} | "
+                f"reason: {rec.get('reason') or 'unknown'}"
+            )
+
+
+class CRAY_OT_AutofixNgonMeshes(Operator):
+    """Scan scene meshes and triangulate all n-gons automatically"""
+
+    bl_idname = "cray.autofix_ngon_meshes"
+    bl_label = "Auto-Fix N-gons"
+    bl_description = (
+        "Scan all scene mesh objects for n-gons (same check as Report Meshes With N-gons) "
+        "and triangulate them in one click; works without entering Edit Mode on each mesh"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from .nh_base import (_fmt_exc)
+        from .nh_snap import (_collect_scene_ngon_mesh_records, _tag_redraw_all_areas)
+
+        if context.mode != "OBJECT":
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception as e:
+                self.report({"ERROR"}, f"Switch to Object Mode failed: {_fmt_exc(e)}")
+                return {"CANCELLED"}
+
+        try:
+            records = _collect_scene_ngon_mesh_records(context)
+        except Exception as e:
+            self.report({"ERROR"}, f"N-gon scan failed: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+
+        if not records:
+            print("")
+            print("=== N-gon Auto-Fix ===")
+            print("Scene: " + str(getattr(getattr(context, "scene", None), "name", "<unknown>")))
+            print("No n-gons found in scene mesh objects.")
+            self.report({"INFO"}, "No n-gons found in scene mesh objects")
+            return {"FINISHED"}
+
+        fixed_records = []
+        skipped_records = []
+        mesh_state = {}
+        ngon_total = 0
+        triangle_total = 0
+
+        for rec in records:
+            obj = bpy.data.objects.get(rec.get("object_name", ""))
+            if obj is None or obj.type != "MESH" or obj.data is None:
+                skipped_records.append({**rec, "reason": "object is not available"})
+                continue
+
+            mesh = obj.data
+            try:
+                mesh_ptr = mesh.as_pointer()
+            except Exception:
+                mesh_ptr = id(mesh)
+
+            state = mesh_state.get(mesh_ptr)
+            if state is not None:
+                if state["ok"]:
+                    fixed_records.append({**rec, "shared_with": state["object"].name})
+                else:
+                    skipped_records.append(
+                        {**rec, "reason": f"shares mesh data with skipped object: {state['object'].name}"}
+                    )
+                continue
+
+            if getattr(mesh, "library", None) is not None:
+                mesh_state[mesh_ptr] = {"object": obj, "ok": False}
+                skipped_records.append({**rec, "reason": "mesh data is linked from a library"})
+                continue
+
+            try:
+                ngon_count, triangle_count = _triangulate_all_ngons_in_mesh_data(mesh)
+            except Exception as e:
+                mesh_state[mesh_ptr] = {"object": obj, "ok": False}
+                skipped_records.append({**rec, "reason": _fmt_exc(e)})
+                continue
+
+            remaining_ngons = sum(1 for poly in mesh.polygons if len(poly.vertices) > 4)
+            mesh_state[mesh_ptr] = {"object": obj, "ok": True}
+            ngon_total += ngon_count
+            triangle_total += triangle_count
+            fixed_records.append(
+                {
+                    **rec,
+                    "ngon_count": ngon_count,
+                    "triangles": triangle_count,
+                    "remaining_ngons": remaining_ngons,
+                }
+            )
+
+        _report_ngon_autofix_in_console(context, fixed_records, skipped_records, ngon_total, triangle_total)
+
+        try:
+            context.view_layer.update()
+        except Exception:
+            pass
+        _tag_redraw_all_areas(context)
+
+        fixed_meshes = sum(1 for rec in fixed_records if not rec.get("shared_with"))
+        if skipped_records:
+            self.report(
+                {"WARNING"},
+                f"Triangulated {ngon_total} n-gon face(s) in {fixed_meshes} mesh object(s); "
+                f"{len(skipped_records)} object(s) skipped (see System Console)",
+            )
+        else:
+            self.report(
+                {"INFO"},
+                f"Triangulated {ngon_total} n-gon face(s) in {fixed_meshes} mesh object(s)",
+            )
+        return {"FINISHED"}
+
+
+def _collect_resolution_loose_vertex_records(context):
+    from .nh_snap import (_is_p3d_lod_root_object, _is_p3d_resolution_lod_object, _iter_p3d_export_meshes_for_lod_root, _mesh_isolated_vertex_indices)
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        return []
+
+    records = []
+    seen_roots = set()
+    for obj in getattr(scene, "objects", []) or []:
+        if not _is_p3d_lod_root_object(obj) or not _is_p3d_resolution_lod_object(obj):
+            continue
+        try:
+            root_ptr = obj.as_pointer()
+        except Exception:
+            root_ptr = id(obj)
+        if root_ptr in seen_roots:
+            continue
+        seen_roots.add(root_ptr)
+
+        try:
+            lod_name = str(obj.a3ob_properties_object.get_name())
+        except Exception:
+            lod_name = obj.name
+
+        for mesh_obj in _iter_p3d_export_meshes_for_lod_root(obj):
+            isolated_indices = _mesh_isolated_vertex_indices(mesh_obj)
+            if not isolated_indices:
+                continue
+            records.append(
+                {
+                    "lod_object_name": obj.name,
+                    "lod_name": lod_name,
+                    "mesh_object_name": mesh_obj.name,
+                    "mesh_object": mesh_obj,
+                    "isolated_count": len(isolated_indices),
+                    "isolated_indices": isolated_indices,
+                }
+            )
+
+    records.sort(
+        key=lambda rec: (
+            rec["lod_object_name"].lower(),
+            rec["lod_name"],
+            rec["mesh_object_name"].lower(),
+        )
+    )
+    return records
+
+
+def _delete_isolated_vertices_in_mesh_data(mesh):
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh)
+        isolated_verts = [
+            vert for vert in bm.verts
+            if vert.is_valid and not vert.link_edges and not vert.link_faces
+        ]
+        if not isolated_verts:
+            return 0
+        deleted_count = len(isolated_verts)
+        bmesh.ops.delete(bm, geom=isolated_verts, context="VERTS")
+        bm.normal_update()
+        bm.to_mesh(mesh)
+    finally:
+        bm.free()
+
+    mesh.update()
+    return deleted_count
+
+
+def _report_resolution_loose_vert_autofix_in_console(context, fixed_records, skipped_records, deleted_total):
+    scene = getattr(context, "scene", None)
+    scene_name = getattr(scene, "name", "<unknown>")
+
+    print("")
+    print("=== Resolution Loose Vertices Auto-Fix ===")
+    print(f"Scene: {scene_name}")
+
+    fixed_meshes = sum(1 for rec in fixed_records if not rec.get("shared_with"))
+    print(f"Deleted {deleted_total} isolated vertex/vertices in {fixed_meshes} mesh object(s).")
+
+    for rec in fixed_records:
+        if rec.get("shared_with"):
+            print(
+                f" - LOD: {rec.get('lod_name', '')} | root: {rec.get('lod_object_name', '')} | "
+                f"mesh: {rec.get('mesh_object_name', '')} | shares fixed mesh data with: {rec['shared_with']}"
+            )
+            continue
+        remaining = int(rec.get("remaining_loose", 0) or 0)
+        remaining_note = f" | remaining loose vertices: {remaining}" if remaining else ""
+        print(
+            f" - LOD: {rec.get('lod_name', '')} | root: {rec.get('lod_object_name', '')} | "
+            f"mesh: {rec.get('mesh_object_name', '')} | deleted: {int(rec.get('deleted_count', 0) or 0)}"
+            f"{remaining_note}"
+        )
+
+    if skipped_records:
+        print(f"Skipped {len(skipped_records)} mesh object(s):")
+        for rec in skipped_records:
+            print(
+                f" - LOD: {rec.get('lod_name', '')} | root: {rec.get('lod_object_name', '')} | "
+                f"mesh: {rec.get('mesh_object_name', '')} | reason: {rec.get('reason') or 'unknown'}"
+            )
+
+
+class CRAY_OT_AutofixLooseVerticesResolution(Operator):
+    """Delete isolated vertices in visual Resolution LODs automatically"""
+
+    bl_idname = "cray.autofix_loose_vertices_resolution"
+    bl_label = "Auto-Fix Loose Verts (Resolution)"
+    bl_description = (
+        "Delete isolated vertices with no edges or faces (Edit Mode > Mesh > Clean Up > Delete Loose) "
+        "in visual Resolution LODs only; works without entering Edit Mode"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from .nh_base import (_fmt_exc)
+        from .nh_snap import (_mesh_isolated_vertex_indices, _tag_redraw_all_areas)
+
+        if context.mode != "OBJECT":
+            try:
+                bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception as e:
+                self.report({"ERROR"}, f"Switch to Object Mode failed: {_fmt_exc(e)}")
+                return {"CANCELLED"}
+
+        try:
+            records = _collect_resolution_loose_vertex_records(context)
+        except Exception as e:
+            self.report({"ERROR"}, f"Loose vertex scan failed: {_fmt_exc(e)}")
+            return {"CANCELLED"}
+
+        if not records:
+            scene_name = getattr(getattr(context, "scene", None), "name", "<unknown>")
+            print("")
+            print("=== Resolution Loose Vertices Auto-Fix ===")
+            print(f"Scene: {scene_name}")
+            print("No isolated vertices found in Resolution LODs.")
+            self.report({"INFO"}, "No isolated vertices found in Resolution LODs")
+            return {"FINISHED"}
+
+        fixed_records = []
+        skipped_records = []
+        mesh_state = {}
+        deleted_total = 0
+
+        for rec in records:
+            obj = rec.get("mesh_object")
+            if obj is None:
+                obj = bpy.data.objects.get(rec.get("mesh_object_name", ""))
+            if obj is None or obj.type != "MESH" or obj.data is None:
+                skipped_records.append({**rec, "reason": "object is not available"})
+                continue
+
+            mesh = obj.data
+            try:
+                mesh_ptr = mesh.as_pointer()
+            except Exception:
+                mesh_ptr = id(mesh)
+
+            state = mesh_state.get(mesh_ptr)
+            if state is not None:
+                if state["ok"]:
+                    fixed_records.append({**rec, "shared_with": state["object"].name})
+                else:
+                    skipped_records.append(
+                        {**rec, "reason": f"shares mesh data with skipped object: {state['object'].name}"}
+                    )
+                continue
+
+            if getattr(mesh, "library", None) is not None:
+                mesh_state[mesh_ptr] = {"object": obj, "ok": False}
+                skipped_records.append({**rec, "reason": "mesh data is linked from a library"})
+                continue
+
+            try:
+                deleted_count = _delete_isolated_vertices_in_mesh_data(mesh)
+            except Exception as e:
+                mesh_state[mesh_ptr] = {"object": obj, "ok": False}
+                skipped_records.append({**rec, "reason": _fmt_exc(e)})
+                continue
+
+            remaining_loose = len(_mesh_isolated_vertex_indices(obj))
+            mesh_state[mesh_ptr] = {"object": obj, "ok": True}
+            deleted_total += deleted_count
+            fixed_records.append(
+                {
+                    **rec,
+                    "deleted_count": deleted_count,
+                    "remaining_loose": remaining_loose,
+                }
+            )
+
+        _report_resolution_loose_vert_autofix_in_console(context, fixed_records, skipped_records, deleted_total)
+
+        try:
+            context.view_layer.update()
+        except Exception:
+            pass
+        _tag_redraw_all_areas(context)
+
+        fixed_meshes = sum(1 for rec in fixed_records if not rec.get("shared_with"))
+        if skipped_records:
+            self.report(
+                {"WARNING"},
+                f"Deleted {deleted_total} isolated vertex/vertices in {fixed_meshes} Resolution mesh object(s); "
+                f"{len(skipped_records)} object(s) skipped (see System Console)",
+            )
+        else:
+            self.report(
+                {"INFO"},
+                f"Deleted {deleted_total} isolated vertex/vertices in {fixed_meshes} Resolution mesh object(s)",
+            )
         return {"FINISHED"}
 
 

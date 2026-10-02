@@ -581,11 +581,13 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
 
     def execute(self, context):
         from .nh_base import (_fmt_exc)
-        from .nh_snap import (_call_export_with_optional_relaxed_validation, _collect_expected_lod_entries, _collect_export_loose_vertex_warnings, _collect_export_ngon_issues, _collect_resolution_lod_index_conflicts, _deselect_all_in_view_layer, _discard_pending_export_backup, _finalize_export_backup, _has_any_p3d_export_ops, _iter_p3d_root_collections, _read_exported_lod_entries, _report_export_backup_preserved_in_console, _report_export_backup_skipped_in_console, _report_export_backup_updated_in_console, _report_export_loose_vertex_warnings_in_console, _report_export_ngon_issues_in_console, _report_missing_lod_diagnostics_in_console, _report_missing_lods_in_console, _report_resolution_lod_index_conflicts_in_console, _restore_p3d_named_properties_after_export, _restore_collision_lod_materials_after_export, _stage_export_backup, _strip_p3d_named_properties_for_export, _strip_collision_lod_materials_for_export)
+        from .nh_snap import (_call_export_with_optional_relaxed_validation, _collect_expected_lod_entries, _collect_export_loose_vertex_warnings, _collect_export_ngon_issues, _collect_resolution_lod_index_conflicts, _deselect_all_in_view_layer, _discard_pending_export_backup, _finalize_export_backup, _has_any_p3d_export_ops, _iter_p3d_root_collections, _prepare_geometry_house_metadata_for_export, _read_exported_lod_entries, _report_export_backup_preserved_in_console, _report_export_backup_skipped_in_console, _report_export_backup_updated_in_console, _report_export_loose_vertex_warnings_in_console, _report_export_ngon_issues_in_console, _report_geometry_metadata_prepared_in_console, _report_missing_lod_diagnostics_in_console, _report_missing_lods_in_console, _report_resolution_lod_index_conflicts_in_console, _restore_p3d_named_properties_after_export, _restore_collision_lod_materials_after_export, _stage_export_backup, _strip_p3d_named_properties_for_export, _strip_collision_lod_materials_for_export)
         from .nh_textures import (_build_ie_import_basename_map, _collect_collection_objects_recursive, _collection_has_any_mesh, _ensure_collection_visible_in_view_layer, _export_filename_for_collection, _looks_like_p3d_collection_name, _looks_like_split_part_collection_name, _obj_depth, _repair_imported_p3d_lod_alignment, _resolve_collection_source_path, _set_object_world_matrix_stable)
         st = context.scene.cray_ie_settings
         tex_settings = context.scene.cray_texreplace_settings
         warn_loose_vertices = bool(getattr(tex_settings, "export_warn_loose_vertices", True))
+        geometry_house_metadata = bool(getattr(st, "export_geometry_house_metadata", False))
+        recalculate_components = bool(getattr(st, "export_recalculate_components", True))
         if not _has_any_p3d_export_ops():
             self.report({"ERROR"}, "NH internal P3D export backend is unavailable")
             return {"CANCELLED"}
@@ -790,9 +792,18 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
 
             material_restore = {}
             named_property_restore = {}
+            geometry_house_restore = []
+            geometry_metadata_records = []
             try:
                 material_restore = _strip_collision_lod_materials_for_export(selectable)
                 named_property_restore = _strip_p3d_named_properties_for_export(selectable)
+                if geometry_house_metadata:
+                    geometry_house_restore, geometry_metadata_records = _prepare_geometry_house_metadata_for_export(
+                        selectable,
+                        original_named_properties=named_property_restore,
+                    )
+                    if geometry_metadata_records:
+                        _report_geometry_metadata_prepared_in_console(col.name, geometry_metadata_records)
             except Exception as e:
                 if pending_backup_path:
                     try:
@@ -817,11 +828,13 @@ class CRAY_OT_IE_ExportCollectionsBatch(Operator):
                     validate_lods=False,
                     validate_lods_warning_errors=False,
                     generate_components=True,
+                    recalculate_components=recalculate_components,
                     renumber_components=True,
                     translate_selections=False,
                     force_lowercase=True,
                 )
             finally:
+                _restore_p3d_named_properties_after_export(geometry_house_restore)
                 _restore_p3d_named_properties_after_export(named_property_restore)
                 _restore_collision_lod_materials_after_export(material_restore)
                 for obj, desired_world in sorted(export_world_matrices, key=lambda item: _obj_depth(item[0])):

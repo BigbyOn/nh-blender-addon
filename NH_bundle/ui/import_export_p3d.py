@@ -321,6 +321,11 @@ class NH_OP_export_p3d(bpy.types.Operator, bpy_extras.io_utils.ExportHelper):
         description = "Generate Component## selections if none are already defined",
         default = True
     )
+    recalculate_components: bpy.props.BoolProperty(
+        name = "Recalculate Components",
+        description = "Regenerate Component## selections from the closed parts of the mesh, replacing existing ones",
+        default = False
+    )
 
     def draw(self, context):
         pass
@@ -427,6 +432,9 @@ class NH_PT_export_p3d_meshes(bpy.types.Panel):
         col.prop(operator, "preserve_normals")
         col.prop(operator, "sort_sections")
         col.prop(operator, "generate_components")
+        row_components = col.row()
+        row_components.enabled = operator.generate_components
+        row_components.prop(operator, "recalculate_components")
 
 
 class NH_PT_export_p3d_validate(bpy.types.Panel):

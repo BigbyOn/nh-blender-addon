@@ -75,6 +75,8 @@ class CRAY_PG_LadderSettings(PropertyGroup):
     box_margin: FloatProperty(name='Box Margin', default=.05, min=0, unit='LENGTH',
                              description='Padding around step meshes and ladder action/exit points in View Geometry')
     show_offsets: BoolProperty(name='Offsets', default=False)
+    show_manual: BoolProperty(name='Manual Step Selection', default=False,
+                              description='Show manual object/vertex capture fields when automatic Z sorting is not suitable')
 
 
 def _points(obj, indices='', context=None):
@@ -194,10 +196,49 @@ def _selected_parts(context):
     return parts
 
 
+class CRAY_OT_ToggleLadderExit(Operator):
+    bl_idname = 'cray.toggle_ladder_exit'
+    bl_label = 'Toggle Ladder Exit'
+    bl_description = 'Front disables side exits; Left and Right disable Front and can be enabled separately or together'
+    bl_options = {'UNDO'}
+
+    zone: EnumProperty(items=(('TOP', 'Top', ''), ('MIDDLE', 'Middle', '')), default='TOP')
+    side: EnumProperty(items=(('FRONT', 'Front', ''), ('LEFT', 'Left', ''), ('RIGHT', 'Right', '')),
+                       default='FRONT')
+
+    def execute(self, context):
+        settings = context.scene.cray_ladder_settings
+        property_name = 'top_exit' if self.zone == 'TOP' else 'middle_exit'
+        current = getattr(settings, property_name)
+
+        if self.side == 'FRONT':
+            if self.zone != 'TOP':
+                return {'CANCELLED'}
+            result = 'FRONT'
+        else:
+            left = current in {'LEFT', 'BOTH'}
+            right = current in {'RIGHT', 'BOTH'}
+            if current == 'FRONT':
+                left = right = False
+            if self.side == 'LEFT':
+                left = not left
+            else:
+                right = not right
+            # A ladder exit may not be empty. Clicking the only active side
+            # therefore keeps that side enabled.
+            if not left and not right:
+                left = self.side == 'LEFT'
+                right = self.side == 'RIGHT'
+            result = 'BOTH' if left and right else ('LEFT' if left else 'RIGHT')
+
+        setattr(settings, property_name, result)
+        return {'FINISHED'}
+
+
 class CRAY_OT_LadderCapture(Operator):
     bl_idname = 'cray.ladder_capture'
     bl_label = 'Use Selected Steps'
-    bl_description = 'Capture two selected step meshes, or two disconnected selected vertex sets in Edit Mode; assign the lower and upper automatically'
+    bl_description = 'Capture selected step meshes or disconnected selected vertex sets in Edit Mode and assign Bottom/Middle/Top automatically by world Z'
     bl_options = {'UNDO'}
     slot: EnumProperty(items=(('PAIR', 'Two Steps', ''), ('bottom', 'Bottom', ''),
                               ('top', 'Top', ''), ('middle', 'Middle', '')), default='PAIR')
@@ -213,10 +254,19 @@ class CRAY_OT_LadderCapture(Operator):
         try:
             if self.slot == 'PAIR':
                 parts = _selected_parts(context)
-                if len(parts) != 2:
-                    raise ValueError('Select exactly two step meshes or two disconnected vertex sets')
-                parts.sort(key=lambda part: _centre(_points(*part, context)).z)
-                assignments = list(zip(('bottom', 'top'), parts))
+                slots = ('bottom', 'middle', 'top') if settings.ladder_type == 'MIDDLE' else ('bottom', 'top')
+                if len(parts) != len(slots):
+                    raise ValueError(
+                        f'Select exactly {len(slots)} step meshes or {len(slots)} disconnected vertex sets'
+                    )
+                measured = sorted(
+                    ((_centre(_points(*part, context)).z, part) for part in parts),
+                    key=lambda item: item[0],
+                )
+                for (lower_z, _), (upper_z, _) in zip(measured, measured[1:]):
+                    if upper_z - lower_z <= 1e-4:
+                        raise ValueError('Selected steps must be on different world Z levels')
+                assignments = [(slot, part) for slot, (_z, part) in zip(slots, measured)]
             else:
                 obj = context.edit_object or context.active_object
                 if obj is None or obj.type != 'MESH':
@@ -513,15 +563,37 @@ class CRAY_PT_LadderPointsPanel(Panel):
         s = context.scene.cray_ladder_settings
         layout = self.layout
         layout.prop(s, 'ladder_type', expand=True)
-        layout.operator('cray.ladder_capture', text='Use Two Selected Steps', icon='RESTRICT_SELECT_OFF')
-        for slot in ('bottom', 'top'):
-            row = layout.row(align=True)
-            row.prop(s, slot)
-            row.operator('cray.ladder_capture', text='', icon='RESTRICT_SELECT_OFF').slot = slot
-        if s.ladder_type == 'MIDDLE':
-            row = layout.row(align=True)
-            row.prop(s, 'middle')
-            row.operator('cray.ladder_capture', text='', icon='RESTRICT_SELECT_OFF').slot = 'middle'
+        step_count = 3 if s.ladder_type == 'MIDDLE' else 2
+        layout.operator(
+            'cray.ladder_capture',
+            text=f'Capture {step_count} Selected Steps by Z',
+            icon='RESTRICT_SELECT_OFF',
+        )
+
+        slots = ('bottom', 'middle', 'top') if s.ladder_type == 'MIDDLE' else ('bottom', 'top')
+        summary = layout.box()
+        for slot in slots:
+            obj = getattr(s, slot)
+            indices = getattr(s, slot + '_vertices')
+            label = slot.title() + ': '
+            if obj is None:
+                label += 'not captured'
+            else:
+                label += obj.name
+                if indices:
+                    try:
+                        label += f' ({len(json.loads(indices))} selected verts)'
+                    except Exception:
+                        label += ' (captured selection)'
+            summary.label(text=label, icon='CHECKMARK' if obj is not None else 'ERROR')
+
+        layout.prop(s, 'show_manual', icon='TRIA_DOWN' if s.show_manual else 'TRIA_RIGHT', emboss=False)
+        if s.show_manual:
+            manual = layout.column(align=True)
+            for slot in slots:
+                row = manual.row(align=True)
+                row.prop(s, slot)
+                row.operator('cray.ladder_capture', text='', icon='RESTRICT_SELECT_OFF').slot = slot
         layout.prop(s, 'memory')
         layout.prop(s, 'view_geometry')
         row = layout.row(align=True)
@@ -532,13 +604,24 @@ class CRAY_PT_LadderPointsPanel(Panel):
         row.prop(s, 'flip_front', text='', icon='ARROW_LEFTRIGHT')
         layout.label(text='Top Exit')
         row = layout.row(align=True)
-        for token, label in (('FRONT', 'Front'), ('LEFT', 'Left'), ('RIGHT', 'Right'), ('BOTH', 'Both')):
-            row.prop_enum(s, 'top_exit', token, text=label)
+        for token, label in (('FRONT', 'Front'), ('LEFT', 'Left'), ('RIGHT', 'Right')):
+            active = (
+                s.top_exit == 'FRONT' if token == 'FRONT'
+                else s.top_exit in {token, 'BOTH'}
+            )
+            op = row.operator('cray.toggle_ladder_exit', text=label, depress=active)
+            op.zone = 'TOP'
+            op.side = token
         if s.ladder_type == 'MIDDLE':
             layout.label(text='Middle Exit')
             row = layout.row(align=True)
-            for token, label in (('LEFT', 'Left'), ('RIGHT', 'Right'), ('BOTH', 'Both')):
-                row.prop_enum(s, 'middle_exit', token, text=label)
+            for token, label in (('LEFT', 'Left'), ('RIGHT', 'Right')):
+                op = row.operator(
+                    'cray.toggle_ladder_exit', text=label,
+                    depress=s.middle_exit in {token, 'BOTH'},
+                )
+                op.zone = 'MIDDLE'
+                op.side = token
         layout.prop(s, 'show_offsets', icon='TRIA_DOWN' if s.show_offsets else 'TRIA_RIGHT', emboss=False)
         if s.show_offsets:
             col = layout.column(align=True)

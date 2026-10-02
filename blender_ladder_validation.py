@@ -324,11 +324,8 @@ class LadderTests(unittest.TestCase):
         bm.free()
 
     def test_sample_group_structure_and_free_id(self):
-        try:
-            with bpy.data.libraries.load(str(ROOT / 'laddernest.blend'), link=False) as (source, target):
-                target.objects = ['Memory', 'View Geometry']
-        except OSError:
-            self.skipTest('Reference laddernest.blend format is not readable by this Blender; generated ladder tests still run')
+        with bpy.data.libraries.load(str(ROOT / 'laddernest.blend'), link=False) as (source, target):
+            target.objects = ['Memory', 'View Geometry']
         sample = target.objects[0]
         bpy.context.scene.collection.objects.link(sample)
         sample_view = target.objects[1]
@@ -389,9 +386,8 @@ class LadderTests(unittest.TestCase):
 
 from math import sin as math_sin, cos as math_cos
 result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(LadderTests))
-(ROOT / 'reports').mkdir(exist_ok=True)
 (ROOT / 'reports/ladder_validation.json').write_text(json.dumps(dict(tests=result.testsRun,
-    failures=len(result.failures), errors=len(result.errors), skipped=len(result.skipped)), indent=2), encoding='utf-8')
+    failures=len(result.failures), errors=len(result.errors)), indent=2), encoding='utf-8')
 nh.unregister()
 if not result.wasSuccessful():
     raise RuntimeError('Ladder validation failed')

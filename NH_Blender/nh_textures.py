@@ -2149,6 +2149,435 @@ def _sync_collider_material_identity_from_source(target_mat: bpy.types.Material,
         pass
 
 
+# ------------------------------------------------------------------------
+#  Material replacement hash
+#
+#  Remembers texture/material replacements the user made in the Geometry
+#  LODs and Misc / Roadway menus so they can be applied again automatically.
+# ------------------------------------------------------------------------
+
+_MATERIAL_HASH_FILE_NAME = "NH_material_hash.json"
+_MATERIAL_HASH_SCHEMA_VERSION = 1
+_MATERIAL_HASH_CHANNELS = ("fire", "roadway")
+_MATERIAL_HASH_BACKUP_FILE_NAME = "NH_material_hash.backup.json"
+_MATERIAL_HASH_RESET_BACKUP_FILE_NAME = "NH_material_hash.reset_backup.json"
+_MATERIAL_HASH_CACHE = None
+
+
+def _material_hash_file_path(create_dir=False) -> str:
+    base = _nh_blender_shared_cache_base(create=create_dir)
+    return os.path.join(base, _MATERIAL_HASH_FILE_NAME)
+
+
+def _material_hash_sibling_path(file_name: str) -> str:
+    return os.path.join(os.path.dirname(_material_hash_file_path(create_dir=False)), file_name)
+
+
+def _strip_ext_int_suffix(value: str) -> str:
+    base = str(value or "").strip()
+    low = base.lower()
+    for suffix in ("_ext", "_int"):
+        if low.endswith(suffix):
+            return base[: -len(suffix)]
+    return base
+
+
+def _swap_ext_int_suffix(value: str) -> str:
+    base, ext = os.path.splitext(str(value or "").strip())
+    low = base.lower()
+    if low.endswith("_ext"):
+        return base[:-4] + "_int" + ext
+    if low.endswith("_int"):
+        return base[:-4] + "_ext" + ext
+    return ""
+
+
+def _ext_int_suffix_of_material(mat) -> str:
+    from .nh_collider_exp import (_basename_no_ext)
+    if mat is None:
+        return ""
+    paa_path, rvmat_path = _source_material_export_paths(mat)
+    for value in (getattr(mat, "name", ""), paa_path, rvmat_path):
+        base = _basename_no_ext(value).strip().lower()
+        if base.endswith("_ext"):
+            return "_ext"
+        if base.endswith("_int"):
+            return "_int"
+    return ""
+
+
+def _prefer_ext_texture_path(filepath: str) -> str:
+    """For Roadway, use the _ext variant whenever an _int texture was picked."""
+    raw = str(filepath or "").strip()
+    if not raw:
+        return filepath
+    base, ext = os.path.splitext(raw)
+    if not base.lower().endswith("_int"):
+        return filepath
+    candidate = base[:-4] + "_ext" + ext
+    try:
+        if os.path.isfile(candidate):
+            return candidate
+    except Exception:
+        pass
+    return filepath
+
+
+def _material_hash_snapshot(mat):
+    name = str(getattr(mat, "name", "") or "").strip()
+    paa_path, rvmat_path = _source_material_export_paths(mat)
+    return {
+        "name": name,
+        "paa": str(paa_path or "").strip(),
+        "rvmat": str(rvmat_path or "").strip(),
+    }
+
+
+def _material_hash_keys_from_snapshot(snapshot, *, family=False):
+    from .nh_collider_exp import (_basename_no_ext)
+    keys = []
+
+    def _add(value):
+        base = _basename_no_ext(value).strip().lower()
+        if not base:
+            return
+        if base not in keys:
+            keys.append(base)
+        if family:
+            stem = _strip_ext_int_suffix(base).strip().lower()
+            if stem and stem not in keys:
+                keys.append(stem)
+
+    _add(snapshot.get("paa"))
+    _add(snapshot.get("rvmat"))
+    _add(snapshot.get("name"))
+    return keys
+
+
+def _material_hash_storage_key(snapshot, *, family=False) -> str:
+    keys = _material_hash_keys_from_snapshot(snapshot, family=family)
+    if not keys:
+        return ""
+    key = keys[0]
+    if family:
+        stem = _strip_ext_int_suffix(key).strip().lower()
+        if stem:
+            key = stem
+    return key
+
+
+def _normalize_material_hash_data(raw):
+    data = {
+        "version": _MATERIAL_HASH_SCHEMA_VERSION,
+        "fire": {},
+        "roadway": {},
+    }
+    if not isinstance(raw, dict):
+        return data
+    for channel in _MATERIAL_HASH_CHANNELS:
+        entries = raw.get(channel)
+        if not isinstance(entries, dict):
+            continue
+        cleaned = {}
+        for key, entry in entries.items():
+            if not isinstance(entry, dict):
+                continue
+            clean_key = str(key or "").strip().lower()
+            if not clean_key:
+                continue
+            cleaned[clean_key] = {
+                "name": str(entry.get("name") or "").strip(),
+                "paa": str(entry.get("paa") or "").strip(),
+                "rvmat": str(entry.get("rvmat") or "").strip(),
+            }
+        data[channel] = cleaned
+    return data
+
+
+def _read_material_hash_json(path):
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+    except Exception:
+        return None
+    return None
+
+
+def _restore_material_hash_from_backup(path):
+    backup_path = _material_hash_sibling_path(_MATERIAL_HASH_BACKUP_FILE_NAME)
+    raw = _read_material_hash_json(backup_path)
+    if raw is None:
+        return None
+    try:
+        shutil.copy2(backup_path, path)
+    except Exception:
+        pass
+    return raw
+
+
+def _load_material_hash():
+    global _MATERIAL_HASH_CACHE
+    if _MATERIAL_HASH_CACHE is not None:
+        return _MATERIAL_HASH_CACHE
+    path = _material_hash_file_path(create_dir=False)
+    raw = _read_material_hash_json(path)
+    if raw is None:
+        raw = _restore_material_hash_from_backup(path)
+    _MATERIAL_HASH_CACHE = _normalize_material_hash_data(raw)
+    return _MATERIAL_HASH_CACHE
+
+
+def _save_material_hash(data) -> bool:
+    global _MATERIAL_HASH_CACHE
+    data = _normalize_material_hash_data(data)
+    _MATERIAL_HASH_CACHE = data
+    path = _material_hash_file_path(create_dir=True)
+    tmp_path = path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        return False
+    # Keep a mirror copy so an accidental deletion of the main file can be
+    # recovered on the next load instead of silently losing the history.
+    try:
+        shutil.copy2(path, _material_hash_sibling_path(_MATERIAL_HASH_BACKUP_FILE_NAME))
+    except Exception:
+        pass
+    return True
+
+
+def material_hash_counts():
+    data = _load_material_hash()
+    return {channel: len(data.get(channel) or {}) for channel in _MATERIAL_HASH_CHANNELS}
+
+
+_MATERIAL_HASH_PLACEHOLDER_NAMES = {
+    "material",
+    "geometrymaterial",
+    "roadwaymaterial",
+    "firegeometrymaterial",
+}
+
+
+def _material_hash_identity_is_placeholder(snapshot) -> bool:
+    from .nh_collider_exp import (_is_placeholder_material_name)
+    snapshot = snapshot or {}
+    if str(snapshot.get("paa") or "").strip() or str(snapshot.get("rvmat") or "").strip():
+        return False
+    name = str(snapshot.get("name") or "").strip()
+    if not name:
+        return True
+    if _is_placeholder_material_name(name):
+        return True
+    base = _strip_blender_numeric_suffix(name).strip().lower()
+    return base in _MATERIAL_HASH_PLACEHOLDER_NAMES
+
+
+def _record_material_hash_mapping(channel: str, old_snapshot, new_snapshot) -> bool:
+    channel = str(channel or "").strip().lower()
+    if channel not in _MATERIAL_HASH_CHANNELS:
+        return False
+    if _material_hash_identity_is_placeholder(old_snapshot):
+        return False
+    family = channel == "roadway"
+    key = _material_hash_storage_key(old_snapshot or {}, family=family)
+    if not key:
+        return False
+    entry = {
+        "name": str((new_snapshot or {}).get("name") or "").strip(),
+        "paa": str((new_snapshot or {}).get("paa") or "").strip(),
+        "rvmat": str((new_snapshot or {}).get("rvmat") or "").strip(),
+    }
+    if not any(entry.values()):
+        return False
+    data = _load_material_hash()
+    data.setdefault(channel, {})[key] = entry
+    _save_material_hash(data)
+    return True
+
+
+def _lookup_material_hash_entry(channel: str, mat):
+    channel = str(channel or "").strip().lower()
+    if channel not in _MATERIAL_HASH_CHANNELS:
+        return None, ""
+    mappings = _load_material_hash().get(channel) or {}
+    if not mappings:
+        return None, ""
+    keys = _material_hash_keys_from_snapshot(_material_hash_snapshot(mat), family=(channel == "roadway"))
+    for key in keys:
+        entry = mappings.get(key)
+        if entry:
+            return entry, key
+    return None, ""
+
+
+def _material_matches_hash_entry(mat, entry) -> bool:
+    snapshot = _material_hash_snapshot(mat)
+    for field in ("name", "paa", "rvmat"):
+        target = str((entry or {}).get(field) or "").strip()
+        if not target:
+            continue
+        current = str(snapshot.get(field) or "").strip()
+        if field == "name":
+            if current != target:
+                return False
+        else:
+            left = os.path.normcase(current.replace("/", "\\"))
+            right = os.path.normcase(target.replace("/", "\\"))
+            if left != right:
+                return False
+    return True
+
+
+def _apply_material_hash_entry(mat, entry, channel: str):
+    name = str((entry or {}).get("name") or "").strip()
+    paa_path = str((entry or {}).get("paa") or "").strip() or None
+    rvmat_path = str((entry or {}).get("rvmat") or "").strip() or None
+    if channel == "fire":
+        _set_p3d_material_paths(mat, None, rvmat_path, clear_paa=True, clear_rvmat=not bool(rvmat_path))
+    else:
+        _set_p3d_material_paths(mat, paa_path, None, clear_paa=not bool(paa_path), clear_rvmat=True)
+    if name:
+        try:
+            mat.name = name
+        except Exception:
+            pass
+
+
+def apply_saved_material_hash(channel: str, objects):
+    channel = str(channel or "").strip().lower()
+    stats = {"materials": 0, "applied": 0, "skipped": 0, "changed_materials": []}
+    if channel not in _MATERIAL_HASH_CHANNELS:
+        return stats
+    mappings = _load_material_hash().get(channel) or {}
+    if not mappings:
+        return stats
+    for mat in _iter_unique_materials_from_objects(objects):
+        stats["materials"] += 1
+        entry, _key = _lookup_material_hash_entry(channel, mat)
+        if entry is None:
+            continue
+        if _material_matches_hash_entry(mat, entry):
+            stats["skipped"] += 1
+            continue
+        try:
+            _apply_material_hash_entry(mat, entry, channel)
+        except Exception:
+            continue
+        stats["applied"] += 1
+        stats["changed_materials"].append(mat)
+    return stats
+
+
+def resolve_ext_int_material(mat, direction: str):
+    """Find or create the paired _ext/_int variant of a Roadway material."""
+    from .nh_collider_exp import (_basename_no_ext)
+    if mat is None:
+        return None
+    direction = str(direction or "").strip().upper()
+    suffix = _ext_int_suffix_of_material(mat)
+    if not suffix:
+        return None
+    if direction == "TO_INT" and suffix != "_ext":
+        return None
+    if direction == "TO_EXT" and suffix != "_int":
+        return None
+
+    paa_path, rvmat_path = _source_material_export_paths(mat)
+    swapped_paa = _swap_ext_int_suffix(paa_path) if paa_path else ""
+    swapped_rvmat = _swap_ext_int_suffix(rvmat_path) if rvmat_path else ""
+    swapped_name = _swap_ext_int_suffix(getattr(mat, "name", ""))
+    target_name = swapped_name or _basename_no_ext(swapped_paa or swapped_rvmat)
+    if not target_name:
+        return None
+
+    for existing in bpy.data.materials:
+        if (existing.name or "").strip().lower() == target_name.strip().lower():
+            return existing
+
+    new_mat = mat.copy()
+    new_mat.name = target_name
+    try:
+        _set_p3d_material_paths(
+            new_mat,
+            swapped_paa or None,
+            swapped_rvmat or None,
+            clear_paa=not bool(swapped_paa),
+            clear_rvmat=not bool(swapped_rvmat),
+        )
+    except Exception:
+        pass
+    return new_mat
+
+
+def export_material_hash(filepath: str):
+    data = _load_material_hash()
+    target = os.path.abspath(bpy.path.abspath(str(filepath or "")))
+    if not target:
+        raise RuntimeError("Export path is empty")
+    folder = os.path.dirname(target)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    with open(target, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2, ensure_ascii=False)
+    return material_hash_counts()
+
+
+def import_material_hash(filepath: str):
+    source = os.path.abspath(bpy.path.abspath(str(filepath or "")))
+    if not source or not os.path.isfile(source):
+        raise RuntimeError("Hash file not found")
+    with open(source, "r", encoding="utf-8") as handle:
+        raw = json.load(handle)
+    if not isinstance(raw, dict):
+        raise RuntimeError("Hash file has an unsupported format")
+    data = _load_material_hash()
+    imported = 0
+    for channel in _MATERIAL_HASH_CHANNELS:
+        entries = raw.get(channel)
+        if not isinstance(entries, dict):
+            continue
+        bucket = data.setdefault(channel, {})
+        for key, entry in entries.items():
+            if not isinstance(entry, dict):
+                continue
+            clean_key = str(key or "").strip().lower()
+            if not clean_key:
+                continue
+            bucket[clean_key] = {
+                "name": str(entry.get("name") or "").strip(),
+                "paa": str(entry.get("paa") or "").strip(),
+                "rvmat": str(entry.get("rvmat") or "").strip(),
+            }
+            imported += 1
+    _save_material_hash(data)
+    return imported, material_hash_counts()
+
+
+def material_hash_is_empty():
+    data = _load_material_hash()
+    return all(len(data.get(channel) or {}) == 0 for channel in _MATERIAL_HASH_CHANNELS)
+
+
+def reset_material_hash():
+    path = _material_hash_file_path(create_dir=False)
+    try:
+        archive = _material_hash_sibling_path(_MATERIAL_HASH_RESET_BACKUP_FILE_NAME)
+        if os.path.isfile(path) and (not os.path.isfile(archive) or not material_hash_is_empty()):
+            shutil.copy2(path, archive)
+    except Exception:
+        pass
+    _save_material_hash({"version": _MATERIAL_HASH_SCHEMA_VERSION, "fire": {}, "roadway": {}})
+    return material_hash_counts()
+
+
 def _derive_roadway_material_name(src_mat: bpy.types.Material):
     from .nh_collider_exp import (_basename_no_ext)
     if src_mat is None:

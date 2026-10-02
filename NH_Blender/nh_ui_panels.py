@@ -25,24 +25,30 @@ from contextlib import contextmanager
 from .nh_base import (_UI_PANEL_DEFAULT_ORDER)
 
 _OBJECT_BUILDER_PANEL_PREFIX = "Object Builder"
+_NH_BUNDLE_MODULE_PREFIXES = ("NH_bundle",)
+_A3OB_MODULE_PREFIXES = ("bl_ext.user_default.Arma3ObjectBuilder", "Arma3ObjectBuilder")
 _P3D_PANEL_ICON_PATCHED = False
 _P3D_PANEL_ICON_PATCH_ATTEMPTS = 0
+_P3D_PANEL_ICON_PATCHED_IDS = set()
 
 
-def _patch_a3ob_object_builder_panel_headers():
-    from .nh_ui_icons import (icon_value)
-    idv = icon_value()
-    if idv == 0:
-        return 0
-    patched = 0
+def _module_matches_prefix(mod_name: str, prefixes) -> bool:
+    return any(mod_name == prefix or mod_name.startswith(prefix + ".") for prefix in prefixes)
+
+
+def _is_nh_bundle_module(mod_name: str) -> bool:
+    return _module_matches_prefix(mod_name, _NH_BUNDLE_MODULE_PREFIXES)
+
+
+def _collect_patchable_panel_classes():
+    target_prefixes = _NH_BUNDLE_MODULE_PREFIXES + _A3OB_MODULE_PREFIXES
     seen = set()
-    target_modules = ("bl_ext.user_default.Arma3ObjectBuilder", "NH_bundle")
-    interesting = []
+    result = []
     for mod in list(sys.modules.values()):
         if mod is None:
             continue
         mod_name = getattr(mod, "__name__", "") or ""
-        if not mod_name.startswith(target_modules):
+        if not _module_matches_prefix(mod_name, target_prefixes):
             continue
         for attr_name in dir(mod):
             try:
@@ -51,55 +57,60 @@ def _patch_a3ob_object_builder_panel_headers():
                 continue
             if not (isinstance(cls, type) and issubclass(cls, bpy.types.Panel)):
                 continue
-            label = str(getattr(cls, "bl_label", "") or "")
-            if not label.startswith(_OBJECT_BUILDER_PANEL_PREFIX):
-                continue
             key = id(cls)
             if key in seen:
                 continue
             seen.add(key)
-            interesting.append((cls, label))
+            result.append((cls, mod_name))
+    return result
 
-    for cls, label in interesting:
-        new_label = re.sub(
-            r"^\s*Object Builder\s*:\s*", "", label, flags=re.IGNORECASE
-        ) or label
 
-        def _nh_panel_header(self, context, _orig=None):
-            try:
-                idv_local = icon_value()
-                if idv_local:
-                    self.layout.label(text="", icon_value=idv_local)
-            except Exception:
-                pass
-            if callable(_orig):
-                try:
-                    _orig(self, context)
-                except Exception:
-                    pass
+def _refresh_registered_panel_class(cls) -> bool:
+    try:
+        bpy.utils.unregister_class(cls)
+    except Exception:
+        return False
+    try:
+        bpy.utils.register_class(cls)
+    except Exception as e:
+        print(f"[NH Plugin] Could not refresh panel class {getattr(cls, '__name__', cls)}: {e}")
+    return True
 
-        try:
-            orig_header = getattr(cls, "draw_header", None)
-            if not callable(orig_header) or getattr(orig_header, "__name__", "").startswith("_nh_"):
-                cls.draw_header = _nh_panel_header
-        except Exception:
-            pass
 
+def _patch_a3ob_object_builder_panel_headers():
+    from .nh_ui_icons import (ensure_previews, install_panel_header_icon)
+    ensure_previews()
+    patched = 0
+    for cls, mod_name in _collect_patchable_panel_classes():
+        key = id(cls)
+        if key in _P3D_PANEL_ICON_PATCHED_IDS:
+            continue
+        label = str(getattr(cls, "bl_label", "") or "")
+        if not _is_nh_bundle_module(mod_name) and not label.startswith(_OBJECT_BUILDER_PANEL_PREFIX):
+            continue
+        already_wrapped = getattr(cls.__dict__.get("draw_header"), "_nh_panel_icon_wrapper", False)
+        if not already_wrapped and not install_panel_header_icon(cls):
+            continue
+
+        new_label = re.sub(r"^\s*Object Builder\s*:\s*", "", label, flags=re.IGNORECASE) or label
         if new_label != label:
-            original_label = label
             try:
                 cls.bl_label = new_label
-                bpy.utils.unregister_class(cls)
-                bpy.utils.register_class(cls)
             except Exception:
-                try:
-                    cls.bl_label = original_label
-                    bpy.utils.unregister_class(cls)
-                    bpy.utils.register_class(cls)
-                except Exception as e:
-                    print(f"[NH Plugin] Could not refresh A3OB panel label {original_label}: {e}")
+                pass
+        _refresh_registered_panel_class(cls)
+        _P3D_PANEL_ICON_PATCHED_IDS.add(key)
         patched += 1
     return patched
+
+
+def _restore_a3ob_object_builder_panel_headers():
+    from .nh_ui_icons import (restore_panel_header_icons)
+    global _P3D_PANEL_ICON_PATCHED, _P3D_PANEL_ICON_PATCH_ATTEMPTS
+    restore_panel_header_icons()
+    _P3D_PANEL_ICON_PATCHED_IDS.clear()
+    _P3D_PANEL_ICON_PATCHED = False
+    _P3D_PANEL_ICON_PATCH_ATTEMPTS = 0
 
 
 def _ensure_p3d_panel_icon_patch_timer():
@@ -109,14 +120,15 @@ def _ensure_p3d_panel_icon_patch_timer():
     try:
         patched = _patch_a3ob_object_builder_panel_headers()
         if patched > 0:
-            _P3D_PANEL_ICON_PATCHED = True
-            print(f"[NH Plugin] A3OB panel headers: NH icon applied to {patched} 'Object Builder' panel(s)")
-            return None
+            _P3D_PANEL_ICON_PATCH_ATTEMPTS = 0
+            print(f"[NH Plugin] A3OB panel headers: NH icon applied to {patched} panel(s)")
+            return 2.0
     except Exception:
         pass
     _P3D_PANEL_ICON_PATCH_ATTEMPTS += 1
     if _P3D_PANEL_ICON_PATCH_ATTEMPTS > 30:
-        print("[NH Plugin] A3OB panel headers: could not find Object Builder panels to patch")
+        _P3D_PANEL_ICON_PATCHED = True
+        print("[NH Plugin] A3OB panel headers: no more panels to patch")
         return None
     return 2.0
 
@@ -157,8 +169,10 @@ class CRAY_PT_ColliderPanel(Panel):
             row = fire.row(align=True)
             row.prop(cs, "fire_geometry_material", text="Material")
             row.operator("cray.open_fire_geometry_rvmat_folder", text="", icon="FILE_FOLDER")
-            op = row.operator("cray.select_collider_material_faces", text="", icon="FACESEL")
+            op = row.operator("cray.reset_collider_material_selection", text="", icon="X")
             op.target_attr = "FIRE"
+            op = fire.operator("cray.apply_saved_material_hash", text="Apply Saved Materials", icon="FILE_REFRESH")
+            op.channel = "FIRE"
 
         layout.separator()
 
@@ -209,8 +223,15 @@ class CRAY_PT_ColliderPanel(Panel):
             row = roadway.row(align=True)
             row.prop(cs, "roadway_material", text="Texture")
             row.operator("cray.open_roadway_material_folder", text="", icon="FILE_FOLDER")
-            op = row.operator("cray.select_collider_material_faces", text="", icon="FACESEL")
+            op = row.operator("cray.reset_collider_material_selection", text="", icon="X")
             op.target_attr = "ROADWAY"
+            op = roadway.operator("cray.apply_saved_material_hash", text="Apply Saved Materials", icon="FILE_REFRESH")
+            op.channel = "ROADWAY"
+            row = roadway.row(align=True)
+            op = row.operator("cray.switch_roadway_ext_int", text="Ext > Int", icon="TRIA_RIGHT")
+            op.direction = "TO_INT"
+            op = row.operator("cray.switch_roadway_ext_int", text="Int > Ext", icon="TRIA_LEFT")
+            op.direction = "TO_EXT"
             roadway.prop(cs, "roadway_weld_distance")
             roadway.operator("cray.weld_roadway_vertices", icon="AUTOMERGE_ON")
 
@@ -508,7 +529,9 @@ class CRAY_PT_FixesPanel(Panel):
         check_box.label(text="Export checks", icon="ERROR")
         check_box.prop(ts, "export_warn_loose_vertices", text="Loose vertices outside Memory")
         check_box.operator("cray.select_loose_vertices_outside_memory", icon="VERTEXSEL")
+        check_box.operator("cray.autofix_loose_vertices_resolution", text="Auto-Fix Loose Verts (Resolution)", icon="TRASH")
         check_box.operator("cray.report_ngon_meshes", text="Report Meshes With N-gons", icon="FACESEL")
+        check_box.operator("cray.autofix_ngon_meshes", text="Auto-Fix N-gons (Scene)", icon="MOD_TRIANGULATE")
 
         box = layout.box()
         box.label(text="Shading/Geometry fixes", icon="MOD_SMOOTH")
@@ -623,6 +646,8 @@ class CRAY_PT_ImportExportPlannerPanel(Panel):
         ebox.prop(st, "export_only_p3d_named")
         ebox.prop(st, "export_only_split_parts")
         ebox.prop(st, "export_force_all_lods")
+        ebox.prop(st, "export_geometry_house_metadata")
+        ebox.prop(st, "export_recalculate_components")
         ebox.operator("cray.ie_export_collections_batch", icon="FILE_TICK")
 
 from .nh_base import (_UI_PANEL_DEFAULT_ORDER)
@@ -896,6 +921,20 @@ class CRAY_PT_MenuSettingsPanel(Panel):
                 split = row.split(factor=0.36, align=True)
                 split.label(text=shortcut)
                 split.label(text=action_text)
+
+        layout.separator()
+        hash_box = layout.box()
+        hash_box.label(text="Material Hash", icon="FILE_TICK")
+        from .nh_textures import (material_hash_counts)
+        counts = material_hash_counts()
+        hash_box.label(
+            text=f"Roadway: {counts.get('roadway', 0)} | Fire Geometry: {counts.get('fire', 0)}",
+            icon="INFO",
+        )
+        row = hash_box.row(align=True)
+        row.operator("cray.export_material_hash", text="Export Hash", icon="EXPORT")
+        row.operator("cray.import_material_hash", text="Import Hash", icon="IMPORT")
+        hash_box.operator("cray.reset_material_hash", text="Reset Hash", icon="TRASH")
 
 
 # ------------------------------------------------------------------------

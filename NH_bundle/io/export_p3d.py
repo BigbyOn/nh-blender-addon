@@ -295,10 +295,11 @@ def generate_components(operator, obj):
     if not operator.generate_components or int(obj.a3ob_properties_object.lod) not in data.lod_geometries:
         return
     
-    re_component = re.compile(r"component\d+", re.IGNORECASE)
-    for group in obj.vertex_groups:
-        if re_component.match(group.name):
-            return
+    if not bool(getattr(operator, "recalculate_components", False)):
+        re_component = re.compile(r"component\d+", re.IGNORECASE)
+        for group in obj.vertex_groups:
+            if re_component.match(group.name):
+                return
     
     structutils.find_components(obj)
 

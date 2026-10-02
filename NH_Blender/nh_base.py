@@ -25,7 +25,7 @@ from contextlib import contextmanager
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Enisam",
-    "version": (0, 5, 4, 11),
+    "version": (0, 6, 5, 1),
     "blender": (5, 1, 1),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "All-in-one Blender toolkit for porting and preparing DayZ/Arma assets: fixes, textures, colliders, proxies, snap points, and P3D workflow helpers.",    
@@ -266,6 +266,8 @@ _PERSISTED_UI_SETTINGS = {
         "export_only_p3d_named",
         "export_only_split_parts",
         "export_force_all_lods",
+        "export_geometry_house_metadata",
+        "export_recalculate_components",
     ),
     "cray_asset_proxy_settings": (
         "duplicate_to_all_resolution_lods",

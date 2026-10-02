@@ -4852,35 +4852,75 @@ class CRAY_OT_SelectConnectedShellFromSelectionExp(Operator):
 
     def execute(self, context):
         from .nh_base import (_fmt_exc)
-        obj = getattr(context, "edit_object", None)
-        if obj is None or getattr(obj, "type", None) != "MESH":
+        active_obj = getattr(context, "edit_object", None)
+        if active_obj is None or getattr(active_obj, "type", None) != "MESH":
             self.report({"ERROR"}, "Open a mesh in Edit Mode and select part of a shell")
             return {"CANCELLED"}
 
         try:
-            bm = bmesh.from_edit_mesh(obj.data)
-            if not any(
-                (vert.is_valid and vert.select)
-                for vert in bm.verts
-            ) and not any(
-                (edge.is_valid and edge.select)
-                for edge in bm.edges
-            ) and not any(
-                (face.is_valid and face.select)
-                for face in bm.faces
-            ):
+            edit_objects = [
+                obj for obj in (
+                    getattr(context, "objects_in_mode_unique_data", None)
+                    or getattr(context, "objects_in_mode", None)
+                    or (active_obj,)
+                )
+                if getattr(obj, "type", None) == "MESH" and getattr(obj, "mode", "") == "EDIT"
+            ]
+            selected_objects = 0
+            selected_shells = 0
+            for obj in edit_objects:
+                bm = bmesh.from_edit_mesh(obj.data)
+                bm.verts.ensure_lookup_table()
+                bm.edges.ensure_lookup_table()
+                bm.faces.ensure_lookup_table()
+                seeds = {vert for vert in bm.verts if vert.is_valid and vert.select}
+                for edge in bm.edges:
+                    if edge.is_valid and edge.select:
+                        seeds.update(vert for vert in edge.verts if vert.is_valid)
+                for face in bm.faces:
+                    if face.is_valid and face.select:
+                        seeds.update(vert for vert in face.verts if vert.is_valid)
+                if not seeds:
+                    continue
+
+                selected_objects += 1
+                remaining = set(seeds)
+                while remaining:
+                    stack = [remaining.pop()]
+                    shell = set(stack)
+                    while stack:
+                        vert = stack.pop()
+                        for edge in vert.link_edges:
+                            if not edge.is_valid:
+                                continue
+                            other = edge.other_vert(vert)
+                            if other.is_valid and other not in shell:
+                                shell.add(other)
+                                remaining.discard(other)
+                                stack.append(other)
+                    selected_shells += 1
+                    for vert in shell:
+                        vert.select_set(True)
+                    for edge in bm.edges:
+                        if edge.is_valid and all(vert in shell for vert in edge.verts):
+                            edge.select_set(True)
+                    for face in bm.faces:
+                        if face.is_valid and all(vert in shell for vert in face.verts):
+                            face.select_set(True)
+
+                bm.select_flush_mode()
+                bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+            if not selected_objects:
                 raise RuntimeError("Select a face, edge, or vertex first")
-            result = bpy.ops.mesh.select_linked(delimit=set())
-        except TypeError:
-            result = bpy.ops.mesh.select_linked()
         except Exception as e:
             self.report({"ERROR"}, _fmt_exc(e))
             return {"CANCELLED"}
 
-        if "FINISHED" not in set(result or []):
-            self.report({"WARNING"}, "Could not select linked shell")
-            return {"CANCELLED"}
-        self.report({"INFO"}, "Selected connected shell")
+        self.report(
+            {"INFO"},
+            f"Selected {selected_shells} connected shell(s) in {selected_objects} edit object(s)",
+        )
         return {"FINISHED"}
 
 

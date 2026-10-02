@@ -219,6 +219,23 @@ class CRAY_PG_IEPlannerSettings(PropertyGroup):
             "during batch export to prevent Resolution LODs from being skipped"
         ),
     )
+    export_geometry_house_metadata: BoolProperty(
+        name="Geometry: house properties + mass",
+        default=False,
+        description=(
+            "Before export, add class=house and map=building named properties and prepare "
+            "a3ob_mass on the root Geometry LOD only (token 6, proxies excluded); "
+            "temporary named properties are removed from the .blend after export"
+        ),
+    )
+    export_recalculate_components: BoolProperty(
+        name="Geometry: recalculate components",
+        default=True,
+        description=(
+            "Before export, regenerate Component## selections on geometry-type LODs from the "
+            "closed parts of the mesh, replacing stale components imported from the source .p3d"
+        ),
+    )
 
 class CRAY_OT_IEFilePathTooltip(Operator):
     bl_idname = "cray.ie_file_path_tooltip"

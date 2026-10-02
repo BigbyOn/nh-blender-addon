@@ -85,6 +85,7 @@ _P3D_EXPORT_CANDIDATES = (
             "validate_lods",
             "validate_lods_warning_errors",
             "generate_components",
+            "recalculate_components",
             "renumber_components",
             "translate_selections",
             "force_lowercase",
@@ -662,6 +663,221 @@ def _restore_p3d_named_properties_after_export(restore_items):
                 item.value = value
         except Exception:
             pass
+
+
+_GEOMETRY_LOD_DEFAULT_TOTAL_MASS = 1000.0
+_GEOMETRY_HOUSE_NAMED_PROPERTIES = (("class", "house"), ("map", "building"))
+
+
+def _object_pointer_key(obj):
+    if obj is None:
+        return None
+    try:
+        return obj.as_pointer()
+    except Exception:
+        return id(obj)
+
+
+def _geometry_lod_display_name(root_obj):
+    try:
+        return str(root_obj.a3ob_properties_object.get_name())
+    except Exception:
+        return getattr(root_obj, "name", "<unknown>")
+
+
+def _geometry_lod_root_objects(export_objects):
+    from .nh_assets import (_is_p3d_proxy_object)
+    from .nh_scatter import (_GEOMETRY_LOD_TOKEN)
+    roots = []
+    seen = set()
+    for obj in export_objects or []:
+        if not _is_p3d_lod_root_object(obj):
+            continue
+        if _is_p3d_proxy_object(obj):
+            continue
+        try:
+            lod_token = str(getattr(obj.a3ob_properties_object, "lod", "") or "").strip()
+        except Exception:
+            continue
+        if lod_token != _GEOMETRY_LOD_TOKEN:
+            continue
+        key = _object_pointer_key(obj)
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(obj)
+    return roots
+
+
+def _read_mesh_mass_values(mesh_obj):
+    if mesh_obj is None or getattr(mesh_obj, "type", None) != "MESH" or mesh_obj.data is None:
+        return []
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh_obj.data)
+        layer = bm.verts.layers.float.get("a3ob_mass")
+        if layer is None:
+            return [0.0 for _vert in bm.verts]
+        return [float(vert[layer]) for vert in bm.verts]
+    finally:
+        bm.free()
+
+
+def _write_mesh_mass_uniform(mesh_obj, value_per_vertex: float):
+    if mesh_obj is None or getattr(mesh_obj, "type", None) != "MESH" or mesh_obj.data is None:
+        return 0
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh_obj.data)
+        bm.verts.ensure_lookup_table()
+        layer = bm.verts.layers.float.get("a3ob_mass")
+        if layer is None:
+            layer = bm.verts.layers.float.new("a3ob_mass")
+        for vert in bm.verts:
+            vert[layer] = value_per_vertex
+        changed = len(bm.verts)
+        bm.to_mesh(mesh_obj.data)
+        mesh_obj.data.update()
+        return changed
+    finally:
+        bm.free()
+
+
+def _prepare_geometry_lod_mass_for_export(export_objects):
+    prepared = []
+    for root_obj in _geometry_lod_root_objects(export_objects):
+        meshes = list(_iter_p3d_export_meshes_for_lod_root(root_obj))
+        if not meshes:
+            continue
+
+        values_by_obj = []
+        total_verts = 0
+        total_mass = 0.0
+        has_missing_mass = False
+        for mesh_obj in meshes:
+            values = _read_mesh_mass_values(mesh_obj)
+            if not values:
+                continue
+            values_by_obj.append((mesh_obj, values))
+            total_verts += len(values)
+            total_mass += math.fsum(values)
+            if any(value <= 1e-7 for value in values):
+                has_missing_mass = True
+
+        if total_verts <= 0:
+            continue
+
+        record = {
+            "root_object": root_obj,
+            "total_verts": total_verts,
+            "total_mass": total_mass,
+            "mass_created": False,
+            "mass_repaired": False,
+            "unchanged": False,
+            "changed_verts": 0,
+        }
+
+        if total_mass > 1e-7 and not has_missing_mass:
+            record["unchanged"] = True
+            prepared.append(record)
+            continue
+
+        target_total_mass = total_mass if total_mass > 1e-7 else _GEOMETRY_LOD_DEFAULT_TOTAL_MASS
+        value_per_vertex = target_total_mass / total_verts
+        changed_verts = 0
+        for mesh_obj, _values in values_by_obj:
+            changed_verts += _write_mesh_mass_uniform(mesh_obj, value_per_vertex)
+        record["total_mass"] = target_total_mass
+        record["mass_created"] = total_mass <= 1e-7
+        record["mass_repaired"] = total_mass > 1e-7
+        record["changed_verts"] = changed_verts
+        prepared.append(record)
+
+    return prepared
+
+
+def _prepare_geometry_house_metadata_for_export(export_objects, original_named_properties=None):
+    original_map = {}
+    for obj, saved in original_named_properties or []:
+        original_map[_object_pointer_key(obj)] = list(saved or [])
+
+    try:
+        mass_records = _prepare_geometry_lod_mass_for_export(export_objects)
+    except Exception as e:
+        from .nh_base import (_fmt_exc)
+        print(f"WARNING: Geometry mass preparation failed: {_fmt_exc(e)}")
+        mass_records = []
+    mass_by_root = {_object_pointer_key(rec["root_object"]): rec for rec in mass_records}
+
+    restore_items = []
+    records = []
+    for root_obj in _geometry_lod_root_objects(export_objects):
+        props = getattr(root_obj, "a3ob_properties_object", None)
+        if props is None:
+            continue
+        try:
+            items = props.properties
+            saved = [
+                (str(getattr(item, "name", "") or ""), str(getattr(item, "value", "") or ""))
+                for item in items
+            ]
+            items.clear()
+            for prop_name, prop_value in _GEOMETRY_HOUSE_NAMED_PROPERTIES:
+                item = items.add()
+                item.name = prop_name
+                item.value = prop_value
+        except Exception as e:
+            from .nh_base import (_fmt_exc)
+            print(
+                f"WARNING: Geometry house metadata prep failed for "
+                f"{getattr(root_obj, 'name', '<unknown>')}: {_fmt_exc(e)}"
+            )
+            continue
+
+        restore_items.append((root_obj, saved))
+
+        original = dict(original_map.get(_object_pointer_key(root_obj), []))
+        kept_originals = (
+            original.get("class") == "house"
+            and original.get("map") == "building"
+        )
+        records.append(
+            {
+                "lod_object_name": getattr(root_obj, "name", "<unknown>"),
+                "lod_name": _geometry_lod_display_name(root_obj),
+                "named_properties_label": (
+                    "kept originals (class=house, map=building)"
+                    if kept_originals
+                    else "added (class=house, map=building)"
+                ),
+                "mass": mass_by_root.get(_object_pointer_key(root_obj)),
+            }
+        )
+
+    return restore_items, records
+
+
+def _report_geometry_metadata_prepared_in_console(model_name, records):
+    if not records:
+        return
+
+    print("=== Batch Export Collections: Geometry metadata prepared ===")
+    print(f"Model: {model_name}")
+    for rec in records:
+        mass_rec = rec.get("mass") or {}
+        if mass_rec.get("unchanged"):
+            mass_label = f"mass kept, total {float(mass_rec.get('total_mass', 0.0) or 0.0):.3f}"
+        elif mass_rec.get("mass_created"):
+            mass_label = f"mass created, default total {float(mass_rec.get('total_mass', 0.0) or 0.0):.3f}"
+        elif mass_rec.get("mass_repaired"):
+            mass_label = f"mass repaired, total {float(mass_rec.get('total_mass', 0.0) or 0.0):.3f}"
+        else:
+            mass_label = "mass not prepared"
+        print(
+            f" - Geometry LOD: {rec.get('lod_name', '<unknown>')} | "
+            f"class/map: {rec.get('named_properties_label', '')} | "
+            f"{mass_label} | vertices: {int(mass_rec.get('total_verts', 0) or 0)}"
+        )
 
 
 def _get_p3d_export_p3d_module():
@@ -1727,6 +1943,7 @@ def _make_p3d_export_diagnostic_operator(force_all_lods: bool):
     operator.validate_lods = False
     operator.validate_lods_warning_errors = False
     operator.generate_components = True
+    operator.recalculate_components = False
     operator.force_lowercase = True
     operator.renumber_components = True
     operator.translate_selections = False
@@ -2469,26 +2686,6 @@ def _snap_check_audit_memory_objects(side_label: str, memory_objects):
             f"{side_label}: duplicate logical snap point '{base_name}_{snap_side}_{point_index}': {names}"
         )
 
-    pair_keys = sorted({(base_name, snap_side) for base_name, snap_side, _index in records})
-    for base_name, snap_side in pair_keys:
-        missing = [
-            point_index for point_index in (0, 1)
-            if (base_name, snap_side, point_index) not in records
-        ]
-        if missing:
-            missing_text = ", ".join(f"_{point_index}" for point_index in missing)
-            errors.append(f"{side_label}: incomplete pair '{base_name}_{snap_side}'; missing {missing_text}")
-            continue
-
-        pair_entries = [records[(base_name, snap_side, point_index)] for point_index in (0, 1)]
-        if any(len(entries) != 1 or entries[0]["point"] is None for entries in pair_entries):
-            continue
-        point_0 = pair_entries[0][0]["point"]
-        point_1 = pair_entries[1][0]["point"]
-        span = (point_1 - point_0).length
-        if span <= 1e-6:
-            errors.append(f"{side_label}: pair '{base_name}_{snap_side}' has coincident _0/_1 points")
-
     for used_names in vertex_usage.values():
         if len(used_names) > 1:
             warnings.append(
@@ -2715,230 +2912,6 @@ def _print_snap_check_report(target_a, target_v, naming, root_a, root_v, memory_
     print("=== End NH Snap Magnet Check ===")
 
 
-def _snap_check_base_sequence(base_name: str):
-    """Return a stable chain key and numeric ID parsed from a snap base name."""
-    match = re.fullmatch(r"(.+?)(\d+)([XxYyZz]?)", str(base_name or ""))
-    if match is None:
-        return None
-    prefix, digits, axis = match.groups()
-    return (prefix.lower(), axis.lower()), int(digits), len(digits)
-
-
-def _snap_check_root_part_number(root_collection):
-    """Read an unambiguous `_p01_` style part number from a P3D root name."""
-    name = str(getattr(root_collection, "name", "") or "")
-    matches = list(re.finditer(r"(?:^|_)p(\d+)(?=_|\.p3d(?:\.|$)|$)", name, flags=re.IGNORECASE))
-    if len(matches) != 1:
-        return None
-    try:
-        return int(matches[0].group(1))
-    except Exception:
-        return None
-
-
-def _snap_check_repair_repeated_ids_by_part_order(inventory):
-    """Repair IDs produced by older local-only allocation when root order is unambiguous.
-
-    The old allocator could create 01, 02, 01, 02 along a p01..p05 chain.
-    We only repair when each adjacent numbered root has exactly one A -> V
-    connection for the same name/axis family and the old A/V base still agrees.
-    """
-    endpoints_by_chain = {}
-    repeated_keys = set()
-    logical_counts = {}
-
-    for info in inventory:
-        records = info.get("records", {})
-        bases = sorted({base for base, _side, _index in records})
-        for base in bases:
-            entries = records.get((base, "a", 0), ()) or records.get((base, "v", 0), ())
-            display_base = entries[0]["base"] if entries else base
-            sequence = _snap_check_base_sequence(display_base)
-            if sequence is None:
-                continue
-            chain_key, numeric_id, width = sequence
-            for side in ("a", "v"):
-                points, memory = _snap_check_pair_from_records(records, base, side)
-                if points is None:
-                    continue
-                pair_entries = [records[(base, side, index)][0] for index in (0, 1)]
-                endpoint = {
-                    "info": info,
-                    "base": display_base,
-                    "base_key": base,
-                    "side": side,
-                    "id": numeric_id,
-                    "width": width,
-                    "points": points,
-                    "memory": memory,
-                    "entries": pair_entries,
-                }
-                endpoints_by_chain.setdefault(chain_key, []).append(endpoint)
-                logical_key = (chain_key, numeric_id, side)
-                logical_counts[logical_key] = logical_counts.get(logical_key, 0) + 1
-
-    for (chain_key, _numeric_id, _side), count in logical_counts.items():
-        if count > 1:
-            repeated_keys.add(chain_key)
-
-    if not repeated_keys:
-        return [], [], []
-
-    planned = []
-    errors = []
-    notes = []
-    for chain_key in sorted(repeated_keys):
-        endpoints = endpoints_by_chain.get(chain_key, ())
-        roots = {}
-        for endpoint in endpoints:
-            root = endpoint["info"]["root"]
-            root_ptr = root.as_pointer()
-            root_entry = roots.setdefault(
-                root_ptr,
-                {"root": root, "part": _snap_check_root_part_number(root), "a": [], "v": []},
-            )
-            root_entry[endpoint["side"]].append(endpoint)
-
-        if any(item["part"] is None for item in roots.values()):
-            errors.append(
-                f"Repeated IDs in snap chain '{chain_key[0]}' cannot be repaired automatically: "
-                "every participating root must have one _p01_, _p02_... part number"
-            )
-            continue
-
-        ordered = sorted(roots.values(), key=lambda item: (item["part"], item["root"].name.lower()))
-        part_numbers = [item["part"] for item in ordered]
-        if not part_numbers or part_numbers[0] != 1 or part_numbers != list(range(1, len(ordered) + 1)):
-            errors.append(
-                f"Repeated IDs in snap chain '{chain_key[0]}' cannot be repaired automatically: "
-                f"participating root parts must be continuous from p01 (found {part_numbers})"
-            )
-            continue
-
-        chain_edges = []
-        ambiguous = False
-        for index in range(len(ordered) - 1):
-            left = ordered[index]
-            right = ordered[index + 1]
-            if len(left["a"]) != 1 or len(right["v"]) != 1:
-                errors.append(
-                    f"Repeated IDs in snap chain '{chain_key[0]}' are ambiguous between "
-                    f"'{left['root'].name}' and '{right['root'].name}'"
-                )
-                ambiguous = True
-                break
-            endpoint_a = left["a"][0]
-            endpoint_v = right["v"][0]
-            if endpoint_a["base_key"] != endpoint_v["base_key"]:
-                errors.append(
-                    f"Repeated IDs in snap chain '{chain_key[0]}' do not form an exact A/V pair between "
-                    f"'{left['root'].name}' and '{right['root'].name}'"
-                )
-                ambiguous = True
-                break
-            span_a = (endpoint_a["points"][1] - endpoint_a["points"][0]).length
-            span_v = (endpoint_v["points"][1] - endpoint_v["points"][0]).length
-            tolerance = _snap_pair_distance_tolerance(span_a, span_v)
-            if abs(span_a - span_v) > tolerance:
-                errors.append(
-                    f"Repeated ID '{endpoint_a['base']}' has different A/V distances: "
-                    f"A={span_a:.6f}, V={span_v:.6f}"
-                )
-                ambiguous = True
-                break
-            chain_edges.append((endpoint_a, endpoint_v))
-        if ambiguous:
-            continue
-
-        if ordered and (ordered[0]["v"] or ordered[-1]["a"]):
-            errors.append(
-                f"Repeated IDs in snap chain '{chain_key[0]}' are ambiguous at its first/last root"
-            )
-            continue
-        if any(len(item["a"]) != (0 if index == len(ordered) - 1 else 1)
-               or len(item["v"]) != (0 if index == 0 else 1)
-               for index, item in enumerate(ordered)):
-            errors.append(f"Repeated IDs in snap chain '{chain_key[0]}' have ambiguous root roles")
-            continue
-
-        width = max(2, max(endpoint["width"] for endpoint in endpoints))
-        for sequence_index, (endpoint_a, endpoint_v) in enumerate(chain_edges, 1):
-            match = re.fullmatch(r"(.+?)(\d+)([XxYyZz]?)", endpoint_a["base"])
-            if match is None:
-                errors.append(f"Could not rebuild repeated snap base '{endpoint_a['base']}'")
-                ambiguous = True
-                break
-            prefix, _old_digits, axis = match.groups()
-            new_base = f"{prefix}{sequence_index:0{width}d}{axis}"
-            for endpoint in (endpoint_a, endpoint_v):
-                for point_index, entry in enumerate(endpoint["entries"]):
-                    new_name = f".sp_{new_base}_{endpoint['side'].upper()}_{point_index}"
-                    planned.append((endpoint["memory"], entry["group"], entry["name"], new_name))
-        if not ambiguous:
-            notes.append(
-                f"Recovered repeated IDs in '{chain_key[0]}' from P3D part order: "
-                f"01..{len(chain_edges):02d}"
-            )
-
-    if errors:
-        return [], errors, notes
-
-    # Validate final names before changing Blender data. Names being changed away
-    # are allowed targets; every other existing selection remains protected.
-    changing_groups = {group.as_pointer() for _memory, group, _old, _new in planned}
-    final_per_memory = {}
-    for memory, group, _old_name, new_name in planned:
-        key = memory.as_pointer()
-        target_key = new_name.lower()
-        used = final_per_memory.setdefault(key, {})
-        other = used.get(target_key)
-        if other is not None and other != group.as_pointer():
-            return [], [f"Automatic snap ID repair would create duplicate selection '{new_name}'"], notes
-        used[target_key] = group.as_pointer()
-        for existing in memory.vertex_groups:
-            if existing.as_pointer() in changing_groups:
-                continue
-            if existing.name.lower() == target_key:
-                return [], [
-                    f"Automatic snap ID repair cannot overwrite existing selection "
-                    f"'{memory.name}:{existing.name}'"
-                ], notes
-
-    applied = []
-    try:
-        for index, (memory, group, old_name, new_name) in enumerate(planned):
-            if old_name == new_name:
-                continue
-            group.name = f".nh_snap_tmp_{index:04d}"
-            applied.append((memory, group, old_name, new_name))
-        for _memory, group, _old_name, new_name in applied:
-            group.name = new_name
-    except Exception:
-        for _memory, group, old_name, _new_name in applied:
-            try:
-                group.name = old_name
-            except Exception:
-                pass
-        raise
-    return applied, [], notes
-
-
-def _snap_check_restore_repaired_ids(changes):
-    live = []
-    for index, (memory, group, old_name, new_name) in enumerate(changes or ()):
-        try:
-            group.name = f".nh_snap_restore_{index:04d}"
-            live.append((memory, group, old_name, new_name))
-        except Exception:
-            pass
-    for _memory, group, old_name, _new_name in live:
-        try:
-            group.name = old_name
-        except Exception:
-            pass
-    return len(live)
-
-
 def _snap_check_scene_inventory(context):
     """Audit every P3D root without changing transforms or viewport state."""
     from .nh_textures import (_collect_collection_objects_recursive)
@@ -2988,9 +2961,10 @@ def _snap_check_scene_inventory(context):
                 memory_objects,
             )
             errors.extend(audit_errors)
-            # Reusing a Memory vertex or position for several logical snap points is
-            # ambiguous for automatic assembly, so it is a hard preflight error.
-            errors.extend(audit_warnings)
+            # Coincident world positions and shared Memory vertices between
+            # different snap selections are not errors: on corners, different
+            # exact snap IDs may physically overlap. They stay warnings only.
+            warnings.extend(audit_warnings)
 
         visuals = _snap_check_visual_lod_roots(root)
         resolution_zero = [obj for obj in visuals if _is_resolution0_visual_lod_object(obj)]
@@ -3017,185 +2991,182 @@ def _snap_check_scene_inventory(context):
     return inventory, errors, warnings
 
 
-def _snap_check_build_automatic_chains(inventory, errors, warnings=None):
-    """Build and validate directed A-root -> V-root chains for every exact base ID."""
-    if warnings is None:
-        warnings = []
+def _snap_check_exact_id_side_endpoint(state, side):
+    """Return (endpoint, fail_reason, duplicate_roots) for one exact ID side."""
+    points_by_index = state["points"].get(side, {})
+    if not points_by_index:
+        return None, None, []
+
+    roots_by_index = {}
+    for index in (0, 1):
+        entries = points_by_index.get(index, [])
+        if not entries:
+            return None, f"missing _{index}", []
+        by_root = {}
+        for info, record in entries:
+            root = info.get("root")
+            key = root.as_pointer() if root is not None else id(root)
+            by_root.setdefault(key, (info, record))
+        if len(by_root) > 1:
+            names = sorted(
+                getattr(item[0].get("root"), "name", "<unknown>")
+                for item in by_root.values()
+            )
+            return None, None, names
+        info, record = next(iter(by_root.values()))
+        if record.get("point") is None:
+            return None, f"_{index} selection does not contain exactly one vertex", []
+        roots_by_index[index] = (info, record)
+
+    info_0, record_0 = roots_by_index[0]
+    info_1, record_1 = roots_by_index[1]
+    if info_0.get("root") != info_1.get("root"):
+        root_0 = getattr(info_0.get("root"), "name", "<unknown>")
+        root_1 = getattr(info_1.get("root"), "name", "<unknown>")
+        return None, f"_0 and _1 points are in different P3D roots: '{root_0}' vs '{root_1}'", []
+
+    endpoint = {
+        "info": info_0,
+        "points": [record_0["point"].copy(), record_1["point"].copy()],
+        "memory": record_0.get("memory"),
+    }
+    return endpoint, None, []
+
+
+def _snap_check_evaluate_exact_id(display_base, state):
+    """Validate one exact snap ID locally and return its per-ID result record."""
+    result = {
+        "base": display_base,
+        "status": "PASS",
+        "reasons": [],
+        "a_root": "",
+        "v_root": "",
+        "span_a": None,
+        "span_v": None,
+        "delta": None,
+        "edge": None,
+    }
     endpoints = {}
-    display_bases = {}
+    for side in ("a", "v"):
+        endpoint, fail_reason, duplicate_roots = _snap_check_exact_id_side_endpoint(state, side)
+        endpoints[side] = endpoint
+        if duplicate_roots:
+            result["reasons"].append(
+                f"Duplicate logical snap pair '.sp_{display_base}_{side.upper()}_0/1' "
+                f"exists in multiple roots: {', '.join(duplicate_roots)}"
+            )
+        elif fail_reason:
+            result["reasons"].append(f"{side.upper()} pair is incomplete: {fail_reason}")
 
-    for info in inventory:
-        records = info["records"]
-        bases = sorted({base for base, _side, _index in records})
-        for base in bases:
-            for side in ("a", "v"):
-                points, memory = _snap_check_pair_from_records(records, base, side)
-                if points is None:
-                    continue
-                key = (base, side)
-                endpoints.setdefault(key, []).append({
-                    "info": info,
-                    "points": points,
-                    "memory": memory,
-                })
-                entries = records.get((base, side, 0), ())
-                if entries:
-                    display_bases.setdefault(base, entries[0]["base"])
+    if result["reasons"]:
+        result["status"] = "FAIL"
+        return result
 
-    for (base, side), matches in sorted(endpoints.items()):
-        if len(matches) <= 1:
-            continue
-        roots = ", ".join(match["info"]["root"].name for match in matches)
-        errors.append(
-            f"Duplicate logical snap pair '.sp_{display_bases.get(base, base)}_{side.upper()}_0/1' "
-            f"exists in multiple roots: {roots}"
+    endpoint_a = endpoints["a"]
+    endpoint_v = endpoints["v"]
+    if endpoint_a is None and endpoint_v is None:
+        result["status"] = "FAIL"
+        result["reasons"].append("no A_0/A_1 or V_0/V_1 snap points found")
+        return result
+
+    if endpoint_a is None or endpoint_v is None:
+        result["status"] = "WARN"
+        if endpoint_a is not None:
+            result["a_root"] = getattr(endpoint_a["info"].get("root"), "name", "")
+            result["span_a"] = (endpoint_a["points"][1] - endpoint_a["points"][0]).length
+            result["reasons"].append(
+                "unmatched snap connector: A_0/A_1 is present, V_0/V_1 is not present in this scene"
+            )
+        else:
+            result["v_root"] = getattr(endpoint_v["info"].get("root"), "name", "")
+            result["span_v"] = (endpoint_v["points"][1] - endpoint_v["points"][0]).length
+            result["reasons"].append(
+                "unmatched snap connector: V_0/V_1 is present, A_0/A_1 is not present in this scene"
+            )
+        return result
+
+    root_a = endpoint_a["info"].get("root")
+    root_v = endpoint_v["info"].get("root")
+    result["a_root"] = getattr(root_a, "name", "")
+    result["v_root"] = getattr(root_v, "name", "")
+    span_a = (endpoint_a["points"][1] - endpoint_a["points"][0]).length
+    span_v = (endpoint_v["points"][1] - endpoint_v["points"][0]).length
+    result["span_a"] = span_a
+    result["span_v"] = span_v
+    result["delta"] = abs(span_a - span_v)
+    tolerance = _snap_pair_distance_tolerance(span_a, span_v)
+
+    if root_a == root_v:
+        result["status"] = "FAIL"
+        result["reasons"].append(
+            f"A_0/A_1 and V_0/V_1 are in the same P3D root '{result['a_root']}'"
         )
+        return result
+    if span_a <= tolerance:
+        result["status"] = "FAIL"
+        result["reasons"].append(
+            f"A pair has coincident _0/_1 points (length {span_a:.6f}); pair length must be non-zero"
+        )
+        return result
+    if span_v <= tolerance:
+        result["status"] = "FAIL"
+        result["reasons"].append(
+            f"V pair has coincident _0/_1 points (length {span_v:.6f}); pair length must be non-zero"
+        )
+        return result
+    if abs(span_a - span_v) > tolerance:
+        result["status"] = "FAIL"
+        result["reasons"].append(
+            f"A/V distances differ: A={span_a:.6f}, V={span_v:.6f}, delta={result['delta']:.6f}"
+        )
+        return result
 
-    all_bases = sorted({base for base, _side in endpoints})
+    result["edge"] = {
+        "base": display_base,
+        "base_key": state.get("key") or display_base.lower(),
+        "span": span_a,
+        "a": endpoint_a,
+        "v": endpoint_v,
+    }
+    return result
+
+
+def _snap_check_build_local_pairs(inventory, errors):
+    """Validate every exact snap ID locally and return A-root -> V-root pair edges."""
+    id_entries = {}
+    for info in inventory:
+        records = info.get("records") or {}
+        for (base, side, index), entries in records.items():
+            key = str(base or "").lower()
+            state = id_entries.setdefault(key, {"key": key, "display": None, "points": {}})
+            for record in entries:
+                if state["display"] is None:
+                    state["display"] = str(record.get("base") or base)
+                state["points"].setdefault(str(side or "").lower(), {}).setdefault(
+                    int(index), []
+                ).append((info, record))
+
+    results = []
     edges = []
-    for base in all_bases:
-        matches_a = endpoints.get((base, "a"), ())
-        matches_v = endpoints.get((base, "v"), ())
-        display_base = display_bases.get(base, base)
-        if len(matches_a) != 1:
-            if not matches_a:
-                warnings.append(
-                    f"Unmatched snap connector '{display_base}': A_0/A_1 is not present in this scene"
-                )
-            continue
-        if len(matches_v) != 1:
-            if not matches_v:
-                warnings.append(
-                    f"Unmatched snap connector '{display_base}': V_0/V_1 is not present in this scene"
-                )
-            continue
+    failed_ids = 0
+    for key in sorted(id_entries):
+        state = id_entries[key]
+        result = _snap_check_evaluate_exact_id(state["display"] or key, state)
+        results.append(result)
+        if result["status"] == "PASS" and result.get("edge") is not None:
+            edges.append(result["edge"])
+        elif result["status"] == "FAIL":
+            failed_ids += 1
 
-        endpoint_a = matches_a[0]
-        endpoint_v = matches_v[0]
-        if endpoint_a["info"]["root"] == endpoint_v["info"]["root"]:
-            errors.append(f"Magnet ID '{display_base}' has A and V in the same P3D root")
-            continue
-
-        sequence = _snap_check_base_sequence(display_base)
-        if sequence is None:
-            errors.append(
-                f"Magnet base '{display_base}' has no numeric ID; expected a name ending in 01, 02, 03..."
-            )
-            continue
-
-        span_a = (endpoint_a["points"][1] - endpoint_a["points"][0]).length
-        span_v = (endpoint_v["points"][1] - endpoint_v["points"][0]).length
-        tolerance = _snap_pair_distance_tolerance(span_a, span_v)
-        if abs(span_a - span_v) > tolerance:
-            errors.append(
-                f"A/V pair '{display_base}' has different _0/_1 distances: "
-                f"A={span_a:.6f}, V={span_v:.6f}"
-            )
-            continue
-
-        chain_key, numeric_id, width = sequence
-        edges.append({
-            "base": display_base,
-            "base_key": base,
-            "chain_key": chain_key,
-            "id": numeric_id,
-            "id_width": width,
-            "span": span_a,
-            "a": endpoint_a,
-            "v": endpoint_v,
-        })
-
-    chains = {}
-    for edge in edges:
-        chains.setdefault(edge["chain_key"], []).append(edge)
-
-    root_roles = {}
-    ordered_chains = []
-    for chain_key, chain_edges in sorted(chains.items(), key=lambda item: item[0]):
-        chain_edges.sort(key=lambda edge: (edge["id"], edge["base"].lower()))
-        ids = {}
-        for edge in chain_edges:
-            ids.setdefault(edge["id"], []).append(edge["base"])
-        for numeric_id, bases in sorted(ids.items()):
-            if len(bases) > 1:
-                errors.append(
-                    f"Duplicate numeric magnet ID {numeric_id} in one chain: {', '.join(sorted(bases))}"
-                )
-
-        if not chain_edges:
-            continue
-        expected_id = 1
-        for edge in chain_edges:
-            if edge["id"] != expected_id:
-                errors.append(
-                    f"Non-contiguous magnet IDs in chain '{edge['base']}': expected {expected_id:02d}, "
-                    f"found {edge['id']:0{max(2, edge['id_width'])}d}"
-                )
-                expected_id = edge["id"] + 1
-            else:
-                expected_id += 1
-
-        reference_span = chain_edges[0]["span"]
-        for edge in chain_edges[1:]:
-            tolerance = _snap_pair_distance_tolerance(reference_span, edge["span"])
-            if abs(reference_span - edge["span"]) > tolerance:
-                errors.append(
-                    f"Magnet ID '{edge['base']}' has distance {edge['span']:.6f}, but this chain "
-                    f"starts with {reference_span:.6f}; all _0/_1 distances must match"
-                )
-        expected_a = chain_edges[0]["a"]["info"]["root"]
-        visited = {expected_a.as_pointer()}
-        for edge_index, edge in enumerate(chain_edges):
-            root_a = edge["a"]["info"]["root"]
-            root_v = edge["v"]["info"]["root"]
-            if root_a != expected_a:
-                errors.append(
-                    f"Broken chain at ID '{edge['base']}': A is in '{root_a.name}', "
-                    f"but the previous V ends in '{expected_a.name}'"
-                )
-            if root_v.as_pointer() in visited:
-                errors.append(f"Cycle or repeated model detected at ID '{edge['base']}': '{root_v.name}'")
-            visited.add(root_v.as_pointer())
-            expected_a = root_v
-
-            a_roles = root_roles.setdefault(
-                root_a.as_pointer(),
-                {"a": [], "v": [], "chains": set(), "root": root_a},
-            )
-            v_roles = root_roles.setdefault(
-                root_v.as_pointer(),
-                {"a": [], "v": [], "chains": set(), "root": root_v},
-            )
-            a_roles["a"].append(edge["base"])
-            v_roles["v"].append(edge["base"])
-            a_roles["chains"].add(chain_key)
-            v_roles["chains"].add(chain_key)
-
-        ordered_chains.append(chain_edges)
-
-    for role in root_roles.values():
-        if len(role["a"]) > 1:
-            errors.append(
-                f"Root '{role['root'].name}' is A for multiple IDs: {', '.join(role['a'])}"
-            )
-        if len(role["v"]) > 1:
-            errors.append(
-                f"Root '{role['root'].name}' is V for multiple IDs: {', '.join(role['v'])}"
-            )
-        if len(role["chains"]) > 1:
-            chain_names = sorted(
-                f"{prefix}{axis}" for prefix, axis in role["chains"]
-            )
-            errors.append(
-                f"Root '{role['root'].name}' participates in different snap chains: "
-                f"{', '.join(chain_names)}"
-            )
-
+    if failed_ids:
+        errors.append(
+            f"Exact snap ID validation failed for {failed_ids} ID(s); see per-ID log"
+        )
     if not edges:
         errors.append("No complete matching A/V magnet IDs found")
-    return ordered_chains
 
-
+    edges.sort(key=lambda edge: (edge.get("base", "") or "").lower())
+    return results, edges
 def _snap_check_virtual_pair(endpoint, planned_deltas):
     """Map fixed Memory points into the visual root's current/planned space."""
     info = endpoint["info"]
@@ -3207,81 +3178,545 @@ def _snap_check_virtual_pair(endpoint, planned_deltas):
     return [memory_to_visual @ point for point in endpoint["points"]]
 
 
-def _snap_check_plan_automatic_assembly(chains):
-    """Calculate the whole assembly before changing any Blender object."""
-    planned_deltas = {}
+def _snap_check_matrix_is_identity(matrix, tolerance=5e-5):
+    for row in range(4):
+        for col in range(4):
+            expected = 1.0 if row == col else 0.0
+            if abs(float(matrix[row][col]) - expected) > tolerance:
+                return False
+    return True
+
+
+def _snap_check_matrix_applied(actual, expected, tolerance=1e-4):
+    for row in range(4):
+        for col in range(4):
+            if abs(float(actual[row][col]) - float(expected[row][col])) > tolerance:
+                return False
+    return True
+
+
+def _snap_check_plan_automatic_assembly(edges):
+    """Solve the whole rigid assembly before changing any Blender object.
+
+    Every validated exact ID is an undirected rigid constraint between its A and
+    V roots. Each weakly connected constraint component is solved exactly once
+    from a single fixed anchor root, so every root receives exactly one solved
+    rigid transform. A root referenced by several IDs is therefore never moved
+    twice by a later constraint, which used to silently break an ID that had
+    already been aligned.
+    """
+    edge_solutions = []
     endpoint_errors = []
+    for edge in edges:
+        points_a = _snap_check_virtual_pair(edge["a"], {})
+        points_v = _snap_check_virtual_pair(edge["v"], {})
+        snap_transform, endpoint_error = _snap_check_alignment_transform(points_a, points_v)
+        endpoint_errors.append(endpoint_error)
+        edge_solutions.append((edge, snap_transform))
+
+    adjacency = {}
+    target_ptrs = set()
+    seen_roots = {}
+    for index, (edge, _snap_transform) in enumerate(edge_solutions):
+        a_root = edge["a"]["info"]["root"]
+        v_root = edge["v"]["info"]["root"]
+        a_ptr = a_root.as_pointer()
+        v_ptr = v_root.as_pointer()
+        target_ptrs.add(v_ptr)
+        seen_roots.setdefault(a_ptr, a_root)
+        seen_roots.setdefault(v_ptr, v_root)
+        adjacency.setdefault(a_ptr, []).append((v_ptr, index, False))
+        adjacency.setdefault(v_ptr, []).append((a_ptr, index, True))
+
+    def root_sort_key(ptr):
+        root = seen_roots.get(ptr)
+        return ((getattr(root, "name", "") or "").lower(), ptr)
+
+    planned_deltas = {}
     ordered_edges = []
 
-    for chain in chains:
-        for edge in chain:
-            points_a = _snap_check_virtual_pair(edge["a"], planned_deltas)
-            points_v = _snap_check_virtual_pair(edge["v"], planned_deltas)
-            snap_transform, endpoint_error = _snap_check_alignment_transform(points_a, points_v)
-            root_v_ptr = edge["v"]["info"]["root"].as_pointer()
-            current_delta = planned_deltas.get(root_v_ptr, Matrix.Identity(4))
-            planned_deltas[root_v_ptr] = snap_transform @ current_delta
-            endpoint_errors.append(endpoint_error)
-            ordered_edges.append(edge)
+    def expand_from(seed_ptr):
+        queue = [seed_ptr]
+        while queue:
+            current_ptr = queue.pop(0)
+            current_delta = planned_deltas[current_ptr]
+            for other_ptr, edge_index, backward in adjacency.get(current_ptr, ()):
+                if other_ptr in planned_deltas:
+                    continue
+                edge, snap_transform = edge_solutions[edge_index]
+                if backward:
+                    child_delta = current_delta @ snap_transform.inverted_safe()
+                else:
+                    child_delta = current_delta @ snap_transform
+                planned_deltas[other_ptr] = child_delta
+                ordered_edges.append(edge)
+                queue.append(other_ptr)
 
-    return planned_deltas, ordered_edges, max(endpoint_errors, default=0.0)
+    # A connected constraint component can only keep ONE root fixed: pinning
+    # two roots of the same component over-constrains the loop and silently
+    # breaks an already aligned exact ID. Prefer a root which is never a V
+    # target (its own connectors point outwards), otherwise pin the first root
+    # of the component so every participating root still gets a solved delta.
+    components = []
+    unvisited = set(seen_roots)
+    while unvisited:
+        start_ptr = min(unvisited, key=root_sort_key)
+        component = []
+        stack = [start_ptr]
+        unvisited.discard(start_ptr)
+        while stack:
+            current_ptr = stack.pop()
+            component.append(current_ptr)
+            for other_ptr, _edge_index, _backward in adjacency.get(current_ptr, ()):
+                if other_ptr in unvisited:
+                    unvisited.discard(other_ptr)
+                    stack.append(other_ptr)
+        components.append(component)
+
+    anchor_ptrs = []
+    for component in sorted(components, key=lambda item: root_sort_key(min(item, key=root_sort_key))):
+        anchors = sorted((ptr for ptr in component if ptr not in target_ptrs), key=root_sort_key)
+        anchor_ptr = anchors[0] if anchors else min(component, key=root_sort_key)
+        planned_deltas[anchor_ptr] = Matrix.Identity(4)
+        anchor_ptrs.append(anchor_ptr)
+        expand_from(anchor_ptr)
+
+    verification_errors = []
+    for edge, _snap_transform in edge_solutions:
+        points_a = _snap_check_virtual_pair(edge["a"], planned_deltas)
+        points_v = _snap_check_virtual_pair(edge["v"], planned_deltas)
+        residual = max(
+            (points_v[0] - points_a[0]).length,
+            (points_v[1] - points_a[1]).length,
+        )
+        endpoint_errors.append(residual)
+        tolerance = _snap_pair_distance_tolerance(
+            (points_a[1] - points_a[0]).length,
+            (points_v[1] - points_v[0]).length,
+        )
+        if residual > tolerance:
+            verification_errors.append(
+                f"Solved assembly cannot satisfy '.sp_{edge['base']}' "
+                f"(A={getattr(edge['a']['info']['root'], 'name', '<root>')}, "
+                f"V={getattr(edge['v']['info']['root'], 'name', '<root>')}): "
+                f"residual={residual:.6f} > tolerance={tolerance:.6f}"
+            )
+    if verification_errors:
+        raise RuntimeError("; ".join(verification_errors))
+
+    return planned_deltas, ordered_edges, max(endpoint_errors, default=0.0), anchor_ptrs
+
+
+def _assembly_visual_transform_targets(info):
+    """Resolve every visual object which needs an explicit solved transform.
+
+    Resolution LOD roots carry their whole hierarchy through the parent link, so
+    only top-level LOD objects are returned. Proxy preview objects which are not
+    parented anywhere inside a P3D LOD subtree are added explicitly: they
+    receive the same solved rigid transform exactly once, and their own children
+    keep inheriting it from them. Proxies parented to a technical LOD (Memory,
+    Geometry, View Geometry, Fire Geometry, Roadway) stay with that LOD and are
+    never moved by the visual solve.
+    """
+    from .nh_textures import (_collect_collection_objects_recursive)
+    from .nh_assets import (_is_p3d_proxy_object)
+
+    targets = list(info.get("visuals") or ())
+    target_ptrs = {obj.as_pointer() for obj in targets}
+    inherited_ptrs = set()
+    for obj in targets:
+        for descendant in _iter_object_tree(obj):
+            inherited_ptrs.add(descendant.as_pointer())
+
+    proxy_candidates = []
+    lod_root_ptrs = set()
+    root_collection = info.get("root")
+    if root_collection is not None:
+        for obj in _collect_collection_objects_recursive(root_collection):
+            ptr = obj.as_pointer()
+            if _assembly_lod_root_info(obj) is not None:
+                lod_root_ptrs.add(ptr)
+            if ptr in target_ptrs or ptr in inherited_ptrs:
+                continue
+            if _is_p3d_proxy_object(obj):
+                proxy_candidates.append(obj)
+    candidate_ptrs = {obj.as_pointer() for obj in proxy_candidates}
+    for obj in proxy_candidates:
+        parent = getattr(obj, "parent", None)
+        nested = False
+        while parent is not None:
+            parent_ptr = parent.as_pointer()
+            if parent_ptr in lod_root_ptrs or parent_ptr in candidate_ptrs:
+                nested = True
+                break
+            parent = getattr(parent, "parent", None)
+        if nested:
+            continue
+        targets.append(obj)
+        for descendant in _iter_object_tree(obj):
+            inherited_ptrs.add(descendant.as_pointer())
+    return targets
 
 
 def _snap_check_apply_automatic_assembly(context, inventory, planned_deltas):
     from .nh_textures import (_set_object_world_matrix_stable)
+    from .nh_assets import (_is_p3d_proxy_object)
 
     by_pointer = {info["root"].as_pointer(): info for info in inventory}
-    moved_roots = 0
-    moved_lods = 0
-    changes = []
+    records = []
     for root_ptr, delta in planned_deltas.items():
         info = by_pointer.get(root_ptr)
         if info is None:
             continue
-        for obj in info["visuals"]:
-            original = obj.matrix_world.copy()
-            changes.append((obj, original, delta @ original))
+        visual_ptrs = {obj.as_pointer() for obj in (info.get("visuals") or ())}
+        targets = []
+        for obj in _assembly_visual_transform_targets(info):
+            members = []
+            for member in _iter_object_tree(obj):
+                members.append((
+                    member,
+                    member.matrix_world.copy(),
+                    _is_p3d_proxy_object(member),
+                ))
+            targets.append({
+                "object": obj,
+                "is_proxy": obj.as_pointer() not in visual_ptrs,
+                "members": members,
+            })
+        records.append({
+            "root": info["root"],
+            "delta": delta.copy(),
+            "targets": targets,
+        })
 
+    changes = []
     try:
-        for obj, _original, desired in changes:
-            if not _set_object_world_matrix_stable(obj, desired):
-                raise RuntimeError(f"Could not move visual LOD '{obj.name}'")
-            moved_lods += 1
-        moved_roots = len(planned_deltas)
+        for record in records:
+            delta = record["delta"]
+            if _snap_check_matrix_is_identity(delta):
+                continue
+            for target in record["targets"]:
+                for obj, original, _is_proxy in target["members"]:
+                    if obj is not target["object"]:
+                        continue
+                    if not _set_object_world_matrix_stable(obj, delta @ original):
+                        raise RuntimeError(f"Could not move visual LOD '{obj.name}'")
+                    changes.append((obj, original))
         context.view_layer.update()
+
+        audit_records = []
+        audit_errors = []
+        moved_roots = 0
+        moved_lods = 0
+        for record in records:
+            delta = record["delta"]
+            delta_is_identity = _snap_check_matrix_is_identity(delta)
+            if not delta_is_identity:
+                moved_roots += 1
+            visual_lines = []
+            proxy_count = 0
+            object_count = 0
+            for target in record["targets"]:
+                target_applied = True
+                for obj, original, is_proxy in target["members"]:
+                    object_count += 1
+                    if is_proxy:
+                        proxy_count += 1
+                    if not _snap_check_matrix_applied(obj.matrix_world, delta @ original):
+                        target_applied = False
+                        audit_errors.append(
+                            f"{getattr(record['root'], 'name', '<root>')}/"
+                            f"{getattr(obj, 'name', '<object>')}"
+                        )
+                if not target["is_proxy"]:
+                    if not delta_is_identity:
+                        moved_lods += 1
+                    visual_lines.append({
+                        "name": getattr(target["object"], "name", "<unnamed>"),
+                        "applied": target_applied,
+                    })
+            audit_records.append({
+                "root": record["root"],
+                "delta": delta,
+                "visual_lines": visual_lines,
+                "proxy_count": proxy_count,
+                "object_count": object_count,
+            })
+        if audit_errors:
+            raise RuntimeError(
+                "solved root has visual objects that were not transformed: "
+                + ", ".join(audit_errors)
+            )
     except Exception:
-        for obj, original, _desired in changes:
+        for obj, original in changes:
             _set_object_world_matrix_stable(obj, original)
         context.view_layer.update()
         raise
-    return moved_roots, moved_lods
+    return moved_roots, moved_lods, audit_records
+
+
+def _snap_check_assembly_root_diagnostics(inventory, planned_deltas, audit_records, anchor_ptrs=None):
+    anchor_set = set(anchor_ptrs or ())
+    audit_by_ptr = {
+        record["root"].as_pointer(): record for record in (audit_records or ())
+    }
+    diagnostics = []
+    for info in inventory:
+        root = info.get("root")
+        root_ptr = root.as_pointer() if root is not None else None
+        delta = planned_deltas.get(root_ptr)
+        audit = audit_by_ptr.get(root_ptr)
+        entry = {
+            "root": root,
+            "name": getattr(root, "name", "<unnamed root>"),
+            "visual_lods": len(info.get("visuals") or ()),
+            "transformed_objects": int((audit or {}).get("object_count", 0)),
+        }
+        if root_ptr in anchor_set:
+            entry["status"] = "ANCHOR"
+            entry["translation"] = (0.0, 0.0, 0.0)
+            entry["rotation"] = (1.0, 0.0, 0.0, 0.0)
+            entry["reason"] = "pinned anchor; solved component around its current position"
+        elif delta is not None:
+            location, rotation, _scale = delta.decompose()
+            entry["status"] = (
+                "IDENTITY" if _snap_check_matrix_is_identity(delta) else "MOVED"
+            )
+            entry["translation"] = tuple(float(value) for value in location)
+            entry["rotation"] = tuple(float(value) for value in rotation)
+            entry["reason"] = ""
+        else:
+            entry["status"] = "SKIPPED"
+            entry["translation"] = (0.0, 0.0, 0.0)
+            entry["rotation"] = (1.0, 0.0, 0.0, 0.0)
+            entry["reason"] = "no complete exact A/V snap ID touches this root"
+        diagnostics.append(entry)
+    return diagnostics
+
+
+_ASSEMBLY_LOD_NAME_TOKENS = {
+    "memory": "9",
+    "geometry physx": "8",
+    "geometry": "6",
+    "view geometry": "14",
+    "fire geometry": "15",
+    "roadway": "11",
+    "land contact": "10",
+    "paths": "12",
+    "hit-points": "13",
+    "hitpoints": "13",
+    "view - pilot": "2",
+    "view - gunner": "1",
+    "view - cargo": "3",
+    "view - commander": "18",
+    "shadow volume": "4",
+    "edit": "5",
+    "sub parts": "25",
+    "wreckage": "29",
+    "underground (vbs)": "30",
+    "groundlayer (vbs)": "31",
+    "navigation (vbs)": "32",
+}
+
+_ASSEMBLY_LOD_HIDE_ORDER = {
+    "9": 1,
+    "6": 2,
+    "15": 3,
+    "14": 4,
+    "11": 5,
+}
+
+
+def _assembly_lod_root_info(obj):
+    """Resolve an object as a P3D LOD root: LOD property first, name only as fallback."""
+    from .nh_textures import (_strip_blender_numeric_suffix)
+    if obj is None or getattr(obj, "type", None) != "MESH":
+        return None
+
+    props = getattr(obj, "a3ob_properties_object", None)
+    if props is not None:
+        try:
+            if bool(getattr(props, "is_a3_lod", False)):
+                token = str(getattr(props, "lod", "") or "").strip()
+                try:
+                    resolution = int(getattr(props, "resolution", 0) or 0)
+                except Exception:
+                    resolution = 0
+                try:
+                    label = str(props.get_name())
+                except Exception:
+                    label = ""
+                if not label:
+                    label = f"{_collider_lod_name(token)} {resolution}".strip()
+                return {
+                    "token": token,
+                    "resolution": resolution,
+                    "label": label,
+                    "visual0": _is_resolution0_visual_lod_object(obj),
+                }
+        except Exception:
+            return None
+
+    logical = _strip_blender_numeric_suffix(getattr(obj, "name", "") or "").strip()
+    lowered = logical.lower()
+    if lowered.startswith("resolution"):
+        rest = logical[len("resolution"):].strip()
+        try:
+            resolution = int(rest) if rest else 0
+        except Exception:
+            resolution = 0
+        return {
+            "token": "0",
+            "resolution": resolution,
+            "label": f"Resolution {resolution}",
+            "visual0": resolution == 0,
+        }
+
+    token = _ASSEMBLY_LOD_NAME_TOKENS.get(lowered, "")
+    if token:
+        return {
+            "token": token,
+            "resolution": 0,
+            "label": _collider_lod_name(token),
+            "visual0": False,
+        }
+    return None
+
+
+def _assembly_lod_visibility_groups(root_collection):
+    from .nh_textures import (_collect_collection_objects_recursive)
+    candidates = []
+    lod_ptrs = set()
+    for obj in _collect_collection_objects_recursive(root_collection):
+        info = _assembly_lod_root_info(obj)
+        if info is None:
+            continue
+        candidates.append((obj, info))
+        try:
+            lod_ptrs.add(obj.as_pointer())
+        except Exception:
+            lod_ptrs.add(id(obj))
+
+    groups = []
+    for obj, info in candidates:
+        parent = getattr(obj, "parent", None)
+        nested = False
+        while parent is not None:
+            try:
+                parent_ptr = parent.as_pointer()
+            except Exception:
+                parent_ptr = id(parent)
+            if parent_ptr in lod_ptrs:
+                nested = True
+                break
+            parent = getattr(parent, "parent", None)
+        if nested:
+            continue
+        groups.append({"root": obj, "info": info, "objects": list(_iter_object_tree(obj))})
+    return groups
+
+
+def _assembly_lod_group_sort_key(group):
+    info = group.get("info") or {}
+    token = str(info.get("token", ""))
+    if token == "0":
+        try:
+            return (0, int(info.get("resolution", 0) or 0), "")
+        except Exception:
+            return (0, 0, "")
+    if token in _ASSEMBLY_LOD_HIDE_ORDER:
+        return (1, _ASSEMBLY_LOD_HIDE_ORDER[token], "")
+    try:
+        return (2, int(token), "")
+    except Exception:
+        return (3, 0, str(info.get("label", "")))
+
+
+def _apply_assembly_lod_visibility(context, inventory):
+    """Show only visual Resolution 0 for each assembled P3D root, hide every other LOD."""
+    print("=== Assembly LOD Visibility ===")
+    updated_roots = 0
+    missing_resolution0 = []
+
+    for info in inventory or []:
+        root_collection = info.get("root")
+        root_label = getattr(root_collection, "name", "<unnamed root>")
+        try:
+            groups = _assembly_lod_visibility_groups(root_collection)
+        except Exception as e:
+            missing_resolution0.append(root_label)
+            print(f"WARNING: root '{root_label}': LOD visibility scan failed: {e}")
+            continue
+
+        visible_groups = [group for group in groups if bool(group["info"].get("visual0"))]
+        if not visible_groups:
+            missing_resolution0.append(root_label)
+            print(f"WARNING: root '{root_label}': Resolution 0 not found; LOD visibility unchanged")
+            continue
+
+        hidden_groups = [group for group in groups if not bool(group["info"].get("visual0"))]
+        for group in groups:
+            visible = bool(group["info"].get("visual0"))
+            for obj in group["objects"]:
+                _set_object_view_visible(obj, visible)
+
+        visible_labels = []
+        for group in sorted(visible_groups, key=_assembly_lod_group_sort_key):
+            label = str(group["info"].get("label") or getattr(group["root"], "name", ""))
+            if label not in visible_labels:
+                visible_labels.append(label)
+        hidden_labels = []
+        for group in sorted(hidden_groups, key=_assembly_lod_group_sort_key):
+            label = str(group["info"].get("label") or getattr(group["root"], "name", ""))
+            if label not in hidden_labels:
+                hidden_labels.append(label)
+
+        print(f"root: {root_label}")
+        print(f"visible: {', '.join(visible_labels)}")
+        print(f"hidden: {', '.join(hidden_labels) if hidden_labels else '<none>'}")
+        updated_roots += 1
+
+    try:
+        context.view_layer.update()
+    except Exception:
+        pass
+    _tag_redraw_all_areas(context)
+    return updated_roots, missing_resolution0
 
 
 def _print_automatic_snap_check_report(
     inventory,
-    chains,
+    pair_results,
     errors,
     warnings,
     assembly=None,
-    repair_notes=None,
-    repaired_selection_count=0,
 ):
     print("=== NH Automatic Snap Magnet Check ===")
     print(f"Participating P3D roots (.sp_ found): {len(inventory)}")
-    pair_count = sum(len(chain) for chain in chains)
-    print(f"Complete ordered A/V IDs: {pair_count}")
-    for chain_index, chain in enumerate(chains, 1):
-        if not chain:
-            continue
-        root_names = [chain[0]["a"]["info"]["root"].name]
-        root_names.extend(edge["v"]["info"]["root"].name for edge in chain)
-        ids = " -> ".join(edge["base"] for edge in chain)
-        print(f"CHAIN {chain_index}: {ids}")
-        print(f"  ROOTS: {' -> '.join(root_names)}")
-    if repair_notes:
-        print(f"AUTOMATIC ID REPAIR ({repaired_selection_count} selection name(s)):")
-        for note in repair_notes:
-            print(f" - {note}")
+    pass_count = sum(1 for rec in pair_results if rec.get("status") == "PASS")
+    fail_count = sum(1 for rec in pair_results if rec.get("status") == "FAIL")
+    warn_count = sum(1 for rec in pair_results if rec.get("status") == "WARN")
+    print(
+        f"Exact snap IDs: {len(pair_results)} "
+        f"(PASS {pass_count}, FAIL {fail_count}, WARN {warn_count})"
+    )
+    for rec in pair_results:
+        base_name = rec.get("base", "<unknown>")
+        status = rec.get("status")
+        if status == "PASS":
+            print(
+                f"PASS .sp_{base_name}: A-root={rec.get('a_root', '')}, "
+                f"V-root={rec.get('v_root', '')}, "
+                f"A_len={float(rec.get('span_a', 0.0) or 0.0):.6f}, "
+                f"V_len={float(rec.get('span_v', 0.0) or 0.0):.6f}, "
+                f"delta={float(rec.get('delta', 0.0) or 0.0):.6f}"
+            )
+        elif status == "FAIL":
+            for reason in rec.get("reasons") or ("invalid snap pair",):
+                print(f"FAIL .sp_{base_name}: {reason}")
+        else:
+            for reason in rec.get("reasons") or ("unmatched snap connector",):
+                print(f"WARN .sp_{base_name}: {reason}")
     if errors:
         print(f"ERRORS ({len(errors)}):")
         for issue in errors:
@@ -3291,13 +3726,57 @@ def _print_automatic_snap_check_report(
         for issue in warnings:
             print(f" - {issue}")
     if assembly is not None:
-        moved_roots, moved_lods, endpoint_error = assembly
+        if isinstance(assembly, dict):
+            moved_roots = int(assembly.get("moved_roots", 0) or 0)
+            moved_lods = int(assembly.get("moved_lods", 0) or 0)
+            endpoint_error = float(assembly.get("endpoint_error", 0.0) or 0.0)
+            diagnostics = assembly.get("diagnostics") or []
+            audit_records = assembly.get("audit") or []
+        else:
+            moved_roots, moved_lods, endpoint_error = assembly
+            diagnostics = []
+            audit_records = []
         print(
             f"ASSEMBLED: {moved_roots} model root(s), {moved_lods} visual Resolution LOD(s); "
             f"Memory/Geometry unchanged; endpoint error={endpoint_error:.8f}"
         )
+        if diagnostics:
+            print("=== Assembly Solve Diagnostics ===")
+            for entry in diagnostics:
+                translation = entry.get("translation") or (0.0, 0.0, 0.0)
+                rotation = entry.get("rotation") or (1.0, 0.0, 0.0, 0.0)
+                print(f"root={entry.get('name', '<unnamed root>')}")
+                print(f"status={entry.get('status', 'UNKNOWN')}")
+                print(
+                    f"translation=({translation[0]:.6f},{translation[1]:.6f},{translation[2]:.6f})"
+                )
+                print(
+                    f"rotation=({rotation[0]:.6f},{rotation[1]:.6f},"
+                    f"{rotation[2]:.6f},{rotation[3]:.6f})"
+                )
+                print(f"visual_lods={int(entry.get('visual_lods', 0) or 0)}")
+                print(f"transformed_objects={int(entry.get('transformed_objects', 0) or 0)}")
+                reason = str(entry.get("reason") or "")
+                if reason:
+                    print(f"reason={reason}")
+        if audit_records:
+            print("=== Assembly Transform Audit ===")
+            for record in audit_records:
+                location, rotation, _scale = record["delta"].decompose()
+                print(f"root: {getattr(record.get('root'), 'name', '<unnamed root>')}")
+                print(
+                    f"solved transform: translation=({location.x:.6f},{location.y:.6f},"
+                    f"{location.z:.6f}) rotation=({rotation.w:.6f},{rotation.x:.6f},"
+                    f"{rotation.y:.6f},{rotation.z:.6f})"
+                )
+                for line in record.get("visual_lines") or ():
+                    status = "APPLIED" if line.get("applied") else "NOT TRANSFORMED"
+                    print(f"{line.get('name', '<unnamed>')}: {status}")
+                proxy_count = int(record.get("proxy_count", 0) or 0)
+                if proxy_count:
+                    print(f"proxy children: APPLIED ({proxy_count})")
     elif not errors:
-        print("OK: automatic snap chains are valid")
+        print("OK: automatic snap pairs are valid")
     print("=== End NH Automatic Snap Magnet Check ===")
 
 class _SnapPointPairBuilder:
@@ -3724,6 +4203,158 @@ def _iter_p3d_root_collections(scene):
     return roots
 
 
+_P3D_LOD_REINDEX_KNOWN_NAMES = None
+_P3D_LOD_REINDEX_SCENE_PTR = None
+_P3D_LOD_REINDEX_LAST_COUNT = -1
+
+
+def _is_resolution_lod_object(obj) -> bool:
+    if not _is_p3d_resolution_lod_object(obj):
+        return False
+    proxy = getattr(obj, "a3ob_properties_object_proxy", None)
+    if proxy is not None and bool(getattr(proxy, "is_a3_proxy", False)):
+        return False
+    return True
+
+
+def _resolution_lod_index(obj):
+    props = getattr(obj, "a3ob_properties_object", None)
+    if props is None:
+        return None
+    try:
+        return int(getattr(props, "resolution", 0))
+    except Exception:
+        return None
+
+
+def _p3d_lod_reindex_scope(context, obj):
+    from .nh_textures import (_find_p3d_root_collection_for_object)
+    if context is not None:
+        root = _find_p3d_root_collection_for_object(context, obj)
+        if root is not None:
+            branch_key, _ = _actual_top_level_collection_key_under_root(root, obj)
+            return root, branch_key
+    collections = list(getattr(obj, "users_collection", []) or [])
+    fallback = collections[0] if collections else None
+    if fallback is None:
+        return None, None
+    return fallback, ""
+
+
+def _looks_like_duplicated_object_name(name: str, known_names) -> bool:
+    match = re.match(r"^(?P<base>.+)\.\d{3}$", (name or "").strip())
+    if not match:
+        return False
+    return match.group("base") in (known_names or set())
+
+
+def _build_resolution_lod_buckets(root):
+    from .nh_textures import (_collect_collection_objects_recursive)
+    buckets = {}
+    for other in _collect_collection_objects_recursive(root):
+        if not _is_resolution_lod_object(other):
+            continue
+        value = _resolution_lod_index(other)
+        if value is None:
+            continue
+        branch_key, _ = _actual_top_level_collection_key_under_root(root, other)
+        bucket = buckets.setdefault(branch_key, {})
+        bucket[value] = bucket.get(value, 0) + 1
+    return buckets
+
+
+def _resolution_lod_scope_counts(root, branch_key, cache):
+    from .nh_textures import (_collect_collection_objects_recursive)
+    if branch_key:
+        buckets = cache.get("__branches__")
+        if buckets is None:
+            buckets = _build_resolution_lod_buckets(root)
+            cache["__branches__"] = buckets
+        return buckets.get(branch_key)
+    key = ("__fallback__", id(root))
+    scope = cache.get(key)
+    if scope is None:
+        scope = {}
+        for other in _collect_collection_objects_recursive(root):
+            if not _is_resolution_lod_object(other):
+                continue
+            value = _resolution_lod_index(other)
+            if value is None:
+                continue
+            scope[value] = scope.get(value, 0) + 1
+        cache[key] = scope
+    return scope
+
+
+def _reindex_duplicated_resolution_lods(context, new_objects, known_names=None):
+    changed = 0
+    scope_cache = {}
+    for obj in new_objects:
+        if known_names is not None and not _looks_like_duplicated_object_name(obj.name, known_names):
+            continue
+        if not _is_resolution_lod_object(obj):
+            continue
+        own_index = _resolution_lod_index(obj)
+        if own_index is None:
+            continue
+        root, branch_key = _p3d_lod_reindex_scope(context, obj)
+        if root is None:
+            continue
+        scope = _resolution_lod_scope_counts(root, branch_key, scope_cache)
+        if not scope or scope.get(own_index, 0) <= 1:
+            continue
+        new_index = max(scope) + 1
+        props = getattr(obj, "a3ob_properties_object", None)
+        if props is None:
+            continue
+        try:
+            props.resolution = new_index
+        except Exception:
+            continue
+        scope[new_index] = scope.get(new_index, 0) + 1
+        scope[own_index] = max(0, scope.get(own_index, 0) - 1)
+        changed += 1
+    return changed
+
+
+@persistent
+def _p3d_lod_duplicate_reindex_handler(scene, depsgraph):
+    global _P3D_LOD_REINDEX_KNOWN_NAMES, _P3D_LOD_REINDEX_SCENE_PTR, _P3D_LOD_REINDEX_LAST_COUNT
+    try:
+        scene_ptr = scene.as_pointer() if scene is not None else 0
+        objects = bpy.data.objects
+        count = len(objects)
+        if _P3D_LOD_REINDEX_KNOWN_NAMES is None or scene_ptr != _P3D_LOD_REINDEX_SCENE_PTR:
+            _P3D_LOD_REINDEX_KNOWN_NAMES = {obj.name for obj in objects}
+            _P3D_LOD_REINDEX_SCENE_PTR = scene_ptr
+            _P3D_LOD_REINDEX_LAST_COUNT = count
+            return
+        if count == _P3D_LOD_REINDEX_LAST_COUNT:
+            return
+        known_names = _P3D_LOD_REINDEX_KNOWN_NAMES
+        new_objects = [obj for obj in objects if obj.name not in known_names]
+        _P3D_LOD_REINDEX_KNOWN_NAMES = {obj.name for obj in objects}
+        _P3D_LOD_REINDEX_LAST_COUNT = count
+        if not new_objects:
+            return
+        _reindex_duplicated_resolution_lods(bpy.context, new_objects, known_names)
+    except Exception:
+        return
+
+
+def _prime_p3d_lod_reindex_state():
+    global _P3D_LOD_REINDEX_KNOWN_NAMES, _P3D_LOD_REINDEX_SCENE_PTR, _P3D_LOD_REINDEX_LAST_COUNT
+    try:
+        scene = getattr(bpy.context, "scene", None)
+        _P3D_LOD_REINDEX_SCENE_PTR = scene.as_pointer() if scene is not None else 0
+        _P3D_LOD_REINDEX_KNOWN_NAMES = {obj.name for obj in bpy.data.objects}
+        _P3D_LOD_REINDEX_LAST_COUNT = len(bpy.data.objects)
+    except Exception:
+        _P3D_LOD_REINDEX_KNOWN_NAMES = None
+        _P3D_LOD_REINDEX_SCENE_PTR = None
+        _P3D_LOD_REINDEX_LAST_COUNT = -1
+
+
 def _is_visuals_collection_name(name: str) -> bool:
     from .nh_scatter import (_VISUALS_COLLECTION_NAME)
     from .nh_textures import (_strip_blender_numeric_suffix)
@@ -4015,8 +4646,8 @@ class CRAY_OT_ValidateAssembleSnapPoints(Operator):
     bl_idname = "cray.validate_assemble_snap_points"
     bl_label = "Check & Assemble Visual LODs"
     bl_description = (
-        "Automatically find every exact A/V snap ID in all P3D Memory LODs, validate the complete chain, "
-        "and assemble only visual Resolution LODs in numeric ID order"
+        "Automatically find every exact A/V snap ID in all P3D Memory LODs, "
+        "validate each ID locally, and assemble only visual Resolution LODs"
     )
     bl_options = {"REGISTER", "UNDO"}
 
@@ -4024,12 +4655,13 @@ class CRAY_OT_ValidateAssembleSnapPoints(Operator):
         from .nh_base import (_fmt_exc)
         from .nh_collider import (_try_restore_edit_mode)
         inventory = []
-        chains = []
+        pair_results = []
+        edges = []
         errors = []
         warnings = []
         assembly = None
-        repaired_id_changes = []
-        repair_notes = []
+        visibility_roots = 0
+        missing_resolution0 = []
         restore_edit_mode = (
             context.mode == "EDIT_MESH"
             and context.active_object is not None
@@ -4039,54 +4671,52 @@ class CRAY_OT_ValidateAssembleSnapPoints(Operator):
 
         try:
             inventory, errors, warnings = _snap_check_scene_inventory(context)
-            if not errors:
-                repaired_id_changes, repair_errors, repair_notes = (
-                    _snap_check_repair_repeated_ids_by_part_order(inventory)
-                )
-                errors.extend(repair_errors)
-                if repaired_id_changes and not errors:
-                    inventory, refreshed_errors, refreshed_warnings = _snap_check_scene_inventory(context)
-                    errors.extend(refreshed_errors)
-                    warnings.extend(refreshed_warnings)
-
-            chains = _snap_check_build_automatic_chains(inventory, errors, warnings)
+            pair_results, edges = _snap_check_build_local_pairs(inventory, errors)
 
             # Planning uses virtual snap points and performs no Blender writes. This
             # makes every diagnostic visible before any model can be moved.
             planned_deltas = {}
             endpoint_error = 0.0
+            anchor_ptrs = []
             if not errors:
-                planned_deltas, _ordered_edges, endpoint_error = _snap_check_plan_automatic_assembly(chains)
+                planned_deltas, _ordered_edges, endpoint_error, anchor_ptrs = (
+                    _snap_check_plan_automatic_assembly(edges)
+                )
 
             if not errors:
                 if context.mode != "OBJECT":
                     bpy.ops.object.mode_set(mode="OBJECT")
-                moved_roots, moved_lods = _snap_check_apply_automatic_assembly(
+                moved_roots, moved_lods, audit_records = _snap_check_apply_automatic_assembly(
                     context,
                     inventory,
                     planned_deltas,
                 )
-                assembly = (moved_roots, moved_lods, endpoint_error)
+                diagnostics = _snap_check_assembly_root_diagnostics(
+                    inventory,
+                    planned_deltas,
+                    audit_records,
+                    anchor_ptrs=anchor_ptrs,
+                )
+                assembly = {
+                    "moved_roots": moved_roots,
+                    "moved_lods": moved_lods,
+                    "endpoint_error": endpoint_error,
+                    "diagnostics": diagnostics,
+                    "audit": audit_records,
+                }
+                visibility_roots, missing_resolution0 = _apply_assembly_lod_visibility(context, inventory)
         except Exception as exc:
             errors.append(_fmt_exc(exc))
         finally:
-            if assembly is None and repaired_id_changes:
-                restored = _snap_check_restore_repaired_ids(repaired_id_changes)
-                if restored:
-                    repair_notes.append(
-                        f"Rolled back {restored} repaired selection name(s) because assembly did not complete"
-                    )
             if restore_edit_mode and active_before is not None:
                 _try_restore_edit_mode(context, active_before)
 
         _print_automatic_snap_check_report(
             inventory,
-            chains,
+            pair_results,
             errors,
             warnings,
             assembly=assembly,
-            repair_notes=repair_notes,
-            repaired_selection_count=len(repaired_id_changes),
         )
 
         if assembly is None:
@@ -4096,17 +4726,16 @@ class CRAY_OT_ValidateAssembleSnapPoints(Operator):
             )
             return {"CANCELLED"}
 
-        moved_roots, moved_lods, endpoint_error = assembly
-        repair_suffix = (
-            f", repaired {len(repaired_id_changes)} snap selection name(s)"
-            if repaired_id_changes else ""
-        )
-        if warnings:
+        moved_roots = int(assembly.get("moved_roots", 0) or 0)
+        moved_lods = int(assembly.get("moved_lods", 0) or 0)
+        endpoint_error = float(assembly.get("endpoint_error", 0.0) or 0.0)
+        if warnings or missing_resolution0:
             self.report(
                 {"WARNING"},
                 (
-                    f"Assembled {moved_roots} model(s), {moved_lods} visual LOD(s), "
-                    f"but found {len(warnings)} warning(s){repair_suffix}; "
+                    f"Assembled {moved_roots} model(s), {moved_lods} visual LOD(s); "
+                    f"LOD visibility updated for {visibility_roots} root(s); "
+                    f"{len(warnings)} snap warning(s), {len(missing_resolution0)} root(s) without Resolution 0; "
                     "see System Console"
                 ),
             )
@@ -4115,7 +4744,8 @@ class CRAY_OT_ValidateAssembleSnapPoints(Operator):
                 {"INFO"},
                 (
                     f"Automatic snap OK: assembled {moved_roots} model(s), {moved_lods} visual LOD(s), "
-                    f"endpoint error {endpoint_error:.8f}{repair_suffix}"
+                    f"LOD visibility updated for {visibility_roots} root(s), "
+                    f"endpoint error {endpoint_error:.8f}"
                 ),
             )
         return {"FINISHED"}
@@ -4290,6 +4920,7 @@ class CRAY_OT_SnapBatchProcess(Operator):
                     lod_collisions="SKIP",
                     validate_lods=False,
                     generate_components=True,
+                    recalculate_components=True,
                     renumber_components=True,
                     translate_selections=False,
                     force_lowercase=True,
