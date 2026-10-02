@@ -190,11 +190,21 @@ def restore_absolute(path, extension = ""):
 
 
 def make_relative(path, root):
+    # Engine paths are already relative and must not be rebased to Blender's
+    # current directory. Resolve junctions only for absolute filesystem paths.
+    if not os.path.isabs(path) or not os.path.splitdrive(path)[0]:
+        return path
+    if root:
+        try:
+            resolved_path = os.path.realpath(path)
+            resolved_root = os.path.realpath(root)
+            common = os.path.commonpath((resolved_path, resolved_root))
+            if os.path.normcase(common) == os.path.normcase(resolved_root):
+                return os.path.relpath(resolved_path, resolved_root)
+        except (OSError, ValueError):
+            pass
+
     path = path.lower()
-    root = root.lower()
-    
-    if root != "" and path.startswith(root):
-        return os.path.relpath(path, root)
     
     drive = os.path.splitdrive(path)[0]
     if drive:

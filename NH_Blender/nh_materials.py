@@ -4,11 +4,12 @@ import os
 from pathlib import Path
 import subprocess
 import time
+import textwrap
 import uuid
 
 import bpy
 import bmesh
-from bpy.props import EnumProperty, StringProperty, FloatProperty
+from bpy.props import EnumProperty, StringProperty, FloatProperty, IntProperty
 from bpy.types import AddonPreferences, Operator, Panel
 
 from . import nh_material_shader as shader
@@ -45,6 +46,7 @@ _batch_id = None
 _batch_status = {}
 _progress_started = False
 _index_checked_root = None
+_import_queue = {}
 
 # A library refresh reads every asset file. Batch completed thumbnails instead
 # of restarting Blender's asset scan after each individual sphere.
@@ -82,10 +84,24 @@ def catalog_id(folder):
 
 
 def atomic_json(path, value):
-    temporary = str(path) + '.tmp'
-    with open(temporary, 'w', encoding='utf8') as file:
-        json.dump(value, file, ensure_ascii=False)
-    os.replace(temporary, path)
+    # On Windows an open UI reader briefly denies renaming its JSON file.
+    # Each writer owns its temporary file; retry this transient conflict
+    # instead of failing the material or terminating a library calculation.
+    temporary = str(path) + '.%s.%s.tmp' % (os.getpid(), uuid.uuid4().hex)
+    try:
+        with open(temporary, 'w', encoding='utf8') as file:
+            json.dump(value, file, ensure_ascii=False)
+        for attempt in range(6):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                time.sleep(.01 * (2 ** attempt))
+    finally:
+        if os.path.isfile(temporary):
+            os.remove(temporary)
 
 
 def library_register():
@@ -228,6 +244,7 @@ def _preferences_changed(self, context):
     _library_pending = True
     _batch_status = {}
     _index_checked_root = None
+    _import_queue.clear()
 
 
 class NH_MATERIALS_Preferences(AddonPreferences):
@@ -319,13 +336,13 @@ def selected_entry(context, *, update_manifest=True):
     return None
 
 
-def request_previews(folder='', selected='', *, refresh=False, search='', mode='INDEX'):
+def request_previews(folder='', selected='', *, refresh=False, search='', mode='INDEX', entries=None):
     global _worker, _log, _request_key, _status, _worker_paused, _worker_request
     global _worker_mode, _batch_id, _batch_status, _progress_started, _index_checked_root
     if _refresh_pause:
         return
     root = shader.texture_root()
-    if not os.path.isdir(root):
+    if mode != 'IMPORT' and not os.path.isdir(root):
         _status = 'Textures folder not found: ' + root
         return
     cache = cache_root()
@@ -337,7 +354,8 @@ def request_previews(folder='', selected='', *, refresh=False, search='', mode='
         if _index_checked_root == root:
             return
         manifest = read_manifest()
-        if manifest.get('schema') == rvmat.SCHEMA and manifest.get('root') == root and manifest.get('asset_schema') == 2:
+        if (manifest.get('schema') == rvmat.SCHEMA and manifest.get('root') == root
+                and manifest.get('asset_schema') == 2 and manifest.get('library_indexed', True)):
             _index_checked_root = root
             return
         # One automatic metadata index per root; failures are retried by Refresh.
@@ -350,6 +368,8 @@ def request_previews(folder='', selected='', *, refresh=False, search='', mode='
     request = dict(root=root, cache=cache, folder=folder, selected=selected,
                    refresh=refresh, search=search, engine=engine, generation=time.time(),
                    mode=mode, job_id=uuid.uuid4().hex, paused=False, cancelled=False)
+    if entries is not None:
+        request['entries'] = entries
     atomic_json(os.path.join(cache, 'request.json'), request)
     _worker_request = request
     _request_key = key
@@ -441,6 +461,59 @@ def _batch_active():
             and _worker is not None and _worker.poll() is None)
 
 
+def _import_active():
+    return _worker_mode == 'IMPORT' and _worker is not None and _worker.poll() is None
+
+
+def queue_import_preview(rvmat_path, color_path, *, search_roots=()):
+    """Queue only this imported Super pair, reusing an existing library sphere."""
+    from .nh_material_cache import describe
+    entry = describe(rvmat_path, color_path, search_roots=search_roots)
+    if not entry:
+        return False
+    read_manifest()
+    previous = _entries_by_id.get(entry['id'], {})
+    preview = os.path.join(cache_root(), 'previews', entry['id'] + '.png')
+    if (previous.get('preview_signature') == entry['signature'] and os.path.isfile(preview)):
+        return False
+    root = shader.texture_root()
+    try:
+        relative = os.path.relpath(os.path.realpath(os.path.dirname(entry['rvmat'])),
+                                   os.path.realpath(root))
+    except ValueError:
+        relative = os.pardir
+    folder = ('Imported/' + os.path.basename(os.path.dirname(entry['rvmat']))
+              if relative == os.pardir or relative.startswith(os.pardir + os.sep)
+              else '' if relative == '.' else relative.replace(os.sep, '/'))
+    _import_queue[entry['id']] = dict(entry, root=root, name=Path(entry['rvmat']).stem,
+                                    folder=previous.get('folder', folder), imported=True,
+                                    search_roots=list(search_roots))
+    return True
+
+
+def _start_import_previews():
+    """Run requested import previews after scene work and any explicit batch."""
+    if not _import_queue or _material_busy or _prepare_job is not None:
+        return
+    if _worker is not None and _worker.poll() is None:
+        return
+    read_manifest()
+    entries = []
+    for entry in _import_queue.values():
+        previous = _entries_by_id.get(entry['id'], {})
+        preview = os.path.join(cache_root(), 'previews', entry['id'] + '.png')
+        if (previous.get('preview_signature') != entry['signature'] or not os.path.isfile(preview)):
+            entries.append(entry)
+    if not entries:
+        _import_queue.clear()
+        return
+    stop_worker()
+    request_previews(mode='IMPORT', entries=entries)
+    if _import_active():
+        for entry in entries:
+            _import_queue.pop(entry['id'], None)
+
+
 def _resume_worker():
     global _worker_paused, _worker_request, _pause_generation
     if not _worker_paused or _worker is None or _worker.poll() is not None or not _worker_request:
@@ -459,14 +532,26 @@ def _update_batch_progress(status):
     if _batch_id is None:
         return
     if status.get('job_id') == _batch_id:
-        _batch_status = status
-    if _worker is not None and _worker.poll() is not None and _batch_status.get('phase') not in {'DONE', 'CANCELLED', 'ERROR'}:
-        _batch_status = dict(_batch_status, phase='ERROR', message='Preview calculation stopped; see worker.log')
+        _batch_status = dict(status)
+    active = _worker is not None and _worker.poll() is None
+    terminal = {'DONE', 'CANCELLED', 'ERROR'}
+    if active and _batch_status.get('phase') in terminal:
+        phase = _batch_status['phase']
+        message = (_batch_status.get('message', '') + '; stopping renderer…'
+                   if phase == 'ERROR' else 'Stopping renderer…' if phase == 'CANCELLED'
+                   else 'Finishing calculation; waiting for renderer to stop…')
+        _batch_status = dict(_batch_status, phase='FINALIZING', result_phase=phase, message=message)
+    if not active and _batch_status.get('phase') == 'FINALIZING':
+        _batch_status['phase'] = _batch_status.get('result_phase', 'ERROR')
+    if _worker is not None and not active and _batch_status.get('phase') not in terminal:
+        error = 'Renderer stopped before completion (exit code %s). See %s' % (
+            _worker.poll(), os.path.join(cache_root(), 'worker.log'))
+        _batch_status = dict(_batch_status, phase='ERROR', message=error, error=error)
     progress = min(1.0, max(0.0, _batch_status.get('progress', 0.0)))
     bpy.context.window_manager.nh_materials_progress = progress * 100
     if _progress_started:
         bpy.context.window_manager.progress_update(progress * 100)
-        if _batch_status.get('phase') in {'DONE', 'CANCELLED', 'ERROR'}:
+        if not active and _batch_status.get('phase') in terminal:
             bpy.context.window_manager.progress_end()
             _progress_started = False
     if not _material_busy and _prepare_job is None:
@@ -611,10 +696,11 @@ def timer():
             _pause_worker()
             return 0.75
         _resume_worker()
+        _start_import_previews()
         if not browsers:
             # An explicit batch continues outside Shading. Idle browsing never
             # launches material rendering or rereads the cache.
-            return 0.75 if _batch_active() else 2.0
+            return 0.75 if _batch_active() or _import_active() else 2.0
         previous_status = _status
         status = status if status is not None else _read_status()
         if _batch_id is None:
@@ -648,6 +734,7 @@ def timer():
 
 def material_from_entry(entry, *, material=None, cache_only=False):
     from .nh_textures import _set_p3d_material_paths
+    from .nh_material_cache import build
     if not entry['color']:
         raise ValueError('Choose a color texture for this RVMAT first')
     created = material is None
@@ -660,7 +747,7 @@ def material_from_entry(entry, *, material=None, cache_only=False):
             def loader(path, keep_cache, color_space='SRGB'):
                 return _load_material_preview_image(path, keep_cache, color_space,
                                                     cache_missing_textures=False)
-        if not shader.build(material, entry['rvmat'], entry['color'], image_loader=loader):
+        if not build(material, entry['rvmat'], entry['color'], image_loader=loader):
             raise ValueError('Not a readable Super material')
         _set_p3d_material_paths(material, entry['color'], entry['rvmat'])
         material['nh_material_id'] = entry['id']
@@ -817,7 +904,7 @@ class NH_MATERIALS_OT_Apply(Operator):
             self._selection = self._capture_selection(context)
             self._entry = dict(entry)
             self._owner = ('apply', self.as_pointer())
-            if _batch_active():
+            if _batch_active() or _import_active():
                 _pause_worker()
             else:
                 stop_worker()
@@ -876,7 +963,7 @@ class NH_MATERIALS_OT_Calculate(Operator):
 
     @classmethod
     def poll(cls, context):
-        return not _batch_active() and not _material_busy and _prepare_job is None
+        return not _batch_active() and not _import_active() and not _material_busy and _prepare_job is None
 
     def execute(self, context):
         if not os.path.isdir(shader.texture_root()):
@@ -920,11 +1007,64 @@ class NH_MATERIALS_OT_Refresh(Operator):
 
     @classmethod
     def poll(cls, context):
-        return not _batch_active()
+        return not _batch_active() and not _import_active()
 
     def execute(self, context):
         stop_worker()
         request_previews(_folder, refresh=True)
+        return {'FINISHED'}
+
+
+def calculation_failures():
+    failures = list(_batch_status.get('failures', []))
+    for message in _batch_status.get('errors', []):
+        failures.append(dict(name='Library indexing', error=str(message)))
+    error = _batch_status.get('error')
+    if error and not any(item.get('error') == error for item in failures):
+        failures.append(dict(name='Preview calculation', error=error))
+    return failures
+
+
+class NH_MATERIALS_OT_Errors(Operator):
+    bl_idname = 'nh_materials.preview_errors'
+    bl_label = 'Preview Error Details'
+    bl_description = 'Read each failed material, its source paths and the full error reason'
+    index: IntProperty(name='Error', min=1, default=1)
+
+    @classmethod
+    def poll(cls, context):
+        entry = selected_entry(context, update_manifest=False)
+        return bool(calculation_failures() or (entry and entry.get('error')))
+
+    def invoke(self, context, event):
+        self._errors = calculation_failures()
+        entry = selected_entry(context, update_manifest=False)
+        if entry and entry.get('error'):
+            matching = next((i for i, item in enumerate(self._errors)
+                             if item.get('id') == entry['id']), None)
+            if matching is None:
+                self._errors.append({key: entry.get(key, '')
+                                     for key in ('id', 'name', 'rvmat', 'color', 'error')})
+                matching = len(self._errors) - 1
+            self.index = matching + 1
+        return context.window_manager.invoke_props_dialog(self, width=700)
+
+    def draw(self, context):
+        items = getattr(self, '_errors', None) or calculation_failures()
+        if not items:
+            return
+        self.layout.prop(self, 'index', text='Error (1–%d)' % len(items))
+        item = items[min(self.index, len(items)) - 1]
+        self.layout.label(text=item.get('name', 'Material'), icon='ERROR')
+        for label, value in (('Reason', item.get('error')), ('RVMAT', item.get('rvmat')),
+                             ('Color texture', item.get('color'))):
+            if value:
+                self.layout.label(text=label + ':')
+                for line in str(value).splitlines():
+                    for wrapped in textwrap.wrap(line, width=95, break_long_words=True):
+                        self.layout.label(text=wrapped)
+
+    def execute(self, context):
         return {'FINISHED'}
 
 
@@ -938,7 +1078,7 @@ class NH_MATERIALS_OT_Pair(Operator):
 
     @classmethod
     def poll(cls, context):
-        return not _batch_active()
+        return not _batch_active() and not _import_active()
 
     def invoke(self, context, event):
         entry = selected_entry(context)
@@ -976,9 +1116,11 @@ def calculation_text():
         return status.get('message', 'Indexing materials…')
     text = '%d / %d (%.0f%%)' % (processed, total, status.get('progress', 0) * 100)
     if status.get('failed'):
-        text += '; failed: %d' % status['failed']
+        text += '; ready: %d; failed: %d' % (status.get('ready', 0), status['failed'])
     if status.get('phase') == 'CANCELLED':
         text += ' — cancelled'
+    elif status.get('phase') == 'FINALIZING':
+        text += ' — finishing'
     return text
 
 
@@ -992,6 +1134,8 @@ def draw_calculation(layout, context):
         row.enabled = False
         row.prop(context.window_manager, 'nh_materials_progress', text='Previews', slider=True)
         layout.label(text=calculation_text())
+        if calculation_failures():
+            layout.operator('nh_materials.preview_errors', icon='ERROR')
         if _batch_active() and _batch_status.get('current'):
             layout.label(text=_batch_status['current'])
 
@@ -1021,7 +1165,8 @@ class NH_MATERIALS_PT_Details(Panel):
             if not entry['color']:
                 layout.label(text='Choose a color texture', icon='INFO')
             if entry.get('error'):
-                layout.label(text=entry['error'][:60], icon='ERROR')
+                layout.label(text='Preview failed', icon='ERROR')
+                layout.operator('nh_materials.preview_errors', text='Material Error Details', icon='ERROR')
         if _status:
             # Native sidebar can wrap long status messages.
             for line in [_status[i:i + 42] for i in range(0, len(_status), 42)]:
@@ -1040,13 +1185,15 @@ def draw_header(self, context):
             if _batch_active():
                 row.operator('nh_materials.cancel_calculation', text='', icon='CANCEL')
                 row.label(text=calculation_text())
+            if calculation_failures():
+                row.operator('nh_materials.preview_errors', text='', icon='ERROR')
         else:
             row.operator('nh_materials.open', text='NH Materials', icon='MATERIAL')
 
 
 classes = (NH_MATERIALS_Preferences, NH_MATERIALS_OT_Open, NH_MATERIALS_OT_Apply,
            NH_MATERIALS_OT_Calculate, NH_MATERIALS_OT_CancelCalculation,
-           NH_MATERIALS_OT_Refresh, NH_MATERIALS_OT_Pair, NH_MATERIALS_PT_Details)
+           NH_MATERIALS_OT_Refresh, NH_MATERIALS_OT_Errors, NH_MATERIALS_OT_Pair, NH_MATERIALS_PT_Details)
 
 
 def register_runtime():
@@ -1078,6 +1225,7 @@ def unregister_runtime():
     _stub_failures.clear()
     _index_checked_root = None
     _batch_status = {}
+    _import_queue.clear()
     _runtime_active = False
     if hasattr(bpy.types.WindowManager, 'nh_materials_progress'):
         del bpy.types.WindowManager.nh_materials_progress

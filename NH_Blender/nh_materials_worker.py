@@ -70,13 +70,46 @@ def studio(engine='EEVEE'):
     return sphere
 
 
-def asset_groups(entries):
+def asset_groups(entries, preserve=False):
     folders, groups = {}, {}
     for entry in entries:
         folders.setdefault(entry['folder'], []).append(entry)
     for folder, items in folders.items():
         items.sort(key=lambda entry: (entry['name'].casefold(), entry['id']))
         names = set()
+        if preserve:
+            # Importing one pair must not reshuffle established library cards.
+            # New entries fill an existing group or create another small file.
+            for entry in items:
+                filename = entry.get('asset_file', '')
+                if filename:
+                    groups.setdefault(filename, []).append(entry)
+                    names.add(entry.get('asset_name', entry['name']))
+            for entry in items:
+                if entry.get('asset_file'):
+                    continue
+                name = entry['name']
+                if len(name.encode('utf8')) > 54:
+                    name = name.encode('utf8')[:43].decode('utf8', errors='ignore') + ' · ' + entry['id'][:8]
+                if name in names:
+                    name += ' · ' + entry['id'][:6]
+                names.add(name)
+                candidates = [filename for filename, members in groups.items()
+                              if members[0]['folder'] == folder and len(members) < GROUP_SIZE]
+                if candidates:
+                    filename = sorted(candidates)[-1]
+                else:
+                    number = 0
+                    while True:
+                        key = folder + '\0' + str(number)
+                        filename = 'folder_' + hashlib.sha256(key.encode('utf8')).hexdigest()[:24] + '.blend'
+                        if filename not in groups:
+                            break
+                        number += 1
+                    groups[filename] = []
+                entry['asset_file'], entry['asset_name'] = filename, name
+                groups[filename].append(entry)
+            continue
         for number, entry in enumerate(items):
             key = folder+'\0'+str(number//GROUP_SIZE)
             filename = 'folder_'+hashlib.sha256(key.encode('utf8')).hexdigest()[:24]+'.blend'
@@ -108,7 +141,13 @@ def write_asset_group(cache, entries, filename, default_preview=''):
             material.asset_mark()
             material.asset_data.catalog_id = browser.catalog_id(entry['folder'])
             ready = entry.get('preview_signature') == entry.get('signature') and bool(entry.get('preview_signature'))
-            material.asset_data.description = os.path.relpath(entry['rvmat'], entry['root'])
+            try:
+                description = os.path.relpath(os.path.realpath(entry['rvmat']),
+                                             os.path.realpath(entry['root']))
+            except ValueError:
+                # Sources can be on another drive or use a junction alias.
+                description = entry['rvmat']
+            material.asset_data.description = description
             if not ready:
                 material.asset_data.description += '\nPreview pending'
             preview = os.path.join(cache,'previews',entry['id']+'.png') if ready else default_preview
@@ -163,7 +202,7 @@ def pending_preview(cache):
 
 
 def _main(cache, once=False):
-    from NH_Blender import nh_materials_images as preview_images
+    from NH_Blender import nh_materials_images as preview_images, nh_material_cache as material_cache
     cache = os.path.abspath(cache)
     os.makedirs(os.path.join(cache, 'assets'), exist_ok=True)
     os.makedirs(os.path.join(cache, 'previews'), exist_ok=True)
@@ -176,6 +215,7 @@ def _main(cache, once=False):
     job_id = request.get('job_id', '')
     revision = time.time_ns()
     entries = []
+    requested_ids = set()
     job_failures = set()
     manifest = dict(entries=entries, errors=[])
 
@@ -185,16 +225,21 @@ def _main(cache, once=False):
     def status(message, phase='INDEX', busy=True, **extra):
         nonlocal revision
         revision += 1
-        total = len(entries)
-        complete = sum(ready(entry) for entry in entries)
+        progress_entries = [entry for entry in entries if entry['id'] in requested_ids] if mode == 'IMPORT' else entries
+        total = len(progress_entries)
+        complete = sum(ready(entry) for entry in progress_entries)
         failed = sum(bool(entry.get('error')) and not ready(entry) and
-                     (mode != 'BUILD' or entry['id'] in job_failures) for entry in entries)
+                     (mode not in ('BUILD', 'IMPORT') or entry['id'] in job_failures) for entry in progress_entries)
         processed = complete + failed
+        failures = [dict(id=entry['id'], name=entry['name'], rvmat=entry['rvmat'],
+                         color=entry.get('color', ''), error=entry['error'])
+                    for entry in progress_entries
+                    if entry['id'] in job_failures and entry.get('error') and not ready(entry)]
         result = dict(message=message, job_id=job_id, mode=mode, phase=phase,
                       revision=revision, busy=busy, paused=False, total=total,
                       ready=complete, failed=failed, processed=processed,
                       progress=(processed / total if total else (1.0 if phase == 'DONE' else 0.0)),
-                      current='', errors=manifest.get('errors', []))
+                      current='', errors=manifest.get('errors', []), failures=failures)
         result.update(extra)
         browser.atomic_json(os.path.join(cache, 'status.json'), result)
 
@@ -210,8 +255,8 @@ def _main(cache, once=False):
                 status('Material preparation cancelled', phase='CANCELLED', busy=False)
                 return False
             # INDEX is finite and preserves previous paused-index requests.
-            # Only an explicit BUILD owns background preview preparation.
-            if mode != 'BUILD' or not current.get('paused'):
+            # Explicit library and import jobs can share the same pause gate.
+            if mode not in ('BUILD', 'IMPORT') or not current.get('paused'):
                 return True
             status('Material preparation paused', phase='PAUSED', busy=False,
                    paused=True, pause_generation=current.get('pause_generation'))
@@ -223,12 +268,53 @@ def _main(cache, once=False):
 
     old = read_json(os.path.join(cache, 'manifest.json'), {})
     status('Indexing materials…')
-    reuse = (mode != 'BUILD' and old.get('schema') == rvmat.SCHEMA and
-             old.get('root') == root and not request.get('refresh'))
-    if reuse:
+    compatible = old.get('schema') == rvmat.SCHEMA and old.get('root') == root
+
+    def search_roots(entry):
+        return tuple(dict.fromkeys((root, entry.get('root', root), *entry.get('search_roots', ()))))
+
+    def imported_entry(entry):
+        """Validate an explicit pair without walking the texture library."""
+        path, color = entry.get('rvmat', ''), entry.get('color', '')
+        if not os.path.isfile(path) or (color and not os.path.isfile(color)):
+            return None
+        description = material_cache.describe(path, color, search_roots=search_roots(entry))
+        if not description:
+            return None
+        result = dict(entry, **description)
+        result.update(imported=True, root=root)
+        result.setdefault('name', Path(path).stem)
+        result.setdefault('folder', '')
+        return result
+
+    if mode == 'IMPORT':
+        manifest = dict(old) if compatible else dict(schema=rvmat.SCHEMA, root=root, errors=[])
+        manifest['library_indexed'] = old.get('library_indexed', True) if compatible else False
+        merged = {entry['id']: dict(entry) for entry in manifest.get('entries', [])}
+        for entry in request.get('entries', []):
+            entry = imported_entry(entry)
+            if entry:
+                requested_ids.add(entry['id'])
+                previous = merged.get(entry['id'], {})
+                merged[entry['id']] = dict(previous, **entry)
+        manifest['entries'] = list(merged.values())
+    elif mode != 'BUILD' and compatible and old.get('library_indexed', True) and not request.get('refresh'):
         manifest = old
     else:
         manifest = rvmat.scan(root, read_json(os.path.join(cache, 'pairs.json'), {}))
+        manifest['library_indexed'] = True
+        scanned = {entry['id']: entry for entry in manifest['entries']}
+        for previous in old.get('entries', []) if compatible else []:
+            if not previous.get('imported'):
+                continue
+            entry = imported_entry(previous)
+            if entry:
+                if entry['id'] in scanned:
+                    scanned[entry['id']].update(imported=True, signature=entry['signature'],
+                        search_roots=entry.get('search_roots', ()))
+                else:
+                    manifest['entries'].append(entry)
+                    scanned[entry['id']] = entry
     entries = manifest['entries']
     old_lookup = {entry['id']: dict(entry) for entry in old.get('entries', [])}
     old_groups = {}
@@ -244,7 +330,10 @@ def _main(cache, once=False):
         entry.pop('error', None)
         if unchanged and previous.get('error'):
             entry['error'] = previous['error']
-    groups = asset_groups(entries)
+        if mode == 'IMPORT' and previous.get('asset_file'):
+            entry['asset_file'] = previous['asset_file']
+            entry['asset_name'] = previous.get('asset_name', entry['name'])
+    groups = asset_groups(entries, preserve=mode == 'IMPORT')
     if not control('INDEX'):
         return
     folders = browser.catalog_folders(entries)
@@ -280,7 +369,7 @@ def _main(cache, once=False):
             path.unlink()
     manifest['asset_schema'] = ASSET_SCHEMA
     save_manifest()
-    if mode != 'BUILD':
+    if mode not in ('BUILD', 'IMPORT'):
         status('%d Super materials indexed' % len(entries), phase='DONE', busy=False)
         return
 
@@ -303,7 +392,8 @@ def _main(cache, once=False):
             scene.cycles.use_denoising = True
             bpy.ops.render.render(write_still=True)
 
-    for pending in sorted(entries, key=lambda entry: (entry['name'].casefold(), entry['id'])):
+    render_entries = [entry for entry in entries if entry['id'] in requested_ids] if mode == 'IMPORT' else entries
+    for pending in sorted(render_entries, key=lambda entry: (entry['name'].casefold(), entry['id'])):
         if not control('RENDER'):
             return
         if ready(pending):
@@ -317,12 +407,19 @@ def _main(cache, once=False):
             if sphere is None:
                 sphere = studio(engine)
             material = bpy.data.materials.new('NH Render Material')
-            if not shader.build(material, pending['rvmat'], pending['color'], image_loader=preview_images.load):
+            if not material_cache.build(material, pending['rvmat'], pending['color'],
+                    search_roots=search_roots(pending), image_loader=preview_images.load):
                 raise ValueError('Not a readable Super material')
             sphere.data.materials.clear()
             sphere.data.materials.append(material)
             preview = os.path.join(cache, 'previews', pending['id'] + '.png')
-            render(preview)
+            temporary = preview + '.rendering.png'
+            try:
+                render(temporary)
+                os.replace(temporary, preview)
+            finally:
+                if os.path.isfile(temporary):
+                    os.remove(temporary)
             pending['preview_signature'] = pending['signature']
             pending.pop('error', None)
             job_failures.discard(pending['id'])
@@ -343,7 +440,9 @@ def _main(cache, once=False):
                 if image.users == 0 and image.type != 'RENDER_RESULT':
                     bpy.data.images.remove(image)
         save_manifest()
-        status('Prepared: ' + pending['name'], phase='RENDER', current=pending['name'],
+        message = ('Prepared: ' + pending['name'] if ready(pending)
+                   else 'Failed: ' + pending['name'] + ' — ' + pending.get('error', 'Unknown error'))
+        status(message, phase='RENDER', current=pending['name'],
                selected_ready=pending['id'] if ready(pending) else '')
     current = read_json(request_path, request)
     if current.get('cancelled') or current.get('job_id', '') != job_id:
@@ -364,7 +463,7 @@ def main(cache, once=False):
         if previous.get('job_id', '') != request.get('job_id', ''):
             previous = {}
         for key, value in dict(total=0, ready=0, failed=0, processed=0, progress=0.0,
-                               errors=[]).items():
+                               errors=[], failures=[]).items():
             previous.setdefault(key, value)
         previous.update(job_id=request.get('job_id', ''), mode=request.get('mode', 'INDEX'),
                         phase='ERROR', message='Material preparation failed: ' + str(exc),

@@ -135,13 +135,13 @@ def identity(rvmat, color):
     return hashlib.sha256(text.encode('utf8')).hexdigest()[:24]
 
 
-def signature(rvmat, color, root, *, data=None, stats_cache=None):
+def signature(rvmat, color, root, *, data=None, stats_cache=None, search_roots=()):
     data = read(rvmat) if data is None else data
     paths = [rvmat, color]
     for number in range(1, 8):
         raw = stage(data, number).get('texture', '')
         if raw and not raw.startswith('#'):
-            paths.append(resolve_path(raw, rvmat, root) or raw)
+            paths.append(resolve_path(raw, rvmat, root, search_roots) or raw)
     stats = []
     for path in paths:
         if stats_cache is not None and path in stats_cache:

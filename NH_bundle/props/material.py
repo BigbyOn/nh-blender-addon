@@ -83,16 +83,30 @@ class NH_PG_properties_material(bpy.types.PropertyGroup):
         addon_prefs = get_prefs()
         texture = ""
         material = ""
+        texture_path, material_path = self.texture_path, self.material_path
+        owner = self.id_data
+        if self.texture_type == 'TEX' and owner.get('nh_material_stub', False):
+            # Native NH asset cards have source metadata before their deferred
+            # preview shader is ready. Export those original paths immediately,
+            # while retaining any explicitly edited P3D property.
+            color_source = owner.get('nh_material_color', '')
+            rvmat_source = owner.get('nh_material_rvmat', '')
+            if (not texture_path.strip() and isinstance(color_source, str)
+                    and color_source.strip().lower().endswith('.paa')):
+                texture_path = color_source
+            if (not material_path.strip() and isinstance(rvmat_source, str)
+                    and rvmat_source.strip().lower().endswith('.rvmat')):
+                material_path = rvmat_source
 
         if self.texture_type == 'TEX':
-            texture = utils.format_path(utils.abspath(self.texture_path), utils.abspath(addon_prefs.project_root), relative)
+            texture = utils.format_path(utils.abspath(texture_path), utils.abspath(addon_prefs.project_root), relative)
         elif self.texture_type == 'COLOR':
             color = self.color_value
             texture = "#(argb,8,8,3)color(%.3f,%.3f,%.3f,%.3f,%s)" % (color[0], color[1], color[2], color[3], self.color_type)
         else:
             texture = self.color_raw
         
-        material = utils.format_path(utils.abspath(self.material_path), utils.abspath(addon_prefs.project_root), relative)
+        material = utils.format_path(utils.abspath(material_path), utils.abspath(addon_prefs.project_root), relative)
 
         return texture, material
 

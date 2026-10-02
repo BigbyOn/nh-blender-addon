@@ -54,7 +54,20 @@ def _patch_p3d_import_read_file():
             filepath = _norm_path(bpy.path.abspath(getattr(operator, "filepath", "")))
             pre_col_ptrs = {col.as_pointer() for col in bpy.data.collections}
 
-            lod_objects = _original_read_file(operator, context, file)
+            # NH builds the full Super material after source roots are tagged.
+            # Suppress the backend's eager PAA-only graph, which otherwise
+            # decodes the color texture before the shared cache can be used.
+            load_textures = getattr(operator, "load_textures", None)
+            deferred_preview = (_P3D_IMPORT_TRACKING_SUPPRESS_DEPTH == 0
+                                and load_textures is not None and bool(load_textures)
+                                and filepath and os.path.isfile(filepath))
+            if deferred_preview:
+                operator.load_textures = False
+            try:
+                lod_objects = _original_read_file(operator, context, file)
+            finally:
+                if deferred_preview:
+                    operator.load_textures = load_textures
 
             if _P3D_IMPORT_TRACKING_SUPPRESS_DEPTH > 0:
                 return lod_objects
@@ -83,14 +96,6 @@ def _patch_p3d_import_read_file():
 
             try:
                 show_materials, keep_converted = _get_import_preview_settings(context, operator)
-                operator_loads_textures = False
-                if hasattr(operator, "load_textures"):
-                    try:
-                        operator_loads_textures = bool(getattr(operator, "load_textures"))
-                    except Exception:
-                        operator_loads_textures = False
-                if operator_loads_textures and not keep_converted:
-                    return lod_objects
                 stats = _postprocess_imported_material_previews(
                     context,
                     lod_objects or [],

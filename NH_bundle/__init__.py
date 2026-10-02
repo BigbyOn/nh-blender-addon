@@ -34,7 +34,7 @@ class _NHFallbackPreferences(object):
     """
     icon_theme = "none"
     show_info_links = False
-    project_root = ""
+    project_root = "P:\\"
     custom_data = ""
     a3_tools = ""
     flag_vertex = 0x02000000

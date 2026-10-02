@@ -39,11 +39,13 @@ def build(material, rvmat_path, color_path='', *, base_image=None, has_alpha=Fal
 
     # Decode required images before touching a user's existing shader.
     loaded = {}
+    sources = {}
     missing = []
     for number in (1, 2, 3, 4, 5, 7):
         raw = rvmat.stage(data, number).get('texture', '')
         if raw and not raw.startswith('#'):
             resolved = rvmat.resolve_path(raw, path, root, search_roots)
+            sources[number] = resolved
             image = None
             if resolved:
                 image = load_image(resolved, keep_cache,
@@ -129,12 +131,16 @@ def build(material, rvmat_path, color_path='', *, base_image=None, has_alpha=Fal
             return color.outputs[0], color.outputs[0].default_value[3]
         texture = node('ShaderNodeTexImage', 'Stage%d %s' % (number, os.path.basename(image.filepath)))
         texture.image = image
+        texture['nh_texture_source'] = sources[number]
+        texture['nh_texture_space'] = 'SRGB' if number in (3, 7) else 'DATA'
         feed(texture.inputs['Vector'], vector if vector is not None else mapping(number))
         return texture.outputs['Color'], texture.outputs['Alpha']
 
     if base_image:
         texture = node('ShaderNodeTexImage', 'DayZ Color')
         texture.image = base_image
+        texture['nh_texture_source'] = rvmat.resolve_path(color_path, path, root, search_roots) or color_path
+        texture['nh_texture_space'] = 'SRGB'
         feed(texture.inputs['Vector'], coordinates.outputs['UV'])
         base, alpha = texture.outputs['Color'], texture.outputs['Alpha']
     else:
