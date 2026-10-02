@@ -13,7 +13,7 @@ from bpy.props import EnumProperty, StringProperty, FloatProperty, IntProperty
 from bpy.types import AddonPreferences, Operator, Panel
 
 from . import nh_material_shader as shader
-from .utilities import rvmat
+from .utilities import rvmat, tb_txt
 
 LIBRARY_NAME = 'NH Materials'
 _worker = None
@@ -249,6 +249,9 @@ def _preferences_changed(self, context):
 
 class NH_MATERIALS_Preferences(AddonPreferences):
     bl_idname = __package__
+    tb_templates_folder: StringProperty(name='Terrain Builder template libraries', subtype='DIR_PATH',
+        description='Folder containing TML libraries that map TXT template names to P3D paths',
+        default=tb_txt.DEFAULT_TEMPLATES_DIRECTORY)
     nh_textures_folder: StringProperty(name='NH Textures folder', subtype='DIR_PATH',
         description='Folder containing Super RVMAT materials and color textures. Empty: P:\\NH_ObjectTextures',
         default='', update=_preferences_changed)
@@ -264,6 +267,11 @@ class NH_MATERIALS_Preferences(AddonPreferences):
         if not self.nh_textures_folder:
             self.layout.label(text='Default: ' + rvmat.DEFAULT_ROOT)
         draw_calculation(self.layout, context)
+        box = self.layout.box()
+        box.label(text='Terrain Builder TXT')
+        box.prop(self, 'tb_templates_folder')
+        if not self.tb_templates_folder:
+            box.label(text='Default: ' + tb_txt.DEFAULT_TEMPLATES_DIRECTORY)
 
 
 def _preview_engine():
