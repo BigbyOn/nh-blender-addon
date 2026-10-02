@@ -654,7 +654,7 @@ class P3D_LOD():
             if not re.match(r"component\d+", tagg.name, re.IGNORECASE):
                 continue
             
-            tagg.name = "component%02d" % counter
+            tagg.name = "Component%02d" % counter
             counter += 1
 
         return counter
@@ -756,7 +756,10 @@ class P3D_LOD():
         
         for tagg in self.taggs:
             if tagg.is_selection():
-                tagg.name = tagg.name.lower()
+                if re.fullmatch(r"component\d+", tagg.name, re.IGNORECASE):
+                    tagg.name = "Component" + tagg.name[len("component"):]
+                else:
+                    tagg.name = tagg.name.lower()
             elif type(tagg.data) is P3D_TAGG_DataProperty:
                 tagg.data.key = tagg.data.key.lower()
                 tagg.data.value = tagg.data.value.lower()

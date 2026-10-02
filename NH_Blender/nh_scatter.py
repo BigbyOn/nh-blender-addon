@@ -1073,33 +1073,33 @@ def _create_and_assign_target_material(context, *, object_attr: str, material_at
 
 
 def _on_roadway_material_changed(self, context):
-    from .nh_collider import (_sync_roadway_material_selection)
+    from .nh_collider import (_auto_select_collider_material_faces, _sync_roadway_material_selection)
     if _COLLIDER_MATERIAL_SELECTION_SYNCING:
         return
-    if (getattr(self, "roadway_material", "") or "") != _MATERIAL_ADD_NEW:
-        return
-    _create_and_assign_target_material(
-        context,
-        object_attr="roadway_object",
-        material_attr="roadway_material",
-        default_name="RoadwayMaterial",
-        sync_fn=_sync_roadway_material_selection,
-    )
+    if (getattr(self, "roadway_material", "") or "") == _MATERIAL_ADD_NEW:
+        _create_and_assign_target_material(
+            context,
+            object_attr="roadway_object",
+            material_attr="roadway_material",
+            default_name="RoadwayMaterial",
+            sync_fn=_sync_roadway_material_selection,
+        )
+    _auto_select_collider_material_faces(context, target_attr="ROADWAY")
 
 
 def _on_fire_geometry_material_changed(self, context):
-    from .nh_collider import (_sync_fire_geometry_material_selection)
+    from .nh_collider import (_auto_select_collider_material_faces, _sync_fire_geometry_material_selection)
     if _COLLIDER_MATERIAL_SELECTION_SYNCING:
         return
-    if (getattr(self, "fire_geometry_material", "") or "") != _MATERIAL_ADD_NEW:
-        return
-    _create_and_assign_target_material(
-        context,
-        object_attr="fire_geometry_object",
-        material_attr="fire_geometry_material",
-        default_name="FireGeometryMaterial",
-        sync_fn=_sync_fire_geometry_material_selection,
-    )
+    if (getattr(self, "fire_geometry_material", "") or "") == _MATERIAL_ADD_NEW:
+        _create_and_assign_target_material(
+            context,
+            object_attr="fire_geometry_object",
+            material_attr="fire_geometry_material",
+            default_name="FireGeometryMaterial",
+            sync_fn=_sync_fire_geometry_material_selection,
+        )
+    _auto_select_collider_material_faces(context, target_attr="FIRE")
 
 
 def _actual_collider_lod_token_from_object(obj) -> str:

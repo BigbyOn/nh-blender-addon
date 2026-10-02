@@ -26,7 +26,9 @@ def _overlap(a,b):
 def _plane(tri):
     a,b,c=tri
     n=(b-a).cross(c-a)
-    if abs(n.z)<1e-12: return None
+    # Match the upper-face cutoff used by the final hull check: surfaces this
+    # close to vertical can never produce a top face and must be treated as walls.
+    if abs(n.z)<1e-7*max(n.length,1e-20): return None
     return (-n.x/n.z,-n.y/n.z,n.dot(a)/n.z)
 
 def _z(plane,p):
@@ -200,7 +202,7 @@ def build_terrain(triangles,*,patch_size,min_patch_size,depression_error,hill_er
     # guaranteed by exact triangle leaves, so no inaccurate minimum cell is kept.
     del min_patch_size
     min_x=min(p.x for t in triangles for p in t['points']);min_y=min(p.y for t in triangles for p in t['points'])
-    nodes={};edge_owners={};next_id=0;seen=set();ignored_vertical=0
+    nodes={};edge_owners={};next_id=0;seen=set();ignored_vertical=0;degenerate=0
     for entry in triangles:
         tri=tuple(Vector(p) for p in entry['points']);key=tuple(sorted(_key(p) for p in tri))
         if key in seen:continue
@@ -231,13 +233,17 @@ def build_terrain(triangles,*,patch_size,min_patch_size,depression_error,hill_er
                     if record and _area(record[0])>1e-10:records.append(record)
                 if not records:continue
                 hull=_hull(polygon,thickness)
-                if hull is None:raise RuntimeError('A terrain fragment produced a degenerate hull')
+                if hull is None:
+                    # Numerical slivers can lose their top face after clipping;
+                    # skip them instead of aborting the whole build.
+                    degenerate+=1;continue
                 # Clipping can turn a triangle into a six-sided polygon. Even
                 # initial leaves must respect the requested component budget.
                 leaves=[(polygon,records,hull)] if len(hull[1])<=max_triangles else [
                     (list(record[0]),[record],_hull(record[0],thickness)) for record in records]
                 for boundary,surfaces,leaf in leaves:
-                    if leaf is None:raise RuntimeError('A terrain fragment produced a degenerate hull')
+                    if leaf is None:
+                        degenerate+=1;continue
                     node=dict(vertices=leaf[0],faces=leaf[1],triangles=surfaces,area=_area(boundary),above=0.,below=0.,boundary_error=0.,neighbors=set())
                     nodes[next_id]=node
                     for j,p in enumerate(boundary):
@@ -275,6 +281,7 @@ def build_terrain(triangles,*,patch_size,min_patch_size,depression_error,hill_er
         offset=len(vertices);vertices.extend(node['vertices']);faces.extend(tuple(offset+i for i in f) for f in node['faces'])
     stats=dict(components=len(nodes),source_tris=len(triangles),initial_components=initial,merged_components=merges,
                merge_attempts=attempts,split_cells=0,max_depth=0,skipped_existing=0,ignored_vertical=ignored_vertical,
+               skipped_degenerate=degenerate,
                max_above=max(n['above'] for n in nodes.values()),max_below=max(n['below'] for n in nodes.values()),
                max_component_triangles=max(len(n['faces']) for n in nodes.values()),
                seam_step_bound=2*max(n['boundary_error'] for n in nodes.values()),
