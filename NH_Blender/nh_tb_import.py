@@ -11,7 +11,15 @@ from bpy.props import BoolProperty, EnumProperty, FloatProperty, StringProperty
 from bpy_extras.io_utils import ImportHelper
 from mathutils import Euler, Matrix, Vector
 
-from .utilities.tb_txt import ImportProblem, bounds_center, has_autocenter_zero, read_placements, resolve_models
+from .utilities.tb_txt import (DEFAULT_TEMPLATES_DIRECTORY, ImportProblem, bounds_center,
+                               has_autocenter_zero, read_placements, resolve_models)
+
+
+def template_libraries_directory(context=None):
+    context = context or bpy.context
+    addon = context.preferences.addons.get(__package__)
+    value = getattr(getattr(addon, 'preferences', None), 'tb_templates_folder', '')
+    return bpy.path.abspath(value.strip() or DEFAULT_TEMPLATES_DIRECTORY)
 
 
 def dependency():
@@ -40,10 +48,11 @@ def placement_matrix(record, center, origin):
     return matrix
 
 
-def preflight(operator):
+def preflight(operator, context=None):
     p3d, importer = dependency()
     records = read_placements(bpy.path.abspath(operator.filepath))
-    models = resolve_models(records, bpy.path.abspath(operator.models_directory), operator.recursive_search)
+    models = resolve_models(records, bpy.path.abspath(operator.models_directory), operator.recursive_search,
+                            templates_directory=template_libraries_directory(context))
     plans = {}
     for path in dict.fromkeys(models.values()):
         try:
@@ -118,7 +127,7 @@ def import_layout(operator, context):
         raise ImportProblem('Switch to Object Mode before importing')
     from .nh_snap import _suppress_p3d_import_tracking
 
-    records, paths, plans, importer = preflight(operator)
+    records, paths, plans, importer = preflight(operator, context)
     origin = (operator.origin_east, operator.origin_north, operator.origin_height)
     if operator.origin_mode == 'FIRST':
         origin = (records[0].east, records[0].north, operator.origin_height)
@@ -132,6 +141,7 @@ def import_layout(operator, context):
         collection = bpy.data.collections.new('TB: ' + Path(operator.filepath).stem)
         context.scene.collection.children.link(collection)
         collection['tb_txt_source'] = bpy.path.abspath(operator.filepath)
+        collection['tb_template_libraries'] = template_libraries_directory(context)
         collection['tb_origin'] = list(origin)
         for record in records:
             path = paths[record.model]
@@ -221,6 +231,9 @@ class CRAY_OT_ImportTerrainBuilderTXT(bpy.types.Operator, ImportHelper):
         layout = self.layout
         layout.prop(self, 'models_directory')
         layout.prop(self, 'recursive_search')
+        box = layout.box()
+        box.label(text='Template libraries (Add-on Preferences)')
+        box.label(text=template_libraries_directory(context))
         layout.separator()
         layout.prop(self, 'origin_mode')
         column = layout.column()

@@ -288,4 +288,5 @@ if ($remainingPyc.Count -gt 0) {
     Write-Host ""
 }
 Write-Host "Next step:"
-Write-Host "1. Restart Blender, or disable/enable the addon in Preferences."
+Write-Host "1. Fully restart Blender, then enable the addon in Preferences."
+Write-Host "   Switching from NH_Blender.py to the package requires a full restart."

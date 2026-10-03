@@ -4,6 +4,10 @@ import csv
 import math
 import os
 from pathlib import Path
+import xml.etree.ElementTree as ET
+
+
+DEFAULT_TEMPLATES_DIRECTORY = r'P:\NH_Objects\TemplateLibs'
 
 
 class ImportProblem(ValueError):
@@ -73,13 +77,120 @@ def _key(name):
     return (name[:-4] if name.lower().endswith('.p3d') else name).casefold()
 
 
-def resolve_models(records, directory, recursive=True):
-    root = Path(directory).resolve()
+def _template_key(name):
+    return name.replace('\\_', '_').strip().casefold()
+
+
+def _xml_tag(element):
+    return element.tag.rsplit('}', 1)[-1]
+
+
+def _read_templates(directory):
+    """Index direct Name/File fields without treating nested metadata as fields."""
+    templates = {}
+
+    def on_walk_error(error):
+        raise ImportProblem(f'Cannot read template library folder: {error}')
+
+    for current, directories, files in os.walk(directory, onerror=on_walk_error, followlinks=False):
+        directories.sort()
+        for filename in sorted(files):
+            if not filename.lower().endswith('.tml'):
+                continue
+            library = Path(current) / filename
+            try:
+                document = ET.fromstring(library.read_bytes())
+            except (OSError, ET.ParseError, ValueError, LookupError) as error:
+                raise ImportProblem(f'Cannot read template library {library}: {error}') from error
+            for element in document.iter():
+                if _xml_tag(element) != 'Template':
+                    continue
+                names = [child.text or '' for child in element if _xml_tag(child) == 'Name']
+                model_files = [child.text or '' for child in element if _xml_tag(child) == 'File']
+                for name in names:
+                    key = _template_key(name)
+                    if key:
+                        templates.setdefault(key, []).append((name, model_files, library, len(names)))
+    return templates
+
+
+def _path_key(path):
+    return os.path.normcase(str(path))
+
+
+def _template_candidates(path, anchors):
+    if path.is_absolute():
+        candidates = [path]
+    else:
+        candidates = [anchor / path for anchor in anchors]
+    canonical = {}
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        canonical[_path_key(candidate)] = candidate
+    return canonical
+
+
+def _template_model(name, entries, anchors):
+    references = {}
+    for template_name, files, library, name_count in entries:
+        context = f'Template {template_name!r} in {library}'
+        if name_count != 1 or len(files) != 1 or not files[0].strip():
+            raise ImportProblem(f'{context}: expected one Name and one non-empty File')
+        filename = files[0].strip().replace('\\', '/')
+        path = Path(filename)
+        if '\x00' in filename or path.drive and not path.is_absolute():
+            raise ImportProblem(f'{context}: invalid model File {files[0]!r}')
+        if path.suffix.lower() != '.p3d':
+            raise ImportProblem(f'{context}: model File must end with .p3d: {files[0]}')
+        if '..' in filename.split('/'):
+            raise ImportProblem(f'{context}: parent-directory references in File are not supported: {files[0]}')
+        signature = os.path.normcase(os.path.normpath(filename))
+        references.setdefault(signature, (path, files[0].strip(), library))
+    candidates_by_reference, matches_by_reference = [], []
+    for path, filename, library in references.values():
+        try:
+            candidates = _template_candidates(path, anchors)
+            matches = {key: candidate for key, candidate in candidates.items() if candidate.is_file()}
+        except (OSError, ValueError) as error:
+            raise ImportProblem(f'Template {name!r}, File "{filename}" in {library}: {error}') from error
+        candidates_by_reference.append(set(candidates))
+        matches_by_reference.append(matches)
+    # Absolute and game-relative spellings can name the same canonical file.
+    if any(matches_by_reference):
+        same_target = all(set(matches) == set(matches_by_reference[0]) for matches in matches_by_reference)
+    else:
+        same_target = bool(set.intersection(*candidates_by_reference))
+    if not same_target:
+        details = '; '.join(f'{filename} ({library})' for _, filename, library in references.values())
+        raise ImportProblem(f'Conflicting template {name!r}: {details}')
+    _, filename, library = next(iter(references.values()))
+    matches = matches_by_reference[0]
+    if not matches:
+        raise ImportProblem(f'Not found for template {name!r}: File "{filename}" in {library}')
+    if len(matches) != 1:
+        raise ImportProblem(f'Ambiguous template {name!r}, File "{filename}" in {library}: '
+                            + ', '.join(str(candidate) for candidate in sorted(matches.values())))
+    return next(iter(matches.values()))
+
+
+def resolve_models(records, directory, recursive=True, *, templates_directory=''):
+    selected_root = Path(directory).absolute()
+    root = selected_root.resolve()
     if not root.is_dir():
         raise ImportProblem(f'P3D folder does not exist: {root}')
     names = list(dict.fromkeys(record.model for record in records))
     resolved, unresolved = {}, []
+    templates_root = Path(templates_directory).absolute() if templates_directory else None
+    missing_templates = templates_root is not None and not templates_root.is_dir()
+    templates = _read_templates(templates_root) if templates_root is not None and not missing_templates else {}
+    # Preserve virtual drive/junction ancestors as well as the physical paths.
+    anchor_roots = (selected_root, root, templates_root, templates_root.resolve() if templates_root else None)
+    anchors = dict.fromkeys(anchor for base in anchor_roots if base is not None for anchor in (base, *base.parents))
     for name in names:
+        entries = templates.get(_template_key(name))
+        if entries:
+            resolved[name] = _template_model(name, entries, anchors)
+            continue
         normalized = name.replace('\\', '/')
         if '..' in normalized.split('/'):
             raise ImportProblem(f'Parent-directory references are not supported: {name}')
@@ -114,6 +225,8 @@ def resolve_models(records, directory, recursive=True):
             else:
                 resolved[name] = matches[0]
         if errors:
+            if missing_templates:
+                errors.append(f'Template library folder does not exist: {templates_root}')
             raise ImportProblem('\n'.join(errors))
     return resolved
 

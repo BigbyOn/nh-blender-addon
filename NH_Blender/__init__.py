@@ -1,8 +1,8 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Enisam",
-    "version": (0, 6, 7, 6),
-    "blender": (5, 1, 1),
+    "version": (0, 6, 11),
+    "blender": (4, 0, 0),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "All-in-one Blender toolkit for porting and preparing DayZ/Arma assets: fixes, textures, colliders, proxies, snap points, and P3D workflow helpers.",    
     "doc_url": "https://github.com/T3Z-ONE/nh-blender-addon",
@@ -14,7 +14,7 @@ bl_info = {
 import bpy
 import bmesh
 from bpy.app.handlers import persistent
-from bpy.types import Operator, Panel, PropertyGroup, UIList, OperatorFileListElement, Menu
+from bpy.types import Operator, Panel, PropertyGroup, UIList, OperatorFileListElement, Menu, AddonPreferences
 from bpy.props import PointerProperty, StringProperty, FloatProperty, IntProperty, BoolProperty, EnumProperty, CollectionProperty
 from mathutils import Vector, Matrix
 import math
@@ -52,6 +52,7 @@ importlib.invalidate_caches()
 _PACKAGE_SUBMODULE_RELOAD_ORDER = (
     "utilities.dayz_config",
     "utilities.tb_txt",
+    "utilities.rvmat",
     "nh_base",
     "nh_scatter",
     "nh_round_geometry",
@@ -60,6 +61,10 @@ _PACKAGE_SUBMODULE_RELOAD_ORDER = (
     "nh_collider",
     "nh_collider_exp",
     "nh_textures",
+    "nh_material_shader",
+    "nh_materials_images",
+    "nh_material_cache",
+    "nh_materials",
     "nh_snap",
     "nh_ladder",
     "nh_assets",
@@ -77,6 +82,8 @@ _PACKAGE_SUBMODULE_RELOAD_ORDER = (
 for _submodule_name in _PACKAGE_SUBMODULE_RELOAD_ORDER:
     _cached_submodule = sys.modules.get(f"{__name__}.{_submodule_name}")
     if _cached_submodule is not None:
+        if _submodule_name == "nh_materials":
+            _cached_submodule.unregister_runtime()
         importlib.reload(_cached_submodule)
 del _cached_submodule
 del _submodule_name
@@ -90,7 +97,7 @@ from .nh_model_split import (CRAY_OT_ModelSplitGridClearCutters, CRAY_OT_ModelSp
 from .nh_planner import (CRAY_MT_P3DDropMenu, CRAY_OT_IEFilePathTooltip, CRAY_OT_IE_AddByName, CRAY_OT_IE_AddFiles, CRAY_OT_IE_AddSelectedCollections, CRAY_OT_IE_ClearFiles, CRAY_OT_IE_ImportBatch, CRAY_OT_IE_RefreshFiles, CRAY_OT_IE_RemoveFile, CRAY_OT_ModelSplitTransferSelectedToTargetCategory, CRAY_OT_P3DDropAddToPlanner, CRAY_OT_P3DDropImportNow, CRAY_OT_P3DDropMenu, CRAY_PG_IEFileItem, CRAY_PG_IEPlannerSettings, CRAY_UL_IEFiles)
 from .nh_scatter import (CRAY_OT_LoadConfig, CRAY_OT_MoveUIPanelLayoutItem, CRAY_OT_ResetUIPanelLayoutOrder, CRAY_OT_ScatterProxies, CRAY_PG_ColliderExpSettings, CRAY_PG_ColliderSettings, CRAY_PG_ModelSplitMergeSourceItem, CRAY_PG_ModelSplitSettings, CRAY_PG_Settings, CRAY_PG_SnapSettings, CRAY_PG_UIPanelSettings)
 from .nh_snap import (CRAY_OT_CreateSnapPairFromModelEdge, CRAY_OT_EnsureMemoryLOD, CRAY_OT_SnapBatchProcess, CRAY_OT_SnapSetP3DVisualsOnly, CRAY_OT_SnapShowAllP3DCollections, CRAY_OT_ValidateAssembleSnapPoints, _P3DValidationCaptureLogger, _MemoryLodManager, _SnapPointNamePattern, _SnapPointPairBuilder)
-from .nh_textures import (CRAY_OT_AssetLibraryForceRebuildIconsTextures, CRAY_OT_AssetLibraryFullRebuildFromZero, CRAY_OT_AssetLibraryRebuildIconCache, CRAY_OT_CancelTextureExport, CRAY_OT_CleanTextureConverterTestOutputs, CRAY_OT_ExportMissingTexturesFromSources, CRAY_OT_FixMeshHierarchy, CRAY_OT_OpenExpectedTextureToolsFolder, CRAY_OT_OpenNHAssetCacheFolder, CRAY_OT_OpenTextureCacheLastReport, CRAY_OT_OpenTextureExportLastReport, CRAY_OT_OpenTexturePreviewCacheFolder, CRAY_OT_PrintTextureConverterDiagnostics, CRAY_OT_PrintTextureExportDiagnostics, CRAY_OT_ReplaceTexturesFromDB, CRAY_OT_TexDBBuildFromFolder, CRAY_OT_TexSourceRootAdd, CRAY_OT_TexSourceRootRemove, CRAY_OT_TextureCacheBuild, CRAY_OT_TextureCacheBuildNHLibraryUsed, CRAY_OT_TextureCacheRebuildNHLibraryUsed, CRAY_OT_UpdateObjectPreview, CRAY_PG_ObjMatImagesItem, CRAY_PG_TexDBItem, CRAY_PG_TexReplaceSettings, CRAY_PG_TexSourceRootItem, CRAY_UL_ObjPreview, CRAY_UL_TexDB)
+from .nh_textures import (CRAY_OT_AssetLibraryForceRebuildIconsTextures, CRAY_OT_AssetLibraryFullRebuildFromZero, CRAY_OT_AssetLibraryRebuildIconCache, CRAY_OT_CancelTextureExport, CRAY_OT_CleanTextureConverterTestOutputs, CRAY_OT_ExportMissingTexturesFromSources, CRAY_OT_FixMeshHierarchy, CRAY_OT_OpenExpectedTextureToolsFolder, CRAY_OT_OpenNHAssetCacheFolder, CRAY_OT_OpenTextureCacheLastReport, CRAY_OT_OpenTextureExportLastReport, CRAY_OT_OpenTexturePreviewCacheFolder, CRAY_OT_PrintTextureConverterDiagnostics, CRAY_OT_PrintTextureExportDiagnostics, CRAY_OT_ReplaceTexturesFromDB, CRAY_OT_TexDBBuildFromFolder, CRAY_OT_TexSourceRootAdd, CRAY_OT_TexSourceRootRemove, CRAY_OT_TextureCacheBuild, CRAY_OT_TextureCacheBuildNHLibraryUsed, CRAY_OT_TextureCacheRebuildNHLibraryUsed, CRAY_PG_ObjMatImagesItem, CRAY_PG_TexDBItem, CRAY_PG_TexReplaceSettings, CRAY_PG_TexSourceRootItem, CRAY_UL_ObjPreview, CRAY_UL_TexDB)
 from .nh_ui_panels import (CRAY_PT_AssetProxyPanel, CRAY_PT_CacheManagerPanel, CRAY_PT_ColliderExpPanel, CRAY_PT_ColliderPanel, CRAY_PT_FixesPanel, CRAY_PT_ImportExportPlannerPanel, CRAY_PT_MenuSettingsPanel, CRAY_PT_ModelSplitPanel, CRAY_PT_TextureReplacePanel, _ensure_p3d_panel_icon_patch_timer, _restore_a3ob_object_builder_panel_headers)
 from .nh_geometry_audit_ops import (CRAY_OT_GeometryAuditCleanSafe, CRAY_OT_GeometryAuditScan, CRAY_OT_GeometryAuditSelect, CRAY_PG_GeometryAuditDetail, CRAY_PG_GeometryAuditLODResult, CRAY_PG_GeometryAuditSettings, _clear_geometry_audit_cache)
 
@@ -103,7 +110,7 @@ from .nh_model_split import (CRAY_OT_ModelSplitGridClearCutters, CRAY_OT_ModelSp
 from .nh_planner import (CRAY_MT_P3DDropMenu, CRAY_OT_IEFilePathTooltip, CRAY_OT_IE_AddByName, CRAY_OT_IE_AddFiles, CRAY_OT_IE_AddSelectedCollections, CRAY_OT_IE_ClearFiles, CRAY_OT_IE_ImportBatch, CRAY_OT_IE_RefreshFiles, CRAY_OT_IE_RemoveFile, CRAY_OT_ModelSplitTransferSelectedToTargetCategory, CRAY_OT_P3DDropAddToPlanner, CRAY_OT_P3DDropImportNow, CRAY_OT_P3DDropMenu, CRAY_PG_IEFileItem, CRAY_PG_IEPlannerSettings, CRAY_UL_IEFiles, _ensure_p3d_import_patch_timer, _ensure_p3d_p3d_file_handler_patch_timer, _patch_p3d_import_read_file, _unpatch_p3d_import_read_file)
 from .nh_scatter import (CRAY_OT_LoadConfig, CRAY_OT_MoveUIPanelLayoutItem, CRAY_OT_ResetUIPanelLayoutOrder, CRAY_OT_ScatterProxies, CRAY_PG_ColliderExpSettings, CRAY_PG_ColliderSettings, CRAY_PG_ModelSplitMergeSourceItem, CRAY_PG_ModelSplitSettings, CRAY_PG_Settings, CRAY_PG_SnapSettings, CRAY_PG_UIPanelSettings, _apply_ui_panel_class_order, _ui_panel_settings_from_context)
 from .nh_snap import (CRAY_OT_CreateSnapPairFromModelEdge, CRAY_OT_EnsureMemoryLOD, CRAY_OT_SnapBatchProcess, CRAY_OT_SnapSetP3DVisualsOnly, CRAY_OT_SnapShowAllP3DCollections, CRAY_OT_ValidateAssembleSnapPoints, _ensure_p3d_bundle_registered, _patch_p3d_p3d_file_handler, _p3d_lod_duplicate_reindex_handler, _prime_p3d_lod_reindex_state, _unpatch_p3d_p3d_file_handler, _unregister_p3d_bundle)
-from .nh_textures import (CRAY_OT_AssetLibraryForceRebuildIconsTextures, CRAY_OT_AssetLibraryFullRebuildFromZero, CRAY_OT_AssetLibraryRebuildIconCache, CRAY_OT_CancelTextureExport, CRAY_OT_CleanTextureConverterTestOutputs, CRAY_OT_ExportMissingTexturesFromSources, CRAY_OT_FixMeshHierarchy, CRAY_OT_OpenExpectedTextureToolsFolder, CRAY_OT_OpenNHAssetCacheFolder, CRAY_OT_OpenTextureCacheLastReport, CRAY_OT_OpenTextureExportLastReport, CRAY_OT_OpenTexturePreviewCacheFolder, CRAY_OT_PrintTextureConverterDiagnostics, CRAY_OT_PrintTextureExportDiagnostics, CRAY_OT_ReplaceTexturesFromDB, CRAY_OT_TexDBBuildFromFolder, CRAY_OT_TexSourceRootAdd, CRAY_OT_TexSourceRootRemove, CRAY_OT_TextureCacheBuild, CRAY_OT_TextureCacheBuildNHLibraryUsed, CRAY_OT_TextureCacheRebuildNHLibraryUsed, CRAY_OT_UpdateObjectPreview, CRAY_PG_ObjMatImagesItem, CRAY_PG_TexDBItem, CRAY_PG_TexReplaceSettings, CRAY_PG_TexSourceRootItem, CRAY_UL_ObjPreview, CRAY_UL_TexDB)
+from .nh_textures import (CRAY_OT_AssetLibraryForceRebuildIconsTextures, CRAY_OT_AssetLibraryFullRebuildFromZero, CRAY_OT_AssetLibraryRebuildIconCache, CRAY_OT_CancelTextureExport, CRAY_OT_CleanTextureConverterTestOutputs, CRAY_OT_ExportMissingTexturesFromSources, CRAY_OT_FixMeshHierarchy, CRAY_OT_OpenExpectedTextureToolsFolder, CRAY_OT_OpenNHAssetCacheFolder, CRAY_OT_OpenTextureCacheLastReport, CRAY_OT_OpenTextureExportLastReport, CRAY_OT_OpenTexturePreviewCacheFolder, CRAY_OT_PrintTextureConverterDiagnostics, CRAY_OT_PrintTextureExportDiagnostics, CRAY_OT_ReplaceTexturesFromDB, CRAY_OT_TexDBBuildFromFolder, CRAY_OT_TexSourceRootAdd, CRAY_OT_TexSourceRootRemove, CRAY_OT_TextureCacheBuild, CRAY_OT_TextureCacheBuildNHLibraryUsed, CRAY_OT_TextureCacheRebuildNHLibraryUsed, CRAY_PG_ObjMatImagesItem, CRAY_PG_TexDBItem, CRAY_PG_TexReplaceSettings, CRAY_PG_TexSourceRootItem, CRAY_UL_ObjPreview, CRAY_UL_TexDB)
 from .nh_ui_panels import (CRAY_PT_AssetProxyPanel, CRAY_PT_CacheManagerPanel, CRAY_PT_ColliderExpPanel, CRAY_PT_ColliderPanel, CRAY_PT_FixesPanel, CRAY_PT_ImportExportPlannerPanel, CRAY_PT_MenuSettingsPanel, CRAY_PT_ModelSplitPanel, CRAY_PT_TextureReplacePanel, _ensure_p3d_panel_icon_patch_timer, _restore_a3ob_object_builder_panel_headers)
 
 # --- public/debug surface of the split package (ops candidates + bridge) ---
@@ -124,7 +131,9 @@ from .nh_pipe_editor import CRAY_PG_PipeEditor
 from .nh_ladder import (CRAY_PG_LadderSettings, CRAY_OT_LadderCapture, CRAY_OT_ToggleLadderExit,
                         CRAY_OT_CreateLadderMemory, CRAY_OT_NewLadder, CRAY_PT_LadderPointsPanel)
 
-classes = (
+from . import nh_materials as _materials
+
+classes = _materials.classes + (
     CRAY_PG_PipeEditor,
     CRAY_OT_ImportTerrainBuilderTXT,
     CRAY_PG_Settings,
@@ -216,7 +225,6 @@ classes = (
     CRAY_OT_TexDBBuildFromFolder,
     CRAY_OT_TexSourceRootAdd,
     CRAY_OT_TexSourceRootRemove,
-    CRAY_OT_UpdateObjectPreview,
     CRAY_OT_FixMeshHierarchy,
     CRAY_OT_ReplaceTexturesFromDB,
     CRAY_OT_PrintTextureExportDiagnostics,
@@ -347,7 +355,7 @@ def _unregister_stale_nh_classes_before_hot_reload():
 
     stale = []
     seen = set()
-    for base in (Operator, Panel, PropertyGroup, UIList, Menu):
+    for base in (Operator, Panel, PropertyGroup, UIList, Menu, AddonPreferences):
         for candidate in _iter_runtime_subclasses(base):
             if candidate in desired or candidate in seen:
                 continue
@@ -444,6 +452,7 @@ def register():
     _prime_p3d_lod_reindex_state()
     bpy.types.TOPBAR_MT_file_import.append(_tb_menu_import)
     _stats.start()
+    _materials.register_runtime()
     _patch_p3d_import_read_file()
     if not bpy.app.timers.is_registered(_ensure_p3d_import_patch_timer):
         bpy.app.timers.register(_ensure_p3d_import_patch_timer, first_interval=1.0, persistent=True)
@@ -455,6 +464,7 @@ def register():
         bpy.app.timers.register(_ensure_p3d_panel_icon_patch_timer, first_interval=1.0)
 
 def unregister():
+    _materials.unregister_runtime()
     if hasattr(bpy.types.Object, "nh_pipe_editor"):
         del bpy.types.Object.nh_pipe_editor
     bpy.types.TOPBAR_MT_file_import.remove(_tb_menu_import)

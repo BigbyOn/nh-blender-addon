@@ -803,7 +803,6 @@ class CRAY_PT_TextureReplacePanel(Panel):
         rbox.label(text="Replace Texture from DB", icon="FILE_TICK")
         rbox.prop(ts, "picked_object", text="Select Object")
         rbox.operator("cray.replace_textures_from_db", icon="FILE_TICK")
-        rbox.operator("cray.update_object_preview", text="Restore Material Preview", icon="MATERIAL")
         rbox.prop(ts, "write_expected_missing_paths")
 
         layout.separator()

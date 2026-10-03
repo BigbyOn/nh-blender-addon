@@ -3494,19 +3494,25 @@ def _nh_texture_export_output_root(create=False) -> str:
     return path
 
 
-def _texture_cache_key_for_path(path_abs: str) -> str:
+def _texture_cache_key_for_path(path_abs: str, *, canonical=True) -> str:
     from .nh_base import (_TEXTURE_PREVIEW_CACHE_SCHEMA_VERSION)
     try:
-        normalized = os.path.normcase(os.path.abspath(bpy.path.abspath(path_abs))).replace("/", "\\")
+        normalized = os.path.abspath(bpy.path.abspath(path_abs))
     except Exception:
-        normalized = os.path.normcase(os.path.abspath(path_abs or "")).replace("/", "\\")
+        normalized = os.path.abspath(path_abs or "")
+    if canonical:
+        # The material blueprint stores real paths. A mapped drive or junction
+        # must share the full PNG cache with that same physical source.
+        normalized = os.path.realpath(normalized)
+    normalized = os.path.normcase(normalized).replace("/", "\\")
     versioned_key = f"v{_TEXTURE_PREVIEW_CACHE_SCHEMA_VERSION}\0{normalized}"
     return hashlib.sha1(versioned_key.encode("utf-8", errors="replace")).hexdigest()
 
-def _paa_preview_cache_path(paa_abs_path: str) -> str:
+def _paa_preview_cache_path(paa_abs_path: str, *, canonical=True) -> str:
     from .nh_base import (_TEXTURE_PREVIEW_CACHE_SCHEMA_VERSION)
-    key = _texture_cache_key_for_path(paa_abs_path)
-    basename = os.path.splitext(os.path.basename(paa_abs_path or "texture"))[0] or "texture"
+    key = _texture_cache_key_for_path(paa_abs_path, canonical=canonical)
+    source = os.path.realpath(paa_abs_path) if canonical and paa_abs_path else paa_abs_path
+    basename = os.path.splitext(os.path.basename(source or "texture"))[0] or "texture"
     safe_basename = re.sub(r'[<>:"/\\|?*]+', "_", basename).strip(" .") or "texture"
     folder = os.path.join(_nh_texture_cache_root(create=True), key[:2], key[2:4])
     return os.path.join(
@@ -3521,6 +3527,33 @@ def _texture_cache_is_valid(source_abs_path: str, cache_path: str) -> bool:
         return os.path.getmtime(cache_path) >= os.path.getmtime(source_abs_path)
     except Exception:
         return False
+
+def _migrate_legacy_texture_cache(source_abs_path, legacy_path, cache_path):
+    """Publish an already readable alias PNG under its physical-source key."""
+    if _texture_cache_is_valid(source_abs_path, cache_path):
+        return
+    import time
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    temporary = cache_path + ".%d.%s.tmp" % (os.getpid(), uuid.uuid4().hex)
+    try:
+        shutil.copy2(legacy_path, temporary)
+        for attempt in range(5):
+            # Another producer may have completed the canonical PNG meanwhile.
+            if _texture_cache_is_valid(source_abs_path, cache_path):
+                return
+            try:
+                os.replace(temporary, cache_path)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(.01 * (attempt + 1))
+    finally:
+        try:
+            os.remove(temporary)
+        except FileNotFoundError:
+            pass
+
 
 def _iter_paa_files_recursive(root_abs: str):
     root_abs = os.path.abspath(bpy.path.abspath(root_abs or ""))
@@ -3632,7 +3665,7 @@ def _run_texture_cache_workers(paa_files, *, force_rebuild: bool = False, settin
             fp_abs = os.path.abspath(fp or "")
         if not fp_abs or not os.path.isfile(fp_abs):
             continue
-        key = os.path.normcase(fp_abs)
+        key = os.path.normcase(os.path.realpath(fp_abs))
         if key in seen:
             continue
         seen.add(key)
@@ -3959,7 +3992,7 @@ def _repair_existing_preview_image_paths():
     return repaired
 
 def _selected_base_color_texture_path(original_path: str, resolved_path: str) -> str:
-    from .nh_collider_exp import (_base_color_stem, _base_color_suffix, _norm_path)
+    from .nh_collider_exp import (_base_color_stem, _base_color_suffix, _norm_path, _TEX_EXPORT_TEXTURE_SUFFIX_RE)
     selected_suffix = _base_color_suffix(resolved_path)
     if not selected_suffix or selected_suffix == _base_color_suffix(original_path):
         return original_path
@@ -3969,11 +4002,27 @@ def _selected_base_color_texture_path(original_path: str, resolved_path: str) ->
     original_base, original_ext = os.path.splitext(leaf)
     resolved_ext = os.path.splitext(resolved_path)[1]
     stem = _base_color_stem(original_base)
+    suffix = _TEX_EXPORT_TEXTURE_SUFFIX_RE.search(stem)
+    if suffix and suffix.group(2).lower() not in {"ca", "co"}:
+        stem = stem[:suffix.start()]
     if not stem:
         return original_path
 
     selected_leaf = stem + selected_suffix + (original_ext or resolved_ext or ".paa")
     return _norm_path(os.path.join(folder, selected_leaf) if folder else selected_leaf)
+
+def _resolve_import_base_color_texture_path(texture_path, search_roots):
+    from .nh_collider_exp import _TEX_EXPORT_TEXTURE_SUFFIX_RE
+    folder, leaf = os.path.split(_normalize_drive_relative_path(texture_path))
+    base, extension = os.path.splitext(leaf)
+    suffix = _TEX_EXPORT_TEXTURE_SUFFIX_RE.search(base)
+    if suffix and suffix.group(2).lower() not in {"ca", "co"}:
+        color_path = os.path.join(folder, base[:suffix.start()] + extension)
+        resolved = _resolve_p3d_texture_path(color_path, extra_roots=search_roots)
+        if resolved:
+            return resolved
+    return _resolve_p3d_texture_path(texture_path, extra_roots=search_roots)
+
 
 def _load_material_preview_image(
     texture_path: str,
@@ -4032,6 +4081,30 @@ def _load_material_preview_image(
                 except Exception:
                     pass
 
+    if not force_rebuild_cache:
+        legacy_path = _paa_preview_cache_path(resolved_path, canonical=False)
+        if (os.path.normcase(legacy_path) != os.path.normcase(cache_path)
+                and _texture_cache_is_valid(resolved_path, legacy_path)):
+            legacy_image = None
+            try:
+                # Read before migration: a truncated old PNG is not a cache hit.
+                legacy_image = _load_external_image(legacy_path, color_space)
+                legacy_image.reload()
+                if min(legacy_image.size) <= 0:
+                    raise ValueError("Legacy texture cache has no pixels")
+                _migrate_legacy_texture_cache(resolved_path, legacy_path, cache_path)
+                image = _load_external_image(cache_path, color_space)
+                image.reload()
+                has_alpha = _has_image_alpha(image) if declared_has_alpha is None else declared_has_alpha
+                return image, has_alpha, resolved_path, "cache_hit", cache_path
+            except (OSError, RuntimeError, ValueError):
+                # The ordinary decoder below can repair a broken cache in a
+                # worker; cache-only callers still never decompress the PAA.
+                pass
+            finally:
+                if legacy_image is not None:
+                    _remove_image_if_unused(legacy_image)
+
     if keep_converted_textures and not cache_missing_textures:
         return None, False, resolved_path, "cache_missing", cache_path
 
@@ -4072,7 +4145,24 @@ def _load_material_preview_image(
 
     return image, has_alpha, resolved_path, "paa_runtime", cache_path
 
-def _setup_import_preview_nodes(material: bpy.types.Material, image, texture_label: str, has_alpha: bool):
+def _setup_import_preview_nodes(material: bpy.types.Material, image, texture_label: str, has_alpha: bool,
+                                *, search_roots=(), keep_cache=True, force_rebuild_cache=False,
+                                cache_missing_textures=True, include_super=True):
+    if include_super:
+        from .nh_material_cache import build as build_super
+        _, rvmat_path = _get_p3d_material_paths(material)
+        loader = None
+        if force_rebuild_cache or not cache_missing_textures:
+            def loader(path, keep, color_space="SRGB"):
+                return _load_material_preview_image(
+                    path, keep, color_space, force_rebuild_cache=force_rebuild_cache,
+                    cache_missing_textures=cache_missing_textures, search_roots=search_roots)
+        if rvmat_path and build_super(
+                material, rvmat_path, texture_label, base_image=image, has_alpha=has_alpha,
+                search_roots=search_roots, keep_cache=keep_cache, image_loader=loader,
+                force_rebuild=force_rebuild_cache):
+            return True
+
     if material is None or image is None:
         return False
 
@@ -4178,7 +4268,10 @@ def _postprocess_imported_material_previews(
         "packed": 0,
         "cache_hits": 0,
         "cache_created": 0,
+        "material_cache_hits": 0,
+        "material_cache_created": 0,
         "errors": [],
+        "library_errors": [],
     }
 
     if not show_materials:
@@ -4190,10 +4283,27 @@ def _postprocess_imported_material_previews(
     materials = _iter_unique_materials_from_objects(imported_objs)
     result["materials_total"] = len(materials)
     search_roots = _texture_resolution_roots_from_imported_objects(imported_objs)
+    from .nh_material_shader import texture_root
+    configured_root = texture_root()
+    search_roots.extend(root for root in (configured_root, os.path.dirname(configured_root))
+                        if root and root not in search_roots)
 
     for mat in materials:
         paa_path, _ = _get_p3d_material_paths(mat)
         if not paa_path:
+            # The ordinary importer defers its eager preview to this pass.
+            # Procedural colors have no file path but still need their RGB graph.
+            props = _find_p3d_material_pg(mat)
+            if getattr(props, "texture_type", "TEX") in {"COLOR", "CUSTOM"}:
+                try:
+                    from .nh_snap import _import_first_available_module
+                    backend = _import_first_available_module((
+                        "NH_bundle.io.import_p3d", "bl_ext.user_default.Arma3ObjectBuilder.io.import_p3d"))
+                    if backend is not None:
+                        backend.setup_material_nodes(mat)
+                        result["previewed"] += 1
+                except Exception as e:
+                    result["errors"].append(f"{mat.name}: {_fmt_exc(e)}")
             continue
         if _is_placeholder_material_name(paa_path):
             print(f"Skipped placeholder material: {paa_path}")
@@ -4203,15 +4313,10 @@ def _postprocess_imported_material_previews(
             continue
 
         result["textured_candidates"] += 1
-        image, has_alpha, resolved_path, source_kind, _cache_path = _load_material_preview_image(
-            paa_path,
-            keep_converted_textures,
-            color_space="SRGB",
-            force_rebuild_cache=force_rebuild_cache,
-            cache_missing_textures=cache_missing_textures,
-            search_roots=search_roots,
-        )
-        if image is None:
+        # Resolve the original color file without decoding it. A ready Super
+        # blueprint can then restore all full-resolution maps immediately.
+        resolved_path = _resolve_import_base_color_texture_path(paa_path, search_roots)
+        if not resolved_path:
             result["missing"] += 1
             continue
 
@@ -4225,7 +4330,43 @@ def _postprocess_imported_material_previews(
                 print(f"Base Color auto-select failed for {mat.name}: {_fmt_exc(e)}")
 
         try:
-            if _setup_import_preview_nodes(mat, image, resolved_path or paa_path, has_alpha):
+            if _setup_import_preview_nodes(
+                    mat, None, resolved_path, False, search_roots=search_roots,
+                    keep_cache=keep_converted_textures,
+                    force_rebuild_cache=force_rebuild_cache,
+                    cache_missing_textures=cache_missing_textures):
+                result["previewed"] += 1
+                cache_counter = ("material_cache_hits" if mat.get("nh_material_cache_hit")
+                                 else "material_cache_created")
+                result[cache_counter] += 1
+                if pack_runtime_images:
+                    for node in mat.node_tree.nodes:
+                        image = getattr(node, "image", None)
+                        if image is not None and getattr(image, "packed_file", None) is None:
+                            try:
+                                image.pack()
+                                result["packed"] += 1
+                            except Exception as e:
+                                result["errors"].append(f"{mat.name}: pack preview image: {_fmt_exc(e)}")
+                # Library bookkeeping is independent of the scene material.
+                # A failed thumbnail queue must not invalidate a valid shader.
+                try:
+                    from .nh_materials import queue_import_preview
+                    _, rvmat_path = _get_p3d_material_paths(mat)
+                    queue_import_preview(rvmat_path, resolved_path, search_roots=search_roots)
+                except Exception as e:
+                    result["library_errors"].append(f"{mat.name}: {_fmt_exc(e)}")
+                continue
+
+            image, has_alpha, resolved_path, source_kind, _cache_path = _load_material_preview_image(
+                resolved_path, keep_converted_textures, color_space="SRGB",
+                force_rebuild_cache=force_rebuild_cache,
+                cache_missing_textures=cache_missing_textures, search_roots=search_roots)
+            if image is None:
+                result["missing"] += 1
+                continue
+            if _setup_import_preview_nodes(mat, image, resolved_path or paa_path, has_alpha,
+                                           include_super=False):
                 result["previewed"] += 1
                 if source_kind == "cache_hit":
                     result["cache_hits"] += 1
@@ -4240,6 +4381,11 @@ def _postprocess_imported_material_previews(
                         result["errors"].append(f"{mat.name}: pack preview image: {_fmt_exc(e)}")
         except Exception as e:
             result["errors"].append(f"{mat.name}: {_fmt_exc(e)}")
+
+    from .nh_material_shader import prepare_uvs
+    for obj in imported_objs:
+        if any(mat and mat.get("nh_super_rvmat") for mat in getattr(obj.data, "materials", ())):
+            prepare_uvs(obj)
 
     if result["previewed"] > 0:
         result["viewports_material_preview"] = _enable_material_preview_in_viewports(context)
@@ -4278,9 +4424,12 @@ def _log_import_preview_summary(filepath: str, stats):
     packed = int(stats.get("packed", 0) or 0)
     cache_hits = int(stats.get("cache_hits", 0) or 0)
     cache_created = int(stats.get("cache_created", 0) or 0)
+    material_cache_hits = int(stats.get("material_cache_hits", 0) or 0)
+    material_cache_created = int(stats.get("material_cache_created", 0) or 0)
     errors = list(stats.get("errors", []) or [])
+    library_errors = list(stats.get("library_errors", []) or [])
 
-    if previewed == 0 and missing == 0 and packed == 0 and cache_hits == 0 and cache_created == 0 and not errors:
+    if previewed == 0 and missing == 0 and packed == 0 and cache_hits == 0 and cache_created == 0 and not errors and not library_errors:
         return
 
     print("=== Import/Export planner: material previews ===")
@@ -4297,9 +4446,13 @@ def _log_import_preview_summary(filepath: str, stats):
             cache_created=cache_created,
         )
     )
+    if material_cache_hits or material_cache_created:
+        print(f"Super material cache: reused {material_cache_hits}, created {material_cache_created}")
     if errors:
         for item in errors[:20]:
             print(item)
+    for item in library_errors[:20]:
+        print("NH Materials thumbnail queue: " + item)
 
 # ---------- UI data ----------
 
@@ -4667,64 +4820,6 @@ class CRAY_OT_TexSourceRootRemove(Operator):
             pass
         _save_texreplace_settings_now(context)
         self.report({"INFO"}, "Removed texture source root")
-        return {"FINISHED"}
-
-class CRAY_OT_UpdateObjectPreview(Operator):
-    bl_idname = "cray.update_object_preview"
-    bl_label = "Restore Material Preview"
-    bl_description = (
-        "Rebuild texture preview nodes for the selected P3D model and switch the current 3D view to Material Preview"
-    )
-    bl_options = {"REGISTER", "UNDO"}
-
-    def execute(self, context):
-        from .nh_base import (_fmt_exc)
-        ts = context.scene.cray_texreplace_settings
-        obj, src = _resolve_tex_target_object(context, ts.picked_object)
-        if obj is None:
-            ts.obj_preview_items.clear()
-            self.report({"ERROR"}, "No mesh object found (pick one or select one)")
-            return {"CANCELLED"}
-        ts.picked_object = obj
-
-        root_collection = _find_p3d_root_collection_for_object(context, obj)
-        scope_objects = _collect_collection_objects_recursive(root_collection) if root_collection is not None else [obj]
-
-        try:
-            preview_stats = _postprocess_imported_material_previews(
-                context,
-                scope_objects,
-                show_materials=True,
-                keep_converted_textures=True,
-                pack_runtime_images=False,
-            )
-        except Exception as e:
-            self.report({"ERROR"}, f"Material preview failed: {_fmt_exc(e)}")
-            return {"CANCELLED"}
-
-        _log_import_preview_summary(getattr(root_collection, "name", obj.name), preview_stats)
-        image_materials = _collect_object_image_materials(obj, ts.obj_preview_items)
-        previewed = int(preview_stats.get("previewed", 0) or 0)
-        missing = int(preview_stats.get("missing", 0) or 0)
-        errors = len(preview_stats.get("errors", ()) or ())
-        viewports = int(preview_stats.get("viewports_material_preview", 0) or 0)
-
-        if previewed == 0 and image_materials > 0:
-            viewports = _enable_material_preview_in_viewports(context)
-
-        suffix = "" if src == "picked" else f" (auto: {src})"
-        if previewed > 0 or image_materials > 0:
-            self.report(
-                {"INFO"},
-                f"Material Preview restored: {max(previewed, image_materials)} material(s), {viewports} viewport(s){suffix}",
-            )
-        elif missing or errors:
-            self.report(
-                {"WARNING"},
-                f"No preview loaded: missing textures {missing}, errors {errors} (see System Console)",
-            )
-        else:
-            self.report({"WARNING"}, f"Object '{obj.name}' has no P3D texture paths")
         return {"FINISHED"}
 
 class CRAY_OT_FixMeshHierarchy(Operator):
