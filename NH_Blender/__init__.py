@@ -1,7 +1,7 @@
 bl_info = {
     "name": "NH Plugin for Blender",
     "author": "Enisam",
-    "version": (0, 6, 10),
+    "version": (0, 6, 11),
     "blender": (4, 0, 0),
     "location": "3D Viewport > N-panel > NH Plugin",
     "description": "All-in-one Blender toolkit for porting and preparing DayZ/Arma assets: fixes, textures, colliders, proxies, snap points, and P3D workflow helpers.",    

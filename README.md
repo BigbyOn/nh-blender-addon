@@ -6,7 +6,7 @@
 
 Аддон объединяет типовые операции вокруг P3D-пайплайна в одном интерфейсе и может работать как с установленным **Arma 3 Object Builder (A3OB)**, так и со встроенным P3D fallback.
 
-- **Версия:** `0.6.10`
+- **Версия:** `0.6.11`
 - **Blender:** `4.0.0+`
 - **Интерфейс:** `3D Viewport -> N-panel -> NH Plugin`
 - **Releases:** <https://github.com/T3Z-ONE/nh-blender-addon/releases>

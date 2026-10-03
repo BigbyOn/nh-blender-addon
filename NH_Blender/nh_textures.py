@@ -3494,19 +3494,25 @@ def _nh_texture_export_output_root(create=False) -> str:
     return path
 
 
-def _texture_cache_key_for_path(path_abs: str) -> str:
+def _texture_cache_key_for_path(path_abs: str, *, canonical=True) -> str:
     from .nh_base import (_TEXTURE_PREVIEW_CACHE_SCHEMA_VERSION)
     try:
-        normalized = os.path.normcase(os.path.abspath(bpy.path.abspath(path_abs))).replace("/", "\\")
+        normalized = os.path.abspath(bpy.path.abspath(path_abs))
     except Exception:
-        normalized = os.path.normcase(os.path.abspath(path_abs or "")).replace("/", "\\")
+        normalized = os.path.abspath(path_abs or "")
+    if canonical:
+        # The material blueprint stores real paths. A mapped drive or junction
+        # must share the full PNG cache with that same physical source.
+        normalized = os.path.realpath(normalized)
+    normalized = os.path.normcase(normalized).replace("/", "\\")
     versioned_key = f"v{_TEXTURE_PREVIEW_CACHE_SCHEMA_VERSION}\0{normalized}"
     return hashlib.sha1(versioned_key.encode("utf-8", errors="replace")).hexdigest()
 
-def _paa_preview_cache_path(paa_abs_path: str) -> str:
+def _paa_preview_cache_path(paa_abs_path: str, *, canonical=True) -> str:
     from .nh_base import (_TEXTURE_PREVIEW_CACHE_SCHEMA_VERSION)
-    key = _texture_cache_key_for_path(paa_abs_path)
-    basename = os.path.splitext(os.path.basename(paa_abs_path or "texture"))[0] or "texture"
+    key = _texture_cache_key_for_path(paa_abs_path, canonical=canonical)
+    source = os.path.realpath(paa_abs_path) if canonical and paa_abs_path else paa_abs_path
+    basename = os.path.splitext(os.path.basename(source or "texture"))[0] or "texture"
     safe_basename = re.sub(r'[<>:"/\\|?*]+', "_", basename).strip(" .") or "texture"
     folder = os.path.join(_nh_texture_cache_root(create=True), key[:2], key[2:4])
     return os.path.join(
@@ -3521,6 +3527,33 @@ def _texture_cache_is_valid(source_abs_path: str, cache_path: str) -> bool:
         return os.path.getmtime(cache_path) >= os.path.getmtime(source_abs_path)
     except Exception:
         return False
+
+def _migrate_legacy_texture_cache(source_abs_path, legacy_path, cache_path):
+    """Publish an already readable alias PNG under its physical-source key."""
+    if _texture_cache_is_valid(source_abs_path, cache_path):
+        return
+    import time
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    temporary = cache_path + ".%d.%s.tmp" % (os.getpid(), uuid.uuid4().hex)
+    try:
+        shutil.copy2(legacy_path, temporary)
+        for attempt in range(5):
+            # Another producer may have completed the canonical PNG meanwhile.
+            if _texture_cache_is_valid(source_abs_path, cache_path):
+                return
+            try:
+                os.replace(temporary, cache_path)
+                return
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(.01 * (attempt + 1))
+    finally:
+        try:
+            os.remove(temporary)
+        except FileNotFoundError:
+            pass
+
 
 def _iter_paa_files_recursive(root_abs: str):
     root_abs = os.path.abspath(bpy.path.abspath(root_abs or ""))
@@ -3632,7 +3665,7 @@ def _run_texture_cache_workers(paa_files, *, force_rebuild: bool = False, settin
             fp_abs = os.path.abspath(fp or "")
         if not fp_abs or not os.path.isfile(fp_abs):
             continue
-        key = os.path.normcase(fp_abs)
+        key = os.path.normcase(os.path.realpath(fp_abs))
         if key in seen:
             continue
         seen.add(key)
@@ -4047,6 +4080,30 @@ def _load_material_preview_image(
                     os.remove(cache_path)
                 except Exception:
                     pass
+
+    if not force_rebuild_cache:
+        legacy_path = _paa_preview_cache_path(resolved_path, canonical=False)
+        if (os.path.normcase(legacy_path) != os.path.normcase(cache_path)
+                and _texture_cache_is_valid(resolved_path, legacy_path)):
+            legacy_image = None
+            try:
+                # Read before migration: a truncated old PNG is not a cache hit.
+                legacy_image = _load_external_image(legacy_path, color_space)
+                legacy_image.reload()
+                if min(legacy_image.size) <= 0:
+                    raise ValueError("Legacy texture cache has no pixels")
+                _migrate_legacy_texture_cache(resolved_path, legacy_path, cache_path)
+                image = _load_external_image(cache_path, color_space)
+                image.reload()
+                has_alpha = _has_image_alpha(image) if declared_has_alpha is None else declared_has_alpha
+                return image, has_alpha, resolved_path, "cache_hit", cache_path
+            except (OSError, RuntimeError, ValueError):
+                # The ordinary decoder below can repair a broken cache in a
+                # worker; cache-only callers still never decompress the PAA.
+                pass
+            finally:
+                if legacy_image is not None:
+                    _remove_image_if_unused(legacy_image)
 
     if keep_converted_textures and not cache_missing_textures:
         return None, False, resolved_path, "cache_missing", cache_path
